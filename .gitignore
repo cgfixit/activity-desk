@@ -1,0 +1,23 @@
+# Keep the editable app and bundle metadata visible to Git.
+/Activity Desk.app/Contents/Frameworks/
+/Activity Desk.app/Contents/MacOS/
+/Activity Desk.app/Contents/Resources/*
+!/Activity Desk.app/Contents/Resources/app/
+/Activity Desk.app/Contents/_CodeSignature/
+
+/REVIEW.local.md
+.DS_Store
+node_modules/
+.env
+.env.*
+github-token*
+*.pem
+*.p12
+*.pfx
+*.key
+*.mobileprovision
+*.log
+*.dmg
+*.pkg
+/dist/
+/profile/
