@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Activity Desk</title>
   <link rel="stylesheet" href="styles.css">
@@ -18,8 +18,8 @@
         <svg viewBox="0 0 24 24" width="28" height="28"><path fill="currentColor" d="M3 13h4l2-6 4 12 2-6h6" stroke="currentColor" stroke-width="2" fill-opacity="0" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </div>
       <h1>Activity Desk</h1>
-      <p class="muted">Your GitHub activity, insights, and what you might have missed, in its own window.</p>
-      <form id="token-form" action="javascript:void(0)">
+      <p class="muted">Review your GitHub activity, notifications, and contribution trends.</p>
+      <form id="token-form">
         <label for="token">GitHub token</label>
         <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_… or ghp_…" required>
         <button class="btn primary wide" type="submit" id="signin-btn">Sign in</button>
@@ -30,10 +30,10 @@
         <summary>Which token should I use?</summary>
         <ul>
           <li><strong>Fine-grained</strong> works for the stream and insights. For private events, add the account permission <strong>Events: read</strong>. For private pull request details, give it access to those repositories with <strong>Pull requests: read</strong>.</li>
-          <li><strong>Classic</strong> with <code>repo</code>, <code>read:user</code> and <code>notifications</code> also unlocks unread notifications, which GitHub does not give fine-grained tokens.</li>
+          <li><strong>Classic</strong> with <code>notifications</code> enables the unread inbox. GitHub's classic <code>repo</code> scope also grants write access to private repositories.</li>
           <li>Activity Desk encrypts the saved token using macOS Keychain and sends it only to api.github.com.</li>
         </ul>
-        <button class="btn ghost" id="create-token" type="button">Create a token on GitHub</button>
+        <button class="btn ghost" id="create-token" type="button">Create a fine-grained token</button>
       </details>
     </div>
   </main>
@@ -42,16 +42,16 @@
   <div id="app" class="app hidden">
     <nav class="sidebar" aria-label="Sections">
       <div class="me">
-        <img id="avatar" alt="" width="36" height="36">
+        <span class="avatar" id="initials" aria-hidden="true"></span>
         <div>
           <div class="me-name" id="me-name"></div>
           <div class="me-login muted" id="me-login"></div>
         </div>
       </div>
-      <button class="nav active" data-tab="overview" type="button"><span class="ico">◎</span>Overview</button>
-      <button class="nav" data-tab="stream" type="button"><span class="ico">≡</span>Stream <span class="badge hidden" id="fresh-badge"></span></button>
-      <button class="nav" data-tab="insights" type="button"><span class="ico">◇</span>Insights</button>
-      <button class="nav" data-tab="meta" type="button"><span class="ico">ⓘ</span>Data &amp; access</button>
+      <button class="nav active" data-tab="overview" type="button" aria-current="page"><span class="ico" aria-hidden="true">◎</span>Overview</button>
+      <button class="nav" data-tab="stream" type="button"><span class="ico" aria-hidden="true">≡</span>Stream <span class="badge hidden" id="fresh-badge"></span></button>
+      <button class="nav" data-tab="insights" type="button"><span class="ico" aria-hidden="true">◇</span>Insights</button>
+      <button class="nav" data-tab="meta" type="button"><span class="ico" aria-hidden="true">ⓘ</span>Data &amp; access</button>
       <div class="sidebar-foot">
         <button class="btn ghost wide" id="refresh" type="button">Refresh</button>
         <div class="small muted" id="refreshed"></div>
@@ -71,7 +71,7 @@
         <div class="grid two">
           <article class="card">
             <h3>Needs a look</h3>
-            <p class="small muted">Things that are easy to miss when agents do a lot of the typing.</p>
+            <p class="small muted">Review requests, open pull requests, and gaps in the loaded data.</p>
             <ul class="attention" id="attention"></ul>
           </article>
           <article class="card">
@@ -99,7 +99,7 @@
           <div class="toolbar-right">
             <select id="repo-filter" aria-label="Repository"></select>
             <input id="search" type="search" placeholder="Search" aria-label="Search events">
-            <label class="toggle"><input type="checkbox" id="hide-minor" checked> Hide label changes <span id="minor-count"></span></label>
+            <label class="toggle"><input type="checkbox" id="hide-minor" checked> Hide routine changes <span id="minor-count"></span></label>
             <button class="btn ghost" id="mark-seen" type="button">Mark all seen</button>
           </div>
         </div>
@@ -109,9 +109,13 @@
       <section data-view="insights" class="view hidden">
         <header class="view-head">
           <h2>Insights</h2>
-          <p class="lede">Patterns in your work, not just counts. Feed-based cards cover the events window; year cards cover the full contribution year.</p>
         </header>
-        <div class="grid insights" id="insights"></div>
+        <div class="insight-nav" id="insight-nav" role="group" aria-label="Insight data source">
+          <button type="button" data-source="year" aria-pressed="true" aria-controls="insights">Contribution year</button>
+          <button type="button" data-source="events" aria-pressed="false" aria-controls="insights">Recent events</button>
+          <button type="button" data-source="prs" aria-pressed="false" aria-controls="insights">Pull requests</button>
+        </div>
+        <div id="insights"></div>
       </section>
 
       <section data-view="meta" class="view hidden">

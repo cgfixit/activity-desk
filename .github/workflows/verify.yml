@@ -15,9 +15,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Check JavaScript and the main-process boundary
+      - name: Check JavaScript, insights and the main-process boundary
         run: |
           for file in 'Activity Desk.app/Contents/Resources/app/'*.js; do
             node --check "$file"
           done
-          node --test tests/main.test.cjs
+          node --test tests/*.test.cjs

@@ -5,19 +5,29 @@
 !/Activity Desk.app/Contents/Resources/app/
 /Activity Desk.app/Contents/_CodeSignature/
 
-/REVIEW.local.md
+*.local.md
+*.local/
 .DS_Store
 node_modules/
 .env
 .env.*
+.envrc
 github-token*
+credential-*/
+Local Storage/
+Session Storage/
+Crashpad/
 *.pem
 *.p12
 *.pfx
 *.key
 *.mobileprovision
 *.log
+*.har
+*.ips
 *.dmg
 *.pkg
 /dist/
 /profile/
+/profiles/
+/screenshots/

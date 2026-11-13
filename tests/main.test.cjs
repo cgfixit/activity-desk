@@ -9,9 +9,10 @@ const vm = require("node:vm");
 const payload = path.resolve(__dirname, "../Activity Desk.app/Contents/Resources/app");
 const token = "synthetic-token-for-unit-checks";
 
-async function start(t, profile) {
+async function start(t, profile, response = () => new Response("{}")) {
   const handlers = new Map();
   const calls = [];
+  const opened = [];
   const frame = { url: pathToFileURL(path.join(payload, "index.html")).href };
   const sender = { mainFrame: frame, on() {}, setWindowOpenHandler() {} };
   const electron = {
@@ -27,6 +28,7 @@ async function start(t, profile) {
       on() {}
     },
     ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
+    shell: { openExternal: async (url) => opened.push(url) },
     safeStorage: {
       encryptStringAsync: async (value) => {
         assert.equal(value, token);
@@ -46,13 +48,14 @@ async function start(t, profile) {
     AbortSignal,
     fetch: async (url, options) => {
       calls.push({ url, options });
-      return new Response("{}");
+      return response();
     },
   });
   await Promise.resolve();
   const event = { sender, senderFrame: frame };
   return {
     calls,
+    opened,
     invoke: (name, ...args) => handlers.get(`desk:${name}`)(event, ...args),
     foreign: (name) => handlers.get(`desk:${name}`)({ ...event, senderFrame: null }),
   };
@@ -78,6 +81,35 @@ test("only supported reads from the app frame reach the GitHub transport", async
   const body = JSON.parse(calls[1].options.body);
   assert.match(body.query, /^query \(/);
   assert.deepEqual(body.variables, { o0: "fixture", r0: "example", n0: 1 });
+});
+
+test("opens the fine-grained token form and keeps unsuccessful response bodies in main", async (t) => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "activity-desk-"));
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
+  const { invoke, opened } = await start(t, profile, () => new Response("private fixture detail", {
+    status: 403,
+    headers: { "x-ratelimit-remaining": "0" },
+  }));
+  assert.equal((await invoke("open-token-page")).ok, true);
+  assert.deepEqual(opened, ["https://github.com/settings/personal-access-tokens/new?name=Activity%20Desk"]);
+  assert.equal((await invoke("sign-in", token)).ok, true);
+  const result = await invoke("github", "profile");
+  assert.equal(result.status, 403);
+  assert.equal(result.remaining, "0");
+  assert.equal(Object.hasOwn(result, "body"), false);
+});
+
+test("profile IPC returns only display identity", async (t) => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "activity-desk-"));
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
+  const { invoke } = await start(t, profile, () => Response.json({
+    id: 1, login: "fixture", name: "Test account", email: "fixture@example.invalid",
+    avatar_url: "https://avatars.githubusercontent.com/u/1",
+  }));
+  assert.equal((await invoke("sign-in", token)).ok, true);
+  assert.deepEqual(JSON.parse((await invoke("github", "profile")).body), {
+    id: 1, login: "fixture", name: "Test account",
+  });
 });
 
 test("migration survives restart and sign-out reports removal failure", async (t) => {

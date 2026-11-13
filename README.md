@@ -1,19 +1,65 @@
 # Activity Desk
 
-Activity Desk is a macOS Electron dashboard for GitHub activity, pull requests, notifications, and contribution trends.
+Activity Desk is a macOS dashboard for GitHub activity. Review your recent events, see which pull requests are still open, and compare contribution trends from one window.
+
+## What you can see
+
+- **Overview** shows recent contribution totals, open PRs in the loaded sample, and unread notifications when the token supports them.
+- **Stream** filters loaded events by type, repository, and search text. **Mark all seen** updates an account-specific timestamp on this Mac.
+- **Insights** compares two 30-day periods and charts monthly contributions, streaks, and repository totals. **Recent events** shows activity by local day and hour. Select a repository there to open its events in Stream. **Pull requests** shows merge timing, recorded reviews, and change sizes for the loaded sample.
+- **Data & access** reports which sources loaded, where the data is limited, and which token type is in use.
+
+## Screenshots
+
+The running app shows a fictional account and synthetic GitHub data.
+
+### Contribution year
+
+![Insights showing the last and prior 30 days, a monthly contribution chart, and contribution types](docs/screenshots/contribution-year.png)
+
+### Recent events
+
+![Insights showing a day-and-hour heatmap, repository filters, and event counts](docs/screenshots/recent-events.png)
 
 ## Run a local copy
 
-This repository contains the app payload and bundle metadata. Use an existing compatible arm64 Activity Desk bundle with Electron 45 or later. Copy the bundle to a separate development location, then copy the contents of `Activity Desk.app/Contents/Resources/app/` into the development bundle's `Contents/Resources/app/`. The supplied launcher does not have a complete bundle signature. Distribution requires a separately built and signed package.
+This repository contains the app source and bundle metadata. You need an existing compatible arm64 Activity Desk bundle with Electron 45 or later. The bundled Electron runtime and stock assets are kept outside Git.
 
-For fixture runs, use a separate bundle identity and set both Electron data paths before loading `main.js`. Use synthetic credentials and GitHub responses. Run the focused main-process checks with `node --test tests/main.test.cjs`.
+1. Make a development copy of `Activity Desk.app`.
+2. Copy the files from `Activity Desk.app/Contents/Resources/app/` in this checkout into the development bundle's `Contents/Resources/app/`.
+3. Open the development copy and sign in with a GitHub personal access token.
 
-## GitHub access and local data
+The workspace launcher has an incomplete bundle signature. A distributable download needs separately built and signed packaging.
 
-Use a fine-grained GitHub token with access to the repositories you want to see. Grant read access to Events and Pull requests where needed. GitHub requires a classic token for its notifications endpoint. A classic token's repository scopes can grant write permissions to other clients using that token.
+## GitHub access
 
-Activity Desk sends the token to `api.github.com` for specific read operations. macOS Keychain backs encryption of the token stored in the local Electron profile. On first use after an upgrade, the app encrypts the old token and removes the plaintext file. Sign-out clears the dashboard and removes saved credentials. The app keeps a local timestamp per GitHub account for events marked seen. An old profile-wide timestamp has no account identity, so the updated app starts a fresh timestamp for each account.
+Start with a fine-grained token. Use **Events** read access to see private events. Grant **Pull requests** read access to the repositories whose private PR details you want to see. GitHub's unread notifications endpoint requires a classic token with the `notifications` scope. A classic `repo` scope grants write access to other clients holding the token. [GitHub token documentation](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
 
-Stream and review summaries cover the data loaded for the current token. The app flags page failures, capped results, and unavailable PR details. GitHub may delay events or omit activity outside its Events feed.
+| Source | Coverage |
+| --- | --- |
+| Recent events | Up to 300 GitHub events from the past 30 days. GitHub can delay or omit events. [Events API](https://docs.github.com/en/rest/activity/events) |
+| Pull requests | Details for up to 40 distinct PRs mentioned in the loaded events. Review counts reflect the records visible at refresh time. |
+| Contribution year | GitHub's rolling contribution calendar. Commit breakdowns use up to 10 returned repositories. The 30-day comparison includes the current day. [Contributions collection](https://docs.github.com/en/graphql/reference/users#contributionscollection) |
+| Notifications | The first page of up to 50 unread notifications. [Notifications API](https://docs.github.com/en/rest/activity/notifications) |
 
-For vulnerability reporting, see [SECURITY.md](SECURITY.md).
+Agent signals come from known app slugs and branch prefixes. Push counts classify the refs GitHub reports.
+
+## Local data and privacy
+
+- The main process sends the token to `api.github.com` for allowlisted reads. The dashboard displays initials generated locally.
+- macOS Keychain backs encryption of the token in the local Electron profile. The app encrypts a legacy plaintext token on first use. Signing out clears the dashboard and removes the saved token. The account-specific seen timestamp stays in the local profile.
+- A signed-in dashboard can show private repository names and activity. Use an isolated profile and synthetic responses for reusable screenshots and test evidence.
+
+See [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+
+## Development checks
+
+```sh
+for file in 'Activity Desk.app/Contents/Resources/app/'*.js; do
+  node --check "$file" || exit
+done
+node --test tests/insights.test.cjs
+node --test tests/main.test.cjs
+```
+
+For a native fixture run, use a separate bundle identity and set Electron's `userData` and `sessionData` to scratch directories before loading `main.js`. Use synthetic credentials and GitHub responses. The renderer needs the preload bridge for authenticated views.
