@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 
-const TOKEN_PAGE = "https://github.com/settings/tokens/new?scopes=repo,read:user,notifications&description=Activity%20Desk";
+const TOKEN_PAGE = "https://github.com/settings/personal-access-tokens/new?name=Activity%20Desk";
 const API = "https://api.github.com";
 
 const DOCUMENT = pathToFileURL(path.join(__dirname, "index.html")).href;
@@ -189,15 +189,12 @@ const YEAR_QUERY = `query {
       totalPullRequestReviewContributions restrictedContributionsCount totalRepositoriesWithContributedCommits
       contributionCalendar { totalContributions weeks { contributionDays { date contributionCount } } }
       commitContributionsByRepository(maxRepositories: 10) { repository { nameWithOwner isPrivate } contributions { totalCount } }
-      pullRequestContributionsByRepository(maxRepositories: 10) { repository { nameWithOwner isPrivate } contributions { totalCount } }
-      issueContributionsByRepository(maxRepositories: 10) { repository { nameWithOwner isPrivate } contributions { totalCount } }
-      pullRequestReviewContributionsByRepository(maxRepositories: 10) { repository { nameWithOwner isPrivate } contributions { totalCount } }
     }
   }
 }`;
 
 const REPO_NAME = /^[A-Za-z0-9_.-]{1,100}$/;
-const PR_FIELDS = `title state merged isDraft createdAt mergedAt additions deletions changedFiles headRefName
+const PR_FIELDS = `title state merged isDraft createdAt mergedAt additions deletions headRefName
   author { login } mergedBy { login } reviews { totalCount }`;
 
 function githubRequest(operation, args) {
@@ -260,9 +257,17 @@ handle("github", async (operation, args) => {
       redirect: "error",
       signal: AbortSignal.any([credential.signal, AbortSignal.timeout(30000)]),
     });
-    const body = await response.text();
+    if (!response.ok) {
+      await response.body?.cancel();
+      return { ok: false, status: response.status, remaining: response.headers.get("x-ratelimit-remaining") };
+    }
+    let body = await response.text();
+    if (operation === "profile") {
+      const { id, login, name } = JSON.parse(body);
+      body = JSON.stringify({ id, login, name });
+    }
     return {
-      ok: response.ok,
+      ok: true,
       status: response.status,
       body,
       link: response.headers.get("link"),

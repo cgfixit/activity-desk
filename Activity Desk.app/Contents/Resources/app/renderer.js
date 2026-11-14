@@ -17,7 +17,7 @@ const initialState = {
   viewer: null,
   events: [],
   prInfo: {},
-  prLookup: { asked: 0, found: 0 },
+  prLookup: { total: 0, asked: 0, found: 0 },
   contributions: null,
   notifications: null,
   errors: {},
@@ -28,7 +28,7 @@ const initialState = {
   repo: "",
   query: "",
   hideMinor: true,
-  tab: "overview",
+  insight: "year",
   busy: false,
 };
 let state = { ...initialState };
@@ -64,6 +64,11 @@ function dayHeading(key) {
   const d = new Date(`${key}T12:00:00`);
   return d.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
 }
+function dateRange(first, last) {
+  if (first == null || last == null) return "";
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" })
+    .formatRange(new Date(first), new Date(last));
+}
 function level(count, max) {
   if (!count) return 0;
   const r = count / Math.max(1, max);
@@ -72,9 +77,12 @@ function level(count, max) {
 function bars(rows, opts) {
   const o = opts || {};
   const max = Math.max(1, ...rows.map((r) => r[1]));
-  return `<div class="bars">${rows.map(([name, n]) =>
-    `<div class="bar ${o.violet ? "violet" : ""}"><span class="name" title="${esc(name)}">${esc(name)}</span><span class="track"><span class="fill" style="width:${Math.max(2, (n / max) * 100).toFixed(1)}%"></span></span><span class="num">${esc(o.pct ? pct(n) : fmt(n))}</span></div>`
-  ).join("")}</div>`;
+  return `<ul class="bars">${rows.map(([name, n, repo]) => {
+    const label = repo
+      ? `<button type="button" class="link name" data-insight-repo="${esc(repo)}" title="View ${esc(repo)} in Stream">${esc(name)}</button>`
+      : `<span class="name" title="${esc(name)}">${esc(name)}</span>`;
+    return `<li class="bar${o.violet ? " violet" : ""}">${label}<span class="track" aria-hidden="true"><span class="fill" style="width:${(n / max * 100).toFixed(1)}%"></span></span><span class="num">${esc(fmt(n))}</span></li>`;
+  }).join("")}</ul>`;
 }
 const shortRepo = (repo) => (state.user && repo.startsWith(`${state.user.login}/`) ? repo.slice(state.user.login.length + 1) : repo);
 
@@ -96,11 +104,11 @@ async function api(account, operation, args) {
   if (account !== state) throw new Error("Session changed.");
   if (result.remaining != null) account.remaining = result.remaining;
   if (!result.ok) {
-    let detail = result.error || `GitHub returned ${result.status}`;
-    try {
-      const parsed = JSON.parse(result.body || "{}");
-      if (parsed.message) detail = parsed.message;
-    } catch { /* Response was not JSON. */ }
+    const detail = result.error || ({
+      401: "GitHub rejected the saved token.",
+      403: "GitHub denied the request. Check token permissions and rate limits.",
+      429: "GitHub rate limit reached.",
+    })[result.status] || `GitHub returned HTTP ${result.status}.`;
     throw Object.assign(new Error(detail), { status: result.status });
   }
   return { data: JSON.parse(result.body || "null"), more: /rel="next"/.test(result.link || "") };
@@ -117,7 +125,7 @@ async function loadEvents(account, login) {
       more = result.more;
       if (!more) break;
     } catch (error) {
-      return { events, issue: `Events page ${page} did not load: ${error.message}` };
+      return { events, issue: `Events page ${page} did not load. ${error.message}` };
     }
   }
   return { events, issue: more || events.length >= 300 ? "The feed reached the 300-event limit." : "" };
@@ -135,14 +143,13 @@ async function lookupPullRequests(account, refs) {
     const pr = result?.data?.[alias]?.pullRequest;
     if (failed.has(undefined) || failed.has(alias) || !pr || !Number.isInteger(pr.reviews?.totalCount)) return;
     info[I.prKey(r.repo, r.number)] = {
-      ...pr, repo: r.repo, number: r.number, files: pr.changedFiles,
+      ...pr, repo: r.repo, number: r.number,
       headRef: pr.headRefName, author: pr.author?.login, mergedBy: pr.mergedBy?.login,
       reviews: pr.reviews.totalCount,
     };
   });
   return {
     info, total: refs.length, asked: usable.length, found: Object.keys(info).length,
-    error: errors[0]?.message,
   };
 }
 
@@ -151,7 +158,7 @@ async function refresh() {
   setBusy("Loading your profile…");
   try {
     const { data: user } = await api(account, "profile");
-    if (!user?.login || !Number.isSafeInteger(user.id)) throw new Error("Unexpected GitHub profile.");
+    if (typeof user?.login !== "string" || !user.login || !Number.isSafeInteger(user.id)) throw new Error("Unexpected GitHub profile.");
     setBusy("Loading activity…");
     const feed = await loadEvents(account, user.login);
     if (account !== state) return;
@@ -160,8 +167,9 @@ async function refresh() {
 
     setBusy("Loading contribution year and notifications…");
     const refs = I.prRefsFromEvents(events);
+    const fineGrained = account.tokenKind === "fine-grained";
     const [notes, year, prs] = await Promise.allSettled([
-      api(account, "notifications"),
+      fineGrained ? null : api(account, "notifications"),
       api(account, "year"),
       lookupPullRequests(account, refs),
     ]);
@@ -169,23 +177,26 @@ async function refresh() {
 
     const errors = {};
     if (feed.issue) errors.events = feed.issue;
-    const notifications = notes.status === "fulfilled" && Array.isArray(notes.value.data) ? notes.value.data : null;
-    if (!notifications) errors.notifications = `Notifications did not load: ${notes.reason?.message || "unexpected response"}`;
+    const notifications = Array.isArray(notes.value?.data) ? notes.value.data : null;
+    if (!notifications) errors.notifications = fineGrained
+      ? "Unread notifications require a classic token."
+      : notes.reason?.message || "Notifications are unavailable.";
     else if (notes.value.more) errors.notifications = "Showing the first page of unread notifications.";
     const yearData = year.value?.data;
     const yearErrors = yearData?.errors || [];
     const contributionError = yearErrors.some(({ path }) => !path || path.length < 2 || path[1] === "contributionsCollection");
     const viewer = yearData?.data?.viewer;
-    const contributions = !contributionError && viewer?.contributionsCollection?.contributionCalendar
-      ? I.summarizeContributions(viewer.contributionsCollection, localDayKey(new Date())) : null;
-    if (!contributions) errors.year = `Contribution year did not load: ${year.reason?.message || yearData?.errors?.[0]?.message || "contribution data unavailable"}`;
-    else if (yearErrors.length) errors.year = "Some account details are unavailable.";
+    const collection = viewer?.contributionsCollection;
+    const contributions = !contributionError && Array.isArray(collection?.contributionCalendar?.weeks)
+      ? I.summarizeContributions(collection, localDayKey(new Date())) : null;
+    if (!contributions) errors.year = year.reason?.message || "GitHub did not return a usable contribution calendar.";
+    else if (yearErrors.length) errors.account = "Some account details are unavailable.";
     const prLookup = prs.value || { info: {}, total: refs.length, asked: Math.min(refs.length, PR_LOOKUP_LIMIT), found: 0 };
-    if (prs.status === "rejected") errors.prs = `Pull request details did not load: ${prs.reason.message}`;
-    else if (prLookup.found < prLookup.asked) errors.prs = `Some pull request details are unavailable.${prLookup.error ? ` ${prLookup.error}` : ""}`;
-    else if (prLookup.asked < prLookup.total) errors.prs = "Pull request details are limited to the first 40 references.";
+    if (prLookup.found < prLookup.asked) errors.prs = prs.reason?.message || "Some requested pull requests were unavailable.";
+    if (prLookup.asked < prLookup.total) errors.prs = `${errors.prs ? `${errors.prs} ` : ""}Details are capped at the first ${PR_LOOKUP_LIMIT} references.`;
 
     Object.assign(account, { user, viewer, contributions, events, notifications, prLookup, prInfo: prLookup.info, errors, refreshedAt: new Date() });
+    if (!events.some((e) => I.repoName(e) === account.repo)) account.repo = "";
     account.lastSeen = localStorage.getItem(seenKey());
     if (!account.lastSeen && account.events[0]) {
       account.lastSeen = account.events[0].created_at;
@@ -197,7 +208,7 @@ async function refresh() {
   } catch (error) {
     if (account !== state) return;
     if (!account.user) throw error;
-    account.errors.refresh = `Refresh failed: ${error.message}. Showing the last loaded data.`;
+    account.errors.refresh = `Refresh failed. ${error.message} Showing the last loaded data.`;
     renderAll();
   } finally {
     if (account === state) setBusy("");
@@ -208,11 +219,10 @@ async function refresh() {
 function renderIdentity() {
   const u = state.user;
   if (!u) return;
-  $("me-name").textContent = u.name || u.login;
+  const name = typeof u.name === "string" ? u.name.trim() : "";
+  $("me-name").textContent = name || u.login;
   $("me-login").textContent = `@${u.login}`;
-  const avatar = String(u.avatar_url || "");
-  $("avatar").removeAttribute("src");
-  if (avatar.startsWith("https://avatars.githubusercontent.com/")) $("avatar").src = `${avatar}${avatar.includes("?") ? "&" : "?"}s=72`;
+  $("initials").textContent = (name ? name.split(/\s+/).slice(0, 2).map((part) => Array.from(part)[0]).join("") : u.login.slice(0, 2)).toUpperCase();
 }
 
 function computed() {
@@ -226,38 +236,34 @@ function renderOverview(c) {
   const { ev, pr, notes, year } = c;
   const parts = [];
   if (ev.fresh) parts.push(`<strong>${fmt(ev.fresh)} new event${ev.fresh === 1 ? "" : "s"}</strong> since you last marked the stream seen.`);
-  if (year) {
-    const trend = year.trend == null ? "" : ` (${year.trend >= 0 ? "up" : "down"} ${pct(Math.abs(year.trend))} on the 30 days before)`;
+  if (year?.last30 != null) {
+    const trend = year.trend ? ` (${year.trend > 0 ? "up" : "down"} ${pct(Math.abs(year.trend))} from the prior 30 days)` : "";
     parts.push(`${fmt(year.last30)} contributions in the last 30 days${trend}.`);
   }
-  if (ev.total) parts.push(`${pct(ev.agentShare)} of your recent feed traces back to AI agents.`);
+  if (ev.agentEvents) parts.push(`${pct(ev.agentShare)} of loaded events matched a known agent app or branch prefix.`);
   $("summary").innerHTML = parts.join(" ");
 
   const kpis = [
-    ["Contributions this year", year ? fmt(year.total) : "—", year ? `${fmt(year.activeDays)} active days of ${fmt(year.dayCount)}` : esc(state.errors.year || "")],
+    ["Contribution year", year ? fmt(year.total) : "—", year ? `${fmt(year.activeDays)} active days of ${fmt(year.dayCount)}` : esc(state.errors.year || "")],
     ["Current streak", year ? `${fmt(year.currentStreak)} d` : "—", year ? `Longest ${fmt(year.longestStreak)} days` : ""],
-    ["Last 30 days", year ? fmt(year.last30) : "—", year && year.trend != null ? `<span class="${year.trend >= 0 ? "up" : "down"}">${year.trend >= 0 ? "▲" : "▼"} ${pct(Math.abs(year.trend))}</span> vs prior 30` : ""],
-    ["Agent share of feed", ev.total ? pct(ev.agentShare) : "—", ev.agents.length ? ev.agents.slice(0, 3).map(([n, k]) => `${esc(n)} ${k}`).join(" · ") : "No agent activity found"],
+    ["Last 30 days", fmt(year?.last30), year?.prev30 != null ? `${fmt(year.prev30)} in the prior 30 days` : ""],
+    ["Agent signals", ev.total ? pct(ev.agentShare) : "—", ev.agents.length ? ev.agents.slice(0, 3).map(([n, k]) => `${esc(n)} ${k}`).join(" · ") : "No matches in loaded events"],
   ];
   $("kpis").innerHTML = kpis.map(([label, value, sub]) =>
     `<div class="kpi"><div class="label">${esc(label)}</div><div class="value">${value}</div><div class="sub">${sub}</div></div>`).join("");
 
   const items = [];
-  if (pr.agentUnreviewed.length) items.push(["bad", `${pr.agentUnreviewed.length} agent-branch PR${pr.agentUnreviewed.length === 1 ? "" : "s"} merged with no review`, pr.agentUnreviewed.slice(0, 3).map((p) => `${shortRepo(p.repo)} #${p.number}`).join(", ")]);
-  else if (pr.unreviewed.length) items.push(["warn", `${pr.unreviewed.length} of ${pr.merged} merged PRs had no review`, "From the pull requests in your recent feed."]);
-  if (pr.openMine.length) items.push(["warn", `${pr.openMine.length} of your PRs are still open`, pr.openMine.slice(0, 4).map((p) => `${shortRepo(p.repo)} #${p.number}${p.isDraft ? " (draft)" : ""}`).join(", ")]);
-  if (notes && notes.missed.length) items.push(["bad", `${notes.missed.length} unread notification${notes.missed.length === 1 ? "" : "s"} that need you`, "Review requests, mentions, assignments or failed checks."]);
-  if (ev.defaultPushes) items.push([ev.defaultPushShare > 0.5 ? "warn" : "", `${pct(ev.defaultPushShare)} of pushes went straight to main`, `${ev.defaultPushes} direct pushes vs ${ev.branchPushes} to branches in the feed window.`]);
-  if (ev.branchesCreated > ev.branchesDeleted + 3) items.push(["", `${ev.branchesCreated - ev.branchesDeleted} more branches created than deleted`, "Stale agent branches pile up quietly."]);
-  if (year && year.totals.prs && year.totals.reviews / year.totals.prs < 0.05) items.push(["warn", `1 review for every ${Math.round(year.totals.prs / Math.max(1, year.totals.reviews))} PRs this year`, `${fmt(year.totals.reviews)} reviews against ${fmt(year.totals.prs)} pull requests.`]);
+  if (pr.unreviewed.length) items.push(["warn", `${pr.unreviewed.length} of ${pr.merged} sampled merges have zero recorded reviews`, pr.unreviewed.slice(0, 3).map((p) => `${shortRepo(p.repo)} #${p.number}`).join(", ")]);
+  if (pr.openMine.length) items.push(["warn", `${pr.openMine.length} of your sampled PRs are still open`, pr.openMine.slice(0, 4).map((p) => `${shortRepo(p.repo)} #${p.number}${p.isDraft ? " (draft)" : ""}`).join(", ")]);
+  if (notes && notes.missed.length) items.push(["warn", `${notes.missed.length} unread notification${notes.missed.length === 1 ? "" : "s"} flagged`, "Includes review requests, mentions, and failed checks."]);
   const coverage = Object.values(state.errors);
   if (coverage.length) items.push(["warn", "Some data is missing or limited", coverage.join(" ")]);
-  else if (!items.length) items.push(["good", "Nothing stands out in the loaded data", "No unreviewed merges, open PRs or direct-push spikes in the loaded sample."]);
+  else if (!items.length) items.push(["good", "Nothing flagged in the loaded data", "Open PRs, review counts and notifications are limited to the loaded samples."]);
   $("attention").innerHTML = items.map(([cls, t, d]) =>
     `<li class="${cls}"><span class="dot"></span><div><div class="t">${esc(t)}</div><div class="d">${esc(d)}</div></div></li>`).join("");
 
   if (!notes) {
-    $("notes").innerHTML = `<p class="note">${esc(state.errors.notifications || "Notifications are not available.")}</p><p class="note">Use a classic token with the <code>notifications</code> scope to see unread review requests, mentions and failed checks here.</p>`;
+    $("notes").innerHTML = `<p class="note">${esc(state.errors.notifications || "Notifications are unavailable.")}</p>`;
   } else {
     $("notes").innerHTML = `<p class="big"><strong>${fmt(notes.unread)}</strong> unread loaded · ${fmt(notes.ciNoise)} are routine CI updates</p>${bars(notes.byReason.slice(0, 6))}` +
       (notes.missed.length ? `<ul class="attention">${notes.missed.slice(0, 5).map((n) => `<li class="warn"><span class="dot"></span><div><div class="t">${esc((n.subject && n.subject.title) || "Notification")}</div><div class="d">${esc(n.reason)} · ${esc(n.repository && n.repository.full_name)}</div></div></li>`).join("")}</ul>` : "");
@@ -268,7 +274,7 @@ function renderOverview(c) {
 
 function renderYear(year) {
   if (!year) {
-    $("year-heat").innerHTML = `<p class="note">${esc(state.errors.year || "Contribution year did not load.")}</p>`;
+    $("year-heat").innerHTML = `<p class="note year-empty">${esc(state.errors.year || "Contribution year did not load.")}</p>`;
     $("year-caption").textContent = "";
     return;
   }
@@ -294,16 +300,16 @@ function renderYear(year) {
         : `<span class="c l${level(d.contributionCount, max)}" style="grid-column:${w + 1};grid-row:${i + 2}" title="${esc(d.date)}: ${esc(d.contributionCount)} contributions"></span>`;
     });
   }
-  $("year-heat").innerHTML = html;
+  $("year-heat").innerHTML = html || '<p class="note year-empty">GitHub returned no calendar days.</p>';
   const busiest = year.busiest[0];
   $("year-caption").textContent = `${fmt(year.total)} contributions${busiest ? ` · busiest ${busiest.date} (${busiest.contributionCount})` : ""}`;
 }
 
 function renderStream(c) {
   const { ev } = c;
-  const span = ev.spanHours < 48 ? `${Math.max(1, Math.round(ev.spanHours))} hours` : `${Math.round(ev.spanHours / 24)} days`;
+  const range = dateRange(ev.oldest, ev.newest);
   $("stream-caption").textContent = ev.total
-    ? `${fmt(ev.total)} events loaded across ${span}.`
+    ? `${fmt(ev.total)} events loaded${range ? ` · ${range}` : ""}.`
     : "No recent events loaded.";
   if (state.errors.events) $("stream-caption").textContent += ` ${state.errors.events}`;
 
@@ -316,7 +322,7 @@ function renderStream(c) {
   const repos = ev.byRepo.map(([r]) => r);
   $("repo-filter").innerHTML = `<option value="">All repositories</option>${repos.map((r) => `<option value="${esc(r)}"${r === state.repo ? " selected" : ""}>${esc(shortRepo(r))}</option>`).join("")}`;
 
-  const list = I.filterEvents(state.events, state.filter, state.repo, state.query, state.hideMinor);
+  const list = I.filterEvents(state.events, state.filter, state.repo, state.query, state.hideMinor, state.prInfo);
   const lastSeen = state.lastSeen ? new Date(state.lastSeen).getTime() : null;
   const groups = new Map();
   for (const e of list) {
@@ -342,7 +348,7 @@ function renderStream(c) {
           const st = info.merged ? "merged" : info.state === "OPEN" ? "open" : "closed";
           tags.push(`<span class="tag ${st}">${st}</span>`);
           tags.push(`<span class="tag">+${fmt(info.additions)} −${fmt(info.deletions)}</span>`);
-          if (info.merged && !info.reviews) tags.push(`<span class="tag warn">no review</span>`);
+          if (info.merged && !info.reviews) tags.push(`<span class="tag warn">0 reviews</span>`);
         }
         const branch = I.branchOf(e);
         return `<div class="row${fresh ? " fresh" : ""}">
@@ -359,110 +365,183 @@ function renderStream(c) {
   badge.classList.toggle("hidden", !ev.fresh);
 }
 
-function renderInsights(c) {
-  const { ev, pr, year } = c;
-  const cards = [];
+function insightSection(id, name, caption, content) {
+  return `<section class="insight-section" aria-labelledby="${id}-title">
+    <header class="insight-heading">
+      <h3 id="${id}-title">${name}</h3>
+      <p class="lede">${esc(caption)}</p>
+    </header>
+    ${content}
+  </section>`;
+}
 
-  // Rhythm
-  const maxHour = Math.max(1, ...ev.hourGrid.flat());
-  let grid = `<span></span>${Array.from({ length: 24 }, (_, h) => `<span class="axis">${h % 6 === 0 ? esc(hourName(h)) : ""}</span>`).join("")}`;
-  for (let d = 1; d <= 7; d += 1) {
-    const day = d % 7;
-    grid += `<span class="lab">${DAY_NAMES[day]}</span>${ev.hourGrid[day].map((n, h) => `<span class="h l${level(n, maxHour)}" title="${DAY_NAMES[day]} ${hourName(h)}: ${n} events"></span>`).join("")}`;
-  }
-  const weekdayMax = year ? Math.max(1, ...year.weekday) : 1;
-  cards.push(`<article class="card"><h3>Work rhythm</h3>
-    <p class="big">${ev.peakHour ? `Busiest slot in the feed: <strong>${DAY_NAMES[ev.peakHour.day]} ${hourName(ev.peakHour.hour)}</strong>, your local time.` : "Not enough events yet."}</p>
-    <div class="hours">${grid}</div>
-    ${year ? `<div class="cols">${year.weekday.map((n, i) => `<div class="col"><i style="height:${Math.max(2, (n / weekdayMax) * 70).toFixed(0)}px" title="${fmt(n)}"></i><span>${DAY_NAMES[i]}</span></div>`).join("")}</div>
-    <p class="note">Bottom: contributions by weekday across the year. ${pct(year.weekendShare)} land on weekends.</p>` : ""}
-  </article>`);
+const stats = (rows) => `<dl class="stat-row">${rows.map(([label, value]) =>
+  `<div class="stat"><dt>${label}</dt><dd>${value}</dd></div>`
+).join("")}</dl>`;
 
-  // Streaks
-  if (year) {
-    cards.push(`<article class="card"><h3>Consistency</h3>
-      <div class="stat-row"><div class="stat"><b>${fmt(year.currentStreak)}</b><span>day streak now</span></div><div class="stat"><b>${fmt(year.longestStreak)}</b><span>longest streak</span></div><div class="stat"><b>${pct(year.activeDays / Math.max(1, year.dayCount))}</b><span>days active</span></div></div>
-      <p class="big">A typical active day has <strong>${fmt(year.medianActiveDay)}</strong> contributions. Your top day had <strong>${fmt(year.busiest[0] && year.busiest[0].contributionCount)}</strong>, about ${year.medianActiveDay ? Math.round(year.busiest[0].contributionCount / year.medianActiveDay) : "—"}× normal.</p>
-      ${bars(year.busiest.map((d) => [new Date(`${d.date}T12:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }), d.contributionCount]))}
-    </article>`);
+function annualInsights(year) {
+  if (!year) {
+    return insightSection("insight-year", "Contribution year", "Unavailable",
+      `<p class="card muted">${esc(state.errors.year || "The contribution calendar did not load.")}</p>`);
   }
 
-  // Focus
-  if (year && year.commits.length) {
-    cards.push(`<article class="card"><h3>Focus</h3>
-      <p class="big"><strong>${pct(year.focusShare)}</strong> of this year's commits went to <strong>${esc(shortRepo(year.commits[0].repo))}</strong>. You committed to ${fmt(year.totals.repos)} repositories in total.</p>
-      ${bars(year.commits.slice(0, 7).map((r) => [shortRepo(r.repo) + (r.isPrivate ? " 🔒" : ""), r.count]))}
-      ${ev.reposPerDay != null ? `<p class="note">In the feed window you touch a median of ${fmt(ev.reposPerDay)} repositories per day.</p>` : ""}
-    </article>`);
+  const dates = year.days.length ? dateRange(`${year.days[0].date}T12:00:00`, `${year.days.at(-1).date}T12:00:00`) : "";
+  const caption = `${fmt(year.total)} contributions${dates ? ` · ${dates}` : ""}`;
+  const { commits, prs, issues, reviews, restricted } = year.totals;
+  const peak = year.busiest[0];
+  const highestMonth = Math.max(1, ...year.monthly.map(([, n]) => n));
+  const trend = year.trend ? `${year.trend > 0 ? "+" : "−"}${pct(Math.abs(year.trend))}` : pct(year.trend);
+  const comparisonNote = year.last30 == null || year.prev30 == null
+    ? "A 30-day total appears once all 30 dates are available."
+    : year.prev30 === 0 ? "Percentage change requires a nonzero prior total." : "The 30-day comparison includes today.";
+  const chart = year.monthly.length ? `<div class="monthly-chart"><ol class="month-bars" aria-label="Contributions by month">
+    ${year.monthly.map(([key, n], i) => {
+      const month = MONTHS[Number(key.slice(5)) - 1];
+      const label = i === 0 || key.endsWith("-01") ? `${month} ’${key.slice(2, 4)}` : month;
+      return `<li title="${esc(key)} · ${fmt(n)} contributions"><span class="month-count">${fmt(n)}</span>
+        <span class="month-track" aria-hidden="true"><i style="height:${(100 * n / highestMonth).toFixed(1)}%"></i></span>
+        <span>${label}</span></li>`;
+    }).join("")}</ol></div>` : '<p class="note">GitHub returned no calendar days.</p>';
+  const leadingRepo = year.commits[0];
+
+  return insightSection("insight-year", "Contribution year", caption, `
+    ${restricted ? `<p class="insight-notice">${fmt(restricted)} restricted contributions are counted without repository details.</p>` : ""}
+    <div class="grid insights">
+      <article class="card insight-wide">
+        <h4>Contribution trends</h4>
+        ${stats([["Last 30 days", fmt(year.last30)], ["Prior 30 days", fmt(year.prev30)], ["Change", trend]])}
+        ${chart}
+        <p class="note">${comparisonNote} The first and last months in the chart can be partial.</p>
+      </article>
+      <article class="card">
+        <h4>Consistency</h4>
+        ${stats([["Current streak", year.dayCount ? `${fmt(year.currentStreak)} d` : "—"], ["Longest streak", year.dayCount ? `${fmt(year.longestStreak)} d` : "—"], ["Active days", pct(year.dayCount ? year.activeDays / year.dayCount : null)]])}
+        ${peak ? `<p class="note">Median of <strong>${fmt(year.medianActiveDay)}</strong> contributions on active days. Busiest day was <strong>${esc(peak.date)}</strong> with ${fmt(peak.contributionCount)}.</p>` : '<p class="note">No active days in the returned calendar.</p>'}
+      </article>
+      <article class="card">
+        <h4>Contribution types</h4>
+        ${bars([["Commits", commits], ["Pull requests opened", prs], ["Issues opened", issues], ["PR review contributions", reviews]])}
+      </article>
+      <article class="card">
+        <h4>Commit contributions by repository</h4>
+        ${leadingRepo ? `
+          <p class="big">${year.focusShare == null ? "" : `<strong>${pct(year.focusShare)}</strong> of calendar commits were in <strong>${esc(shortRepo(leadingRepo.repo))}</strong>, the leading repository returned. `}${fmt(year.totals.repos)} repositories with commits.</p>
+          ${bars(year.commits.map((r) => [shortRepo(r.repo) + (r.isPrivate ? " (private)" : ""), r.count]))}
+          <p class="note">GitHub returns up to 10 repository totals.</p>` : '<p class="note">No repository totals were returned.</p>'}
+      </article>
+      <article class="card">
+        <h4>Contributions by weekday</h4>
+        ${bars([1, 2, 3, 4, 5, 6, 0].map((d) => [DAY_NAMES[d], year.weekday[d]]))}
+        ${year.activeDays ? `<p class="note">${pct(year.weekendShare)} fell on weekends.</p>` : ""}
+      </article>
+    </div>`);
+}
+
+function eventInsights(ev) {
+  const range = dateRange(ev.oldest, ev.newest);
+  const caption = `${fmt(ev.total)} events loaded${range ? ` · ${range}` : ""}`;
+  const notice = state.errors.events ? `<p class="insight-notice">${esc(state.errors.events)}</p>` : "";
+  if (!ev.total) {
+    return insightSection("insight-events", "Recent events", caption,
+      notice || '<p class="card muted">GitHub returned no recent events for this token.</p>');
   }
 
-  // Collaboration balance
-  if (year) {
-    const t = year.totals;
-    cards.push(`<article class="card"><h3>Shipping vs reviewing</h3>
-      ${bars([["Commits", t.commits], ["Pull requests", t.prs], ["Issues", t.issues], ["Reviews given", t.reviews]])}
-      <div class="callout">${t.reviews ? `You gave <strong>1 review for every ${fmt(Math.round(t.prs / t.reviews))} pull requests</strong> you opened this year.` : "You did not review any pull requests this year."} On solo repos that is expected. Where agents open the PRs, it means most code merges without a second reader.</div>
-    </article>`);
+  const peak = ev.peakHour;
+  const peakLabel = peak ? `${DAY_NAMES[peak.day]} ${hourName(peak.hour)} · ${fmt(peak.count)} ${peak.count === 1 ? "event" : "events"}` : "";
+  const hourLabels = Array.from({ length: 24 }, (_, h) => `<span class="axis">${h % 6 === 0 ? hourName(h) : ""}</span>`).join("");
+  let grid = `<span></span>${hourLabels}`;
+  for (const day of [1, 2, 3, 4, 5, 6, 0]) {
+    grid += `<span class="lab">${DAY_NAMES[day]}</span>${ev.hourGrid[day].map((n, h) =>
+      `<span class="h l${level(n, peak?.count)}" title="${DAY_NAMES[day]} ${hourName(h)} · ${fmt(n)} events"></span>`).join("")}`;
   }
+  const pushes = ev.mainPushes + ev.branchPushes + ev.tagPushes + ev.otherPushes;
 
-  // PR health
-  if (pr.total) {
-    cards.push(`<article class="card"><h3>Pull request health</h3>
-      <div class="stat-row"><div class="stat"><b>${hoursLabel(pr.medianHoursToMerge)}</b><span>median to merge</span></div><div class="stat"><b>${fmt(pr.medianSize)}</b><span>median lines changed</span></div><div class="stat"><b>${pct(pr.merged ? pr.unreviewed.length / pr.merged : null)}</b><span>merged unreviewed</span></div></div>
-      <p class="big">${fmt(pr.total)} PRs from the feed: ${fmt(pr.merged)} merged, ${fmt(pr.open.length)} open, ${fmt(pr.selfMerged)} merged by their own author.</p>
-      ${pr.largest.length ? `<p class="note">Largest: ${pr.largest.map((p) => `${esc(shortRepo(p.repo))} #${p.number} (+${fmt(p.additions)} −${fmt(p.deletions)})`).join(", ")}</p>` : ""}
-    </article>`);
-  }
+  return insightSection("insight-events", "Recent events", caption, `
+    ${notice}
+    <div class="grid insights">
+      <article class="card">
+        <h4>Activity by day and hour</h4>
+        ${peak ? `<p class="big">Busiest slot <strong>${peakLabel}</strong>, local time.</p>
+          <div class="hours" role="img" aria-label="Events by local day and hour. Busiest slot ${peakLabel}.">${grid}</div>
+          <div class="legend small muted" aria-hidden="true"><span>Fewer</span><i class="l0"></i><i class="l1"></i><i class="l2"></i><i class="l3"></i><i class="l4"></i><span>More</span></div>`
+          : '<p class="note">No event timestamps are available.</p>'}
+      </article>
+      <article class="card">
+        <h4>Events by repository</h4>
+        <p class="big">Select a repository to view its loaded events in Stream.</p>
+        ${bars(ev.byRepo.slice(0, 6).map(([repo, n]) => [shortRepo(repo), n, repo]))}
+      </article>
+      <article class="card">
+        <h4>Event types</h4>
+        ${bars(ev.byType.map(([type, n]) => [I.eventLabel(type), n]))}
+      </article>
+      <article class="card">
+        <h4>Agent signals</h4>
+        <p class="big"><strong>${fmt(ev.agentEvents)} of ${fmt(ev.total)} events</strong> matched known app slugs or branch prefixes.</p>
+        ${ev.agents.length ? bars(ev.agents, { violet: true }) : ""}
+        <p class="note">Branch matches include prefixes such as <code>codex/</code>, <code>cursor/</code>, and <code>copilot/</code>.</p>
+      </article>
+      <article class="card">
+        <h4>Pushes and branches</h4>
+        <p class="big">${pushes ? `${fmt(pushes)} push events by ref.` : "No push events loaded."}</p>
+        ${pushes ? bars([["Branches named main or master", ev.mainPushes], ["Other branches", ev.branchPushes], ["Tags", ev.tagPushes], ["Unspecified or other refs", ev.otherPushes]]) : ""}
+        <p class="note">${fmt(ev.branchesCreated)} branches created · ${fmt(ev.branchesDeleted)} deleted</p>
+      </article>
+      ${ev.tags.length ? `<article class="card">
+        <h4>Issue title tags</h4>
+        <p class="big">From the <code>[tag]</code> at the start of issue titles in opened events.</p>
+        ${bars(ev.tags.slice(0, 8))}
+      </article>` : ""}
+    </div>`);
+}
 
-  // Agents
-  cards.push(`<article class="card"><h3>AI agents in your activity</h3>
-    <p class="big">${ev.agentEvents ? `<strong>${fmt(ev.agentEvents)}</strong> of ${fmt(ev.total)} feed events (${pct(ev.agentShare)}) came from an agent app or an agent branch.` : "No agent apps or agent branches found in the feed."}</p>
-    ${ev.agents.length ? bars(ev.agents, { violet: true }) : ""}
-    ${pr.agentAuthored ? `<div class="callout"><strong>${fmt(pr.agentAuthored)}</strong> PRs came from agent branches. ${pr.agentUnreviewed.length ? `<strong>${fmt(pr.agentUnreviewed.length)}</strong> were merged with no review.` : "None were merged without review."}</div>` : ""}
-    <p class="note">Comments and issues count when an agent app posted them. Pushes, branches and PRs count when the branch starts with claude/, codex/, cursor/, copilot/, devin/ or jules/.</p>
-  </article>`);
+function pullRequestInsights(pr) {
+  const { asked, found, total } = state.prLookup;
+  const caption = total
+    ? `${fmt(found)} of ${fmt(asked)} requested details loaded · ${fmt(total)} ${total === 1 ? "pull request" : "distinct pull requests"} referenced in the feed`
+    : "No pull requests referenced in the loaded events.";
+  const notice = [state.errors.events, state.errors.prs].filter(Boolean).join(" ");
+  return insightSection("insight-prs", "Pull requests", caption, `
+    ${notice ? `<p class="insight-notice">${esc(notice)}</p>` : ""}
+    ${pr.total ? `<div class="grid insights">
+      <article class="card">
+        <h4>Merge activity</h4>
+        ${stats([["Merged", fmt(pr.merged)], ["Median time to merge", hoursLabel(pr.medianHoursToMerge)], ["Zero recorded reviews", pr.merged ? `${fmt(pr.unreviewed.length)} / ${fmt(pr.merged)}` : "—"]])}
+        <p class="note">${fmt(pr.selfMerged)} merged by the PR author. Review counts reflect the loaded PR details.</p>
+      </article>
+      <article class="card">
+        <h4>Current status and size</h4>
+        ${stats([["Open", fmt(pr.open.length)], ["Open drafts", fmt(pr.drafts)], ["Median lines changed", fmt(pr.medianSize)]])}
+        ${bars(pr.largest.map((p) => [`${shortRepo(p.repo)} #${p.number}`, p.additions + p.deletions]))}
+        <p class="note">Largest sampled changes by additions plus deletions. ${fmt(pr.agentBranches)} sampled PRs had a known agent branch prefix.</p>
+      </article>
+    </div>` : ""}`);
+}
 
-  // Branch hygiene
-  cards.push(`<article class="card"><h3>Branch habits</h3>
-    <div class="stat-row"><div class="stat"><b>${pct(ev.defaultPushShare)}</b><span>pushes to main</span></div><div class="stat"><b>${fmt(ev.branchesCreated)}</b><span>branches created</span></div><div class="stat"><b>${fmt(ev.branchesDeleted)}</b><span>branches deleted</span></div></div>
-    <p class="big">${ev.defaultPushes ? `${fmt(ev.defaultPushes)} direct pushes to main skipped a pull request.` : "Every push in the window went to a branch."} ${ev.prActions.merged ? `${fmt(ev.prActions.merged)} PRs merged in the window.` : ""}</p>
-  </article>`);
-
-  // Work mix
-  if (ev.tags.length) {
-    cards.push(`<article class="card"><h3>Work mix</h3>
-      <p class="big">From the <code>[tag]</code> at the start of issues you opened in the feed window.</p>
-      ${bars(ev.tags.slice(0, 8))}
-    </article>`);
-  }
-
-  // Monthly trend
-  if (year && year.monthly.length) {
-    const max = Math.max(1, ...year.monthly.map(([, n]) => n));
-    cards.push(`<article class="card"><h3>Monthly trend</h3>
-      <div class="cols">${year.monthly.map(([m, n]) => `<div class="col"><i style="height:${Math.max(2, (n / max) * 70).toFixed(0)}px" title="${esc(m)}: ${fmt(n)}"></i><span>${MONTHS[Number(m.slice(5, 7)) - 1].slice(0, 1)}</span></div>`).join("")}</div>
-      <p class="note">${year.trend == null ? "" : `Last 30 days: ${fmt(year.last30)} vs ${fmt(year.prev30)} the 30 before.`}</p>
-    </article>`);
-  }
-
-  $("insights").innerHTML = cards.join("");
+function renderInsights({ ev, pr, year }) {
+  $("insight-nav").querySelectorAll("button").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.source === state.insight));
+  });
+  const panel = state.insight === "events" ? eventInsights(ev)
+    : state.insight === "prs" ? pullRequestInsights(pr) : annualInsights(year);
+  $("insights").innerHTML = `${state.errors.refresh ? `<p class="insight-notice">${esc(state.errors.refresh)}</p>` : ""}${panel}`;
 }
 
 function renderMeta(c) {
   const { ev, year } = c;
   const v = state.viewer;
-  const span = ev.spanHours < 48 ? `${Math.max(1, Math.round(ev.spanHours))} hours` : `${Math.round(ev.spanHours / 24)} days`;
+  const range = dateRange(ev.oldest, ev.newest);
   const cards = [];
 
   cards.push(`<article class="card"><h3>How far back the stream goes</h3>
-    <p class="big">The feed holds <strong>${fmt(ev.total)}</strong> events covering <strong>${span}</strong>.</p>
+    <p class="big"><strong>${fmt(ev.total)}</strong> events loaded${range ? ` · ${range}` : ""}.</p>
     <div class="callout">${esc(state.errors.events || "The stream covers the events returned by GitHub for this token. GitHub limits the feed to 300 recent events.")}</div>
-    <p class="note">Insights marked as feed-based cover only this window. Year cards use the full contribution calendar.</p>
+    <p class="note">GitHub can delay events. Insights shows the loaded date range for each source.</p>
   </article>`);
 
   const kind = state.tokenKind;
   const caps = [];
-  caps.push([state.errors.events ? "part" : "ok", "Activity stream", esc(state.errors.events || "Recent events loaded.")]);
+  caps.push([state.errors.events ? "part" : "ok", "Activity stream", esc(state.errors.events || `${fmt(ev.total)} recent events loaded.`)]);
   caps.push(ev.privateEvents ? ["ok", "Private events", `${fmt(ev.privateEvents)} private events visible.`]
     : ["part", "Private events", kind === "fine-grained" ? "None visible. Add the account permission Events: read to the token if you have private activity." : "None in this window."]);
   caps.push(state.notifications ? [state.errors.notifications ? "part" : "ok", "Notifications", `${fmt(state.notifications.length)} unread loaded. ${esc(state.errors.notifications || "")}`]
@@ -475,19 +554,19 @@ function renderMeta(c) {
   if (year) {
     caps.push(year.totals.restricted
       ? ["part", "Private contributions", `${fmt(year.totals.restricted)} contributions are counted but hidden from this token.`]
-      : ["ok", "Private contributions", "None hidden from this token."]);
+      : ["ok", "Restricted contributions", "GitHub reported no restricted contribution count."]);
   }
+  if (state.errors.account) caps.push(["part", "Account details", esc(state.errors.account)]);
   cards.push(`<article class="card"><h3>What this token can see</h3>
     <p class="big">Signed in with a <strong>${esc(kind || "GitHub")}</strong> token.</p>
     <ul class="cap">${caps.map(([s, t, d]) => `<li><span class="${s}">${s === "ok" ? "✓" : s === "no" ? "✕" : "!"}</span><div><div>${esc(t)}</div><div class="d">${d}</div></div></li>`).join("")}</ul>
   </article>`);
 
   if (v) {
-    const created = new Date(v.createdAt);
-    const years = ((Date.now() - created.getTime()) / (365.25 * 864e5)).toFixed(1);
+    const created = v.createdAt && new Date(v.createdAt);
     cards.push(`<article class="card"><h3>Account</h3>
       <dl class="kv">
-        <dt>On GitHub since</dt><dd>${esc(created.toLocaleDateString(undefined, { month: "short", year: "numeric" }))} · ${years} years</dd>
+        <dt>On GitHub since</dt><dd>${created ? esc(created.toLocaleDateString(undefined, { month: "short", year: "numeric" })) : "—"}</dd>
         <dt>Repositories you own</dt><dd>${fmt(v.repositories && v.repositories.totalCount)}</dd>
         <dt>Followers</dt><dd>${fmt(v.followers && v.followers.totalCount)}</dd>
         <dt>Repositories committed to this year</dt><dd>${fmt(year && year.totals.repos)}</dd>
@@ -502,9 +581,9 @@ function renderMeta(c) {
       <dt>Last refreshed</dt><dd>${state.refreshedAt ? esc(state.refreshedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })) : "—"}</dd>
       <dt>New since marked seen</dt><dd>${fmt(ev.fresh)}</dd>
       <dt>Marked seen at</dt><dd>${state.lastSeen ? esc(new Date(state.lastSeen).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })) : "—"}</dd>
-      <dt>API requests left this hour</dt><dd>${esc(state.remaining ?? "—")}</dd>
+      <dt>Rate limit remaining</dt><dd>${esc(state.remaining ?? "—")}</dd>
     </dl>
-    <p class="note">Each refresh uses about 6 API requests. The token stays on this Mac and is sent only to api.github.com.</p>
+    <p class="note">The limit is from the last GitHub response. REST and GraphQL use separate limits.</p>
   </article>`);
 
   $("meta").innerHTML = cards.join("");
@@ -520,8 +599,11 @@ function renderAll() {
 }
 
 function showTab(tab) {
-  state.tab = tab;
-  document.querySelectorAll(".nav").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  document.querySelectorAll(".nav").forEach((b) => {
+    const active = b.dataset.tab === tab;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-current", active ? "page" : "false");
+  });
   document.querySelectorAll("[data-view]").forEach((v) => v.classList.toggle("hidden", v.dataset.view !== tab));
   $("content").scrollTop = 0;
 }
@@ -551,7 +633,13 @@ async function boot() {
   }
 }
 
-$("create-token").addEventListener("click", () => window.desk.openTokenPage());
+$("create-token").addEventListener("click", async () => {
+  try {
+    const result = await window.desk.openTokenPage();
+    if (result.ok) return;
+  } catch { /* The system browser could not be opened. */ }
+  signinMessage("Could not open GitHub in your browser.", true);
+});
 $("token-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const button = $("signin-btn");
@@ -590,10 +678,9 @@ async function signOut() {
   signingOut = true;
   showApp(false);
   state = { ...initialState };
-  for (const id of ["me-name", "me-login", "summary", "kpis", "attention", "notes", "year-caption",
+  for (const id of ["me-name", "me-login", "initials", "summary", "kpis", "attention", "notes", "year-caption",
     "year-heat", "stream-caption", "chips", "repo-filter", "minor-count", "stream", "insights", "meta",
     "fresh-badge", "refreshed"]) $(id).textContent = "";
-  $("avatar").removeAttribute("src");
   $("search").value = "";
   $("hide-minor").checked = true;
   setBusy("");
@@ -619,6 +706,23 @@ $("signout").addEventListener("click", signOut);
 $("forget-token").addEventListener("click", signOut);
 $("refresh").addEventListener("click", refresh);
 document.querySelectorAll(".nav").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
+$("insight-nav").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-source]");
+  if (!button || state.insight === button.dataset.source) return;
+  state.insight = button.dataset.source;
+  renderInsights(computed());
+  $("content").scrollTop = 0;
+});
+$("insights").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-insight-repo]");
+  if (!button) return;
+  Object.assign(state, { repo: button.dataset.insightRepo, filter: "all", query: "", hideMinor: false });
+  $("search").value = "";
+  $("hide-minor").checked = false;
+  showTab("stream");
+  renderStream(computed());
+  $("repo-filter").focus();
+});
 $("chips").addEventListener("click", (event) => {
   const chip = event.target.closest(".chip");
   if (!chip) return;
