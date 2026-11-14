@@ -1,0 +1,32 @@
+name: Check macOS package
+
+on:
+  pull_request:
+    paths:
+      - 'Activity Desk.app/**'
+      - 'scripts/package-macos.sh'
+      - '.github/workflows/package-check.yml'
+      - '.github/workflows/release.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  package-check:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Package and verify the Apple silicon app
+        run: |
+          payload='Activity Desk.app/Contents/Resources/app'
+          touch "$payload/.env.package-fixture"
+          output="$RUNNER_TEMP/package-check"
+          bash scripts/package-macos.sh "$output"
+          cd "$output"
+          shasum -a 256 -c Activity-Desk-macos-arm64.zip.sha256
+          ditto -x -k Activity-Desk-macos-arm64.zip extracted
+          codesign --verify --deep --strict 'extracted/Activity Desk.app'
+          test ! -e "extracted/$payload/.env.package-fixture"
