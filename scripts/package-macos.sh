@@ -1,0 +1,25 @@
+#!/bin/bash
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+output=${1:?Pass an output directory}
+version=45.2.1
+archive="electron-v${version}-darwin-arm64.zip"
+digest=a9a1a0a5b64df714957f83467c84823cb34792205922c6f136550b2403605922
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/activity-desk-package.XXXXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+
+curl --fail --location --silent --show-error --retry 3 \
+  "https://github.com/electron/electron/releases/download/v${version}/${archive}" -o "$scratch/$archive"
+printf '%s  %s\n' "$digest" "$scratch/$archive" | shasum -a 256 -c -
+ditto -x -k "$scratch/$archive" "$scratch/unpacked"
+app="$scratch/unpacked/Electron.app"
+test -x "$app/Contents/MacOS/Electron"
+cp "$root/Activity Desk.app/Contents/Info.plist" "$app/Contents/Info.plist"
+ditto "$root/Activity Desk.app/Contents/Resources/app" "$app/Contents/Resources/app"
+codesign --force --deep --sign - "$app"
+codesign --verify --deep --strict "$app"
+mkdir -p "$output"
+mv "$app" "$scratch/unpacked/Activity Desk.app"
+ditto -c -k --sequesterRsrc --keepParent "$scratch/unpacked/Activity Desk.app" "$output/Activity-Desk-macos-arm64.zip"
+(cd "$output" && shasum -a 256 Activity-Desk-macos-arm64.zip > Activity-Desk-macos-arm64.zip.sha256)

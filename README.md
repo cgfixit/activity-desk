@@ -31,6 +31,12 @@ This repository contains the app source and bundle metadata. You need an existin
 
 The workspace launcher has an incomplete bundle signature. A distributable download needs separately built and signed packaging.
 
+## Automated macOS releases
+
+The release workflow runs after a pull request is merged into `main`. It waits for Verify, both CodeQL analyses, and the other checks reported on that commit to succeed before creating a GitHub release. GitHub's skipped CodeQL configuration adjustment is allowed. The workflow waits for 50 seconds of successful checks to allow additional checks to register. Checks that register later cannot hold back an already published release. A release contains an Apple silicon app ZIP and a SHA-256 checksum. The app is ad-hoc signed and is not notarized, so macOS Gatekeeper can require a manual exception. Each release tag contains the merge commit SHA.
+
+The workflow downloads the pinned Electron 45.2.1 arm64 archive and checks its SHA-256 before assembling the app. To build the same archive on a Mac, run `bash scripts/package-macos.sh /path/to/output`.
+
 ## GitHub access
 
 Start with a fine-grained token. Use **Events** read access to see private events. Grant **Pull requests** read access to the repositories whose private PR details you want to see. GitHub's unread notifications endpoint requires a classic token with the `notifications` scope. A classic `repo` scope grants write access to other clients holding the token. [GitHub token documentation](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
