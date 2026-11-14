@@ -3,9 +3,9 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 output=${1:?Pass an output directory}
-version=45.2.1
+version=45.3.2
 archive="electron-v${version}-darwin-arm64.zip"
-digest=a9a1a0a5b64df714957f83467c84823cb34792205922c6f136550b2403605922
+digest=8bdf5d55fbcc2c348b5d34b9e87a364cd2947d00b7c8bfadc6cc50233cd79ac6
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/activity-desk-package.XXXXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 
