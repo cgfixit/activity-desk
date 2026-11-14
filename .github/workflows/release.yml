@@ -1,0 +1,59 @@
+name: Release macOS app
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  checks: read
+  statuses: read
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - name: Identify a merged pull request
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          for attempt in {1..12}; do
+            echo "Checking merge association ($attempt/12)"
+            merged=$(gh api --paginate --slurp "repos/$REPOSITORY/commits/$COMMIT/pulls?per_page=100" |
+              jq --arg commit "$COMMIT" '[.[][] | select(.merged_at != null and .base.ref == "main" and .merge_commit_sha == $commit)] | length')
+            if [ "$merged" -gt 0 ]; then
+              echo "merged=true" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            sleep 5
+          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.merge.outputs.merged == 'true'
+        with:
+          persist-credentials: false
+      - name: Wait for checks on this commit
+        if: steps.merge.outputs.merged == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: bash scripts/wait-for-checks.sh
+      - name: Package app
+        if: steps.merge.outputs.merged == 'true'
+        run: bash scripts/package-macos.sh "$RUNNER_TEMP/release"
+      - name: Publish release
+        if: steps.merge.outputs.merged == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          tag="main-$COMMIT"
+          gh release create "$tag" --repo "$REPOSITORY" --target "$COMMIT" \
+            --title "Activity Desk $COMMIT" --notes "Automated arm64 build for commit $COMMIT. The app is ad-hoc signed and is not notarized." \
+            "$RUNNER_TEMP/release/Activity-Desk-macos-arm64.zip" \
+            "$RUNNER_TEMP/release/Activity-Desk-macos-arm64.zip.sha256"
