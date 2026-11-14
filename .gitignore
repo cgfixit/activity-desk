@@ -9,9 +9,10 @@
 *.local/
 .DS_Store
 node_modules/
-.env
-.env.*
 .envrc
+.direnv/
+*.env
+*.env.*
 github-token*
 credential-*/
 Local Storage/
@@ -27,6 +28,8 @@ Crashpad/
 *.ips
 *.dmg
 *.pkg
+/Activity-Desk-macos-*.zip
+/Activity-Desk-macos-*.zip.sha256
 /dist/
 /profile/
 /profiles/
