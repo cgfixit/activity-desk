@@ -141,6 +141,10 @@ async function lookupPullRequests(account, refs) {
       ...pr, repo: r.repo, number: r.number,
       headRef: pr.headRefName, author: pr.author?.login, mergedBy: pr.mergedBy?.login,
       reviews: pr.reviews.totalCount,
+      reviewList: (Array.isArray(pr.reviews.nodes) ? pr.reviews.nodes : []).map((r) => ({
+        login: r?.author?.login || "", at: r?.submittedAt,
+        bot: r?.author?.__typename === "Bot" || I.isBotLogin(r?.author?.login),
+      })),
     };
   });
   return {
@@ -227,8 +231,11 @@ function computed() {
   const rhythm = state.contributions ? I.summarizeRhythm(state.contributions) : null;
   const sessions = I.summarizeSessions(state.events, state.user && state.user.login);
   const prPatterns = I.summarizePrPatterns(state.prInfo, state.refreshedAt);
-  const observations = I.deriveObservations({ rhythm, sessions, prs: prPatterns });
-  return { ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, observations };
+  const trajectory = state.contributions ? I.summarizeTrajectory(state.contributions) : null;
+  const follow = I.summarizeFollowThrough(state.events, state.prInfo, state.refreshedAt);
+  const review = I.summarizeReviewFlow(state.prInfo, state.user && state.user.login);
+  const observations = I.deriveObservations({ rhythm, sessions, prs: prPatterns, trajectory, follow, review });
+  return { ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, observations };
 }
 
 function renderOverview(c) {
@@ -519,7 +526,7 @@ function pullRequestInsights(pr) {
 
 const sourceTag = (name) => `<span class="src">${esc(name)}</span>`;
 
-function patternInsights({ ev, pr, rhythm, sessions, prPatterns, observations }) {
+function patternInsights({ ev, pr, rhythm, sessions, prPatterns, trajectory, follow, review, observations }) {
   const sources = [
     rhythm ? "the contribution year" : "",
     ev.total ? `${fmt(ev.total)} loaded events` : "",
@@ -586,7 +593,51 @@ function patternInsights({ ev, pr, rhythm, sessions, prPatterns, observations })
       <article class="card"><h4>Work sessions</h4>${sourceTag("Recent events")}${sessionCard}</article>
       <article class="card"><h4>Work mix</h4>${sourceTag("Recent events")}${mixCard}</article>
       <article class="card"><h4>Merge patterns</h4>${sourceTag("Sampled pull requests")}${prCard}</article>
+      <article class="card"><h4>Trajectory</h4>${sourceTag("Contribution year")}${trajectoryCard(trajectory)}</article>
+      <article class="card"><h4>Follow-through</h4>${sourceTag("Recent events")}${followCard(follow)}</article>
+      <article class="card insight-wide"><h4>Review turnaround</h4>${sourceTag("Sampled pull requests")}${reviewCard(review, pr)}</article>
     </div>`);
+}
+
+function trajectoryCard(t) {
+  if (!t) return `<p class="note">${esc(state.errors.year || "The contribution calendar did not load.")}</p>`;
+  if (!t.series.length) return '<p class="note">No full weeks in the returned calendar.</p>';
+  const s = t.shift;
+  const max = Math.max(1, ...t.series.map((w) => w.count));
+  const cols = t.series.map((w, i) => {
+    const later = s && s.clear && i >= s.weeksBefore;
+    return `<span class="${later ? "after" : ""}" style="height:${Math.max(2, Math.round((w.count / max) * 100))}%" title="${esc(`Week of ${w.start}: ${fmt(w.count)}`)}"></span>`;
+  }).join("");
+  const perWeek = (x) => (x >= 10 ? fmt(Math.round(x)) : x.toFixed(1));
+  const odds = (o) => (o ? pct(o.rate) : "—");
+  const shiftText = !s ? `A level-shift check needs at least 12 full weeks; ${fmt(t.weeks)} are available.`
+    : s.clear ? `The clearest shift came in the week of <strong>${esc(s.at)}</strong>: ${perWeek(s.before)} a week before, <strong>${perWeek(s.after)}</strong> a week since.`
+    : `No clear shift. The best split, in the week of ${esc(s.at)}, moves from ${perWeek(s.before)} to ${perWeek(s.after)} a week, which random reorderings of the same weeks match or exceed ${pct(1 - s.beaten)} of the time.`;
+  return `
+    ${stats([["Active the day after an active day", odds(t.afterActive)], ["Active the day after an idle day", odds(t.afterIdle)], ["Full weeks", fmt(t.weeks)]])}
+    <div class="weekly" role="img" aria-label="Weekly contribution totals, oldest first">${cols}</div>
+    <p class="note">${shiftText} The split is the one that best separates two weekly averages, with six or more weeks on each side. It counts as a shift when it beats 95% of the same weeks shuffled into random order and moves the average by at least a quarter. Today is left out of the next-day rates.</p>`;
+}
+
+function followCard(f) {
+  if (!f.branches && !f.opened) return '<p class="note">No branches created or pull requests opened in the loaded events.</p>';
+  const o = f.outcomes;
+  const list = f.withoutPr.slice(0, 4).map((b) => `<li><code>${esc(b.ref)}</code> · ${esc(shortRepo(b.repo))} · ${fmt(Math.floor(b.days))} d</li>`).join("");
+  return `
+    ${stats([["Branches with no PR", f.settled ? `${fmt(f.withoutPr.length)} / ${fmt(f.settled)}` : "—"], ["Opened PRs merged", f.opened ? `${fmt(o.merged)} / ${fmt(f.opened)}` : "—"], ["Closed unmerged", fmt(o.closed)]])}
+    ${f.opened ? bars([["Merged", o.merged], ["Still open", o.open], ["Closed unmerged", o.closed], ["Details unavailable", o.unknown]].filter(([, n]) => n)) : ""}
+    ${list ? `<ul class="plain">${list}</ul>` : ""}
+    <p class="note">Branches count once they are two days old and match a pull request by head branch from the feed or the sampled details. Pull request outcomes use current state, so they cover only the ${fmt(f.opened)} pull requests opened in the loaded events.</p>`;
+}
+
+function reviewCard(r, pr) {
+  if (!pr.total) return '<p class="note">No pull request details are loaded.</p>';
+  if (!r.authored) return '<p class="note">None of the sampled pull requests were authored by you, so there is no review wait to measure.</p>';
+  const people = r.reviewers.slice(0, 5);
+  return `
+    ${stats([["Median to first human review", r.withHumanReview ? hoursLabel(r.medianFirstReviewHours) : "—"], ["Merges reviewed only by bots", r.merged ? `${fmt(r.botOnly)} / ${fmt(r.merged)}` : "—"], ["Merged by you", r.merged ? `${fmt(r.selfMerged)} / ${fmt(r.merged)}` : "—"]])}
+    ${people.length ? bars(people, { violet: true }) + '<p class="note">Pull requests each person reviewed.</p>' : '<p class="note">No one besides you or a bot reviewed the sampled pull requests you authored.</p>'}
+    <p class="note">Measured on ${fmt(r.authored)} sampled ${r.authored === 1 ? "pull request" : "pull requests"} you authored, following the CHAOSS time-to-first-response definition: the first review by a human who is not the author, from creation. Draft time counts toward the wait. ${fmt(r.withHumanReview)} had a human review; ${fmt(r.reviewedBeforeMerge)} of ${fmt(r.merged)} merges got one before merging.${r.truncated ? ` ${fmt(r.truncated)} had more than 10 reviews, and only the first 10 are read.` : ""}</p>`;
 }
 
 function renderInsights(c) {

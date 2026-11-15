@@ -195,7 +195,8 @@ const YEAR_QUERY = `query {
 
 const REPO_NAME = /^[A-Za-z0-9_.-]{1,100}$/;
 const PR_FIELDS = `title state merged isDraft createdAt mergedAt additions deletions headRefName
-  author { login } mergedBy { login } reviews { totalCount }`;
+  author { login } mergedBy { login }
+  reviews(first: 10) { totalCount nodes { submittedAt author { __typename login } } }`;
 
 function githubRequest(operation, args) {
   switch (operation) {
