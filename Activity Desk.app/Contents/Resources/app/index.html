@@ -29,7 +29,7 @@
       <details class="help">
         <summary>Which token should I use?</summary>
         <ul>
-          <li><strong>Fine-grained</strong> works for the stream and insights. For private events, add the account permission <strong>Events: read</strong>. For private pull request details, give it access to those repositories with <strong>Pull requests: read</strong>.</li>
+          <li><strong>Fine-grained</strong> works for the stream and insights. For private events, add the account permission <strong>Events: read</strong>. For private pull request details, give it access to those repositories with <strong>Pull requests: read</strong>. For private issue conversations, add <strong>Issues: read</strong>.</li>
           <li><strong>Classic</strong> with <code>notifications</code> enables the unread inbox. GitHub's classic <code>repo</code> scope also grants write access to private repositories.</li>
           <li>Activity Desk encrypts the saved token using macOS Keychain and sends it only to api.github.com.</li>
         </ul>
@@ -94,12 +94,16 @@
           <h2>Activity stream</h2>
           <p class="lede" id="stream-caption"></p>
         </header>
+        <div class="insight-nav stream-source" id="stream-source" role="group" aria-label="Stream source">
+          <button type="button" data-stream="events" aria-pressed="true" aria-controls="stream">Your events</button>
+          <button type="button" data-stream="conversations" aria-pressed="false" aria-controls="stream">Conversations <span class="n" id="conversation-count"></span></button>
+        </div>
         <div class="toolbar">
           <div class="chips" id="chips" role="tablist" aria-label="Event type"></div>
           <div class="toolbar-right">
             <select id="repo-filter" aria-label="Repository"></select>
             <input id="search" type="search" placeholder="Search" aria-label="Search events">
-            <label class="toggle"><input type="checkbox" id="hide-minor" checked> Hide routine changes <span id="minor-count"></span></label>
+            <label class="toggle" id="hide-minor-label"><input type="checkbox" id="hide-minor" checked> Hide routine changes <span id="minor-count"></span></label>
             <button class="btn ghost" id="mark-seen" type="button">Mark all seen</button>
           </div>
         </div>

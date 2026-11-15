@@ -195,10 +195,36 @@ const YEAR_QUERY = `query {
 
 const REPO_NAME = /^[A-Za-z0-9_.-]{1,100}$/;
 const PR_FIELDS = `title state merged isDraft createdAt mergedAt additions deletions headRefName
-  author { login } mergedBy { login } reviews { totalCount }`;
+  author { login } mergedBy { login }
+  reviews(first: 10) { totalCount nodes { submittedAt author { __typename login } } }`;
+
+// Recent comments on issues and pull requests that involve the user, open or closed.
+// Search finds the threads; each thread's latest comments, reviews, and review comments are read live.
+const COMMENT_FIELDS = "author { __typename login } bodyText createdAt";
+const CONVERSATIONS_QUERY = `query ($q: String!) {
+  search(query: $q, type: ISSUE, first: 25) {
+    issueCount
+    nodes {
+      __typename
+      ... on Issue { number title issueState: state updatedAt author { login } repository { nameWithOwner }
+        comments(last: 10) { totalCount nodes { ${COMMENT_FIELDS} } } }
+      ... on PullRequest { number title prState: state merged updatedAt author { login } repository { nameWithOwner }
+        comments(last: 10) { totalCount nodes { ${COMMENT_FIELDS} } }
+        reviews(last: 10) { totalCount nodes { ${COMMENT_FIELDS} state
+          comments(first: 5) { totalCount nodes { ${COMMENT_FIELDS} path } } } } }
+    }
+  }
+}`;
+const CONVERSATION_DAYS = 30;
 
 function githubRequest(operation, args) {
   switch (operation) {
+    case "conversations": {
+      const login = args?.login;
+      if (typeof login !== "string" || !/^[A-Za-z0-9-]{1,39}$/.test(login)) break;
+      const since = new Date(Date.now() - CONVERSATION_DAYS * 864e5).toISOString().slice(0, 10);
+      return { route: "/graphql", body: { query: CONVERSATIONS_QUERY, variables: { q: `involves:${login} updated:>=${since} sort:updated-desc` } } };
+    }
     case "profile": return { route: "/user" };
     case "notifications": return { route: "/notifications?all=false&per_page=50" };
     case "year": return { route: "/graphql", body: { query: YEAR_QUERY } };

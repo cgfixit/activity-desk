@@ -555,8 +555,189 @@ function summarizePrPatterns(prInfo, now) {
   };
 }
 
+const TRAJECTORY_MIN_WEEKS = 6;
+const TRAJECTORY_SHUFFLES = 200;
+const TRAJECTORY_MIN_CHANGE = 0.25;
+const FOLLOW_GRACE_DAYS = 2;
+
+// The split of a series into before and after that removes the most squared error around the overall mean.
+function bestSplit(values) {
+  const n = values.length;
+  const total = sum(values);
+  let best = null;
+  let left = 0;
+  for (let k = 1; k < n; k += 1) {
+    left += values[k - 1];
+    if (k < TRAJECTORY_MIN_WEEKS || n - k < TRAJECTORY_MIN_WEEKS) continue;
+    const before = left / k;
+    const after = (total - left) / (n - k);
+    const gain = (k * (n - k) / n) * (after - before) ** 2;
+    if (!best || gain > best.gain) best = { k, gain, before, after };
+  }
+  return best;
+}
+
+// Weekly level shifts and day-to-day persistence in the contribution year.
+function summarizeTrajectory(year) {
+  const days = (year && year.days) || [];
+  const weeks = [];
+  for (let end = days.length; end >= 7; end -= 7) {
+    const slice = days.slice(end - 7, end);
+    weeks.unshift({ start: slice[0].date, count: sum(slice.map((d) => d.contributionCount || 0)) });
+  }
+
+  let shift = null;
+  const n = weeks.length;
+  if (n >= TRAJECTORY_MIN_WEEKS * 2) {
+    const values = weeks.map((w) => w.count);
+    const best = bestSplit(values);
+    // The best split is chosen to look as different as possible, so compare it with the best split of
+    // the same weeks in random order. A shift is clear when it beats 95% of the shuffles.
+    let seed = 1;
+    const random = () => (seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296;
+    const shuffled = values.slice();
+    let beaten = 0;
+    for (let round = 0; round < TRAJECTORY_SHUFFLES; round += 1) {
+      for (let i = shuffled.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      if (bestSplit(shuffled).gain < best.gain) beaten += 1;
+    }
+    const diff = best.after - best.before;
+    shift = {
+      at: weeks[best.k].start,
+      weeksBefore: best.k,
+      weeksAfter: n - best.k,
+      before: best.before,
+      after: best.after,
+      beaten: beaten / TRAJECTORY_SHUFFLES,
+      clear: diff !== 0 && beaten / TRAJECTORY_SHUFFLES >= 0.95 &&
+        Math.abs(diff) / Math.max(best.before, best.after) >= TRAJECTORY_MIN_CHANGE,
+    };
+  }
+
+  // Today can still be empty, so it is never counted as the day after.
+  const counts = days.slice(0, -1).map((d) => (d.contributionCount || 0) > 0);
+  const after = { active: [0, 0], idle: [0, 0] };
+  for (let i = 1; i < counts.length; i += 1) {
+    const bucket = counts[i - 1] ? after.active : after.idle;
+    bucket[1] += 1;
+    if (counts[i]) bucket[0] += 1;
+  }
+  const odds = (pair) => (pair[1] >= 10 ? { rate: pair[0] / pair[1], days: pair[1] } : null);
+  return { weeks: n, series: weeks, shift, afterActive: odds(after.active), afterIdle: odds(after.idle) };
+}
+
+// Whether work that starts in the Events feed reaches a pull request and a merge.
+function summarizeFollowThrough(events, prInfo, now) {
+  const nowTime = now == null ? Date.now() : new Date(now).getTime();
+  const prs = Object.values(prInfo || {}).filter((pr) => pr?.title);
+  const headRefs = new Set(prs.map((pr) => `${pr.repo} ${pr.headRef}`));
+  const prBranches = new Set();
+  const opened = new Map();
+  const branches = new Map();
+  for (const e of events || []) {
+    const repo = repoName(e);
+    const p = e.payload || {};
+    if (e.type === "PullRequestEvent") {
+      const ref = branchOf(e);
+      if (ref) prBranches.add(`${repo} ${ref}`);
+      const number = p.number || p.pull_request?.number;
+      if (p.action === "opened" && Number.isInteger(number)) opened.set(prKey(repo, number), { repo, number });
+    }
+    if (e.type === "CreateEvent" && p.ref_type === "branch" && p.ref) {
+      const time = Date.parse(e.created_at);
+      const key = `${repo} ${p.ref}`;
+      if (Number.isFinite(time) && (!branches.has(key) || branches.get(key).time > time)) branches.set(key, { repo, ref: String(p.ref), time });
+    }
+  }
+
+  // Branches younger than the grace period have not had a fair chance to get a pull request.
+  const settled = [...branches.entries()].filter(([, b]) => (nowTime - b.time) / DAY_MS >= FOLLOW_GRACE_DAYS);
+  const withoutPr = settled.filter(([key]) => !headRefs.has(key) && !prBranches.has(key))
+    .map(([, b]) => ({ repo: b.repo, ref: b.ref, days: (nowTime - b.time) / DAY_MS, agent: agentFromBranch(b.ref) }))
+    .sort((a, b) => b.days - a.days);
+
+  const outcomes = { merged: 0, closed: 0, open: 0, unknown: 0 };
+  const closed = [];
+  for (const [key, ref] of opened) {
+    const pr = prInfo?.[key];
+    if (!pr?.title) outcomes.unknown += 1;
+    else if (pr.merged) outcomes.merged += 1;
+    else if (pr.state === "CLOSED") {
+      outcomes.closed += 1;
+      closed.push({ repo: ref.repo, number: ref.number, agent: agentFromBranch(pr.headRef) });
+    } else outcomes.open += 1;
+  }
+  return {
+    branches: branches.size,
+    settled: settled.length,
+    withoutPr,
+    agentWithoutPr: withoutPr.filter((b) => b.agent).length,
+    opened: opened.size,
+    outcomes,
+    closed,
+  };
+}
+
+const isBotLogin = (login) => /\[bot\]$|-bot$|^copilot/i.test(String(login || ""));
+
+// Review turnaround in the sampled pull requests, after CHAOSS "time to first response":
+// the first review by a human who is not the author, measured from when the pull request was created.
+function summarizeReviewFlow(prInfo, login) {
+  const me = String(login || "").toLowerCase();
+  const rows = Object.values(prInfo || {}).filter((pr) => pr?.title && Array.isArray(pr.reviewList));
+  const authored = rows.filter((pr) => me && String(pr.author || "").toLowerCase() === me);
+  const firstHuman = (pr) => pr.reviewList
+    .filter((r) => !r.bot && r.login && r.login.toLowerCase() !== String(pr.author || "").toLowerCase() && Number.isFinite(Date.parse(r.at)))
+    .sort((a, b) => Date.parse(a.at) - Date.parse(b.at))[0];
+
+  const waits = [];
+  let reviewedBeforeMerge = 0;
+  for (const pr of authored) {
+    const first = firstHuman(pr);
+    if (!first) continue;
+    const hours = (Date.parse(first.at) - Date.parse(pr.createdAt)) / 36e5;
+    if (Number.isFinite(hours) && hours >= 0) waits.push(hours);
+    if (pr.merged && Date.parse(first.at) <= Date.parse(pr.mergedAt)) reviewedBeforeMerge += 1;
+  }
+
+  const merged = authored.filter((pr) => pr.merged);
+  const botOnly = merged.filter((pr) => pr.reviewList.length && pr.reviewList.every((r) => r.bot));
+  const noHuman = merged.filter((pr) => !firstHuman(pr));
+  const selfMerged = merged.filter((pr) => pr.mergedBy && pr.mergedBy.toLowerCase() === me);
+
+  // Who reviews this user's work, counting each reviewer once per pull request.
+  const reviewers = new Map();
+  for (const pr of authored) {
+    const seen = new Set();
+    for (const r of pr.reviewList) {
+      const name = r.login && r.login.toLowerCase();
+      if (!name || r.bot || name === me || seen.has(name)) continue;
+      seen.add(name);
+      reviewers.set(r.login, (reviewers.get(r.login) || 0) + 1);
+    }
+  }
+  const ranked = [...reviewers.entries()].sort((a, b) => b[1] - a[1]);
+  const reviewerTotal = sum(ranked.map(([, n]) => n));
+  return {
+    authored: authored.length,
+    withHumanReview: waits.length,
+    medianFirstReviewHours: median(waits),
+    merged: merged.length,
+    reviewedBeforeMerge,
+    botOnly: botOnly.length,
+    noHuman: noHuman.length,
+    selfMerged: selfMerged.length,
+    reviewers: ranked,
+    topReviewerShare: reviewerTotal ? ranked[0][1] / reviewerTotal : null,
+    truncated: authored.filter((pr) => pr.reviews > pr.reviewList.length).length,
+  };
+}
+
 // Plain-language findings. Each names its source, and each needs a minimum sample before it appears.
-function deriveObservations({ rhythm, sessions, prs }) {
+function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review }) {
   const out = [];
   const add = (tone, source, title, detail) => out.push({ tone, source, title, detail });
   const YEAR = "Contribution year";
@@ -641,6 +822,62 @@ function deriveObservations({ rhythm, sessions, prs }) {
         `Oldest is ${o.repo} #${o.number}, opened ${plural(Math.floor(o.days), "day")} ago.`);
     }
   }
+  const perWeek = (x) => `${x >= 10 ? Math.round(x) : x.toFixed(1)} a week`;
+  if (trajectory?.shift?.clear) {
+    const s = trajectory.shift;
+    const up = s.after > s.before;
+    add(up ? "good" : "info", YEAR, `Weekly output ${up ? "stepped up" : "dropped"} around the week of ${s.at}`,
+      `${perWeek(s.before)} across the ${s.weeksBefore} weeks before, ${perWeek(s.after)} across the ${s.weeksAfter} weeks since. This is the clearest single shift in the year's weekly totals.`);
+  }
+  if (trajectory?.afterActive && trajectory?.afterIdle) {
+    const a = trajectory.afterActive.rate;
+    const i = trajectory.afterIdle.rate;
+    if (a - i >= 0.3) {
+      add("info", YEAR, "Activity carries over from one day to the next",
+        `An active day was followed by another ${share(a)} of the time; an idle day was followed by an active one ${share(i)} of the time. Restarting after a break is the harder step.`);
+    } else if (Math.abs(a - i) < 0.1 && i >= 0.3) {
+      add("good", YEAR, "Breaks do not stall the next day",
+        `The chance of an active day is about the same after an active day (${share(a)}) as after an idle one (${share(i)}).`);
+    }
+  }
+
+  if (follow && follow.settled >= 4) {
+    const missing = follow.withoutPr.length;
+    if (missing / follow.settled >= 0.5) {
+      const agents = follow.agentWithoutPr ? ` ${follow.agentWithoutPr} of them are agent branches.` : "";
+      add("info", FEED, `${missing} of ${plural(follow.settled, "branch")} created in the feed never got a pull request`,
+        `Counting branches at least ${FOLLOW_GRACE_DAYS} days old. Oldest is ${follow.withoutPr[0].ref} in ${follow.withoutPr[0].repo}.${agents}`);
+    }
+  }
+  if (follow) {
+    const { merged, closed } = follow.outcomes;
+    const decided = merged + closed;
+    if (decided >= 4 && closed / decided >= 0.3) {
+      add("warn", FEED, `${closed} of ${plural(decided, "pull request")} you opened and that are now finished were closed without merging`,
+        `Pull requests opened in the loaded events, with current state from the sampled details. ${follow.outcomes.open} are still open.`);
+    }
+  }
+
+  if (review && review.withHumanReview >= 3) {
+    add("info", PRS, `Your pull requests waited a median of ${durationLabel(review.medianFirstReviewHours)} for a first human review`,
+      `Across ${plural(review.withHumanReview, "pull request")} that you authored and someone else reviewed. Bots and your own reviews are left out.`);
+  }
+  if (review && review.merged >= 3) {
+    if (review.botOnly && review.botOnly / review.merged >= 0.25) {
+      add("warn", PRS, `${review.botOnly} of ${plural(review.merged, "merge")} were reviewed only by bots`,
+        "These count as reviewed in the Pull requests view, but no person reviewed them.");
+    }
+    if (review.selfMerged / review.merged >= 0.8 && review.noHuman / review.merged >= 0.5) {
+      add("info", PRS, `You merged ${review.selfMerged} of your ${plural(review.merged, "sampled merge")} yourself`,
+        `${review.noHuman} of those merges had no human review from anyone else.`);
+    }
+  }
+  if (review && review.reviewers.length && review.withHumanReview >= 4 && review.topReviewerShare >= 0.6) {
+    const [name, count] = review.reviewers[0];
+    add("info", PRS, `One person handles most reviews of your work`,
+      `${name} reviewed ${count} of your sampled pull requests, ${share(review.topReviewerShare)} of all reviewer visits. Review depends on their availability.`);
+  }
+
   const rank = { warn: 0, good: 1, info: 1 };
   return out.sort((a, b) => rank[a.tone] - rank[b.tone]);
 }
@@ -663,6 +900,73 @@ function summarizeNotifications(items) {
     missed,
     ciNoise: unread.filter((item) => item.reason === "ci_activity").length - ciFailures.length,
   };
+}
+
+// ---------- Conversations ----------
+// Comments, reviews, and review comments on issues and pull requests that involve the user.
+const CONVERSATION_FILTERS = {
+  all: () => true,
+  others: (c) => !c.mine,
+  mine: (c) => c.mine,
+  reviews: (c) => c.kind !== "comment",
+  bots: (c) => c.bot,
+};
+
+function flattenConversations(data, login) {
+  const me = String(login || "").toLowerCase();
+  const search = data && data.search;
+  const nodes = Array.isArray(search?.nodes) ? search.nodes.filter((n) => n && n.repository && Number.isInteger(n.number)) : [];
+  const items = [];
+  const truncated = { comments: 0, reviews: 0, reviewComments: 0, threads: 0 };
+  const person = (author) => {
+    const name = author?.login || "ghost";
+    return { author: name, bot: author?.__typename === "Bot" || isBotLogin(name), mine: name.toLowerCase() === me };
+  };
+  for (const n of nodes) {
+    const isPr = n.__typename === "PullRequest";
+    const raw = String((isPr ? n.prState : n.issueState) || "").toLowerCase();
+    const thread = {
+      repo: n.repository.nameWithOwner,
+      number: n.number,
+      title: String(n.title || ""),
+      isPr,
+      state: isPr && n.merged ? "merged" : raw === "open" ? "open" : "closed",
+      author: n.author?.login || "",
+    };
+    const before = truncated.comments + truncated.reviews + truncated.reviewComments;
+    const comments = n.comments?.nodes || [];
+    if (n.comments?.totalCount > comments.length) truncated.comments += 1;
+    for (const c of comments) if (c) items.push({ kind: "comment", thread, ...person(c.author), at: c.createdAt, body: String(c.bodyText || "") });
+    const reviews = n.reviews?.nodes || [];
+    if (n.reviews?.totalCount > reviews.length) truncated.reviews += 1;
+    for (const r of reviews) {
+      if (!r) continue;
+      const verdict = String(r.state || "").toLowerCase();
+      // A plain COMMENTED review with no body only wraps its inline comments, which are listed below.
+      if (r.bodyText || (verdict && verdict !== "commented" && verdict !== "pending")) {
+        items.push({ kind: "review", thread, ...person(r.author), at: r.createdAt, body: String(r.bodyText || ""), verdict });
+      }
+      const inline = r.comments?.nodes || [];
+      if (r.comments?.totalCount > inline.length) truncated.reviewComments += 1;
+      for (const c of inline) if (c) items.push({ kind: "inline", thread, ...person(c.author), at: c.createdAt, body: String(c.bodyText || ""), path: String(c.path || "") });
+    }
+    if (truncated.comments + truncated.reviews + truncated.reviewComments > before) truncated.threads += 1;
+  }
+  const valid = items.filter((c) => Number.isFinite(Date.parse(c.at)));
+  valid.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  return {
+    items: valid,
+    threads: nodes.length,
+    matched: Number.isInteger(search?.issueCount) ? search.issueCount : nodes.length,
+    truncated,
+  };
+}
+
+function filterConversations(items, filter, repo, query) {
+  const f = CONVERSATION_FILTERS[filter] || CONVERSATION_FILTERS.all;
+  const q = String(query || "").trim().toLowerCase();
+  return (items || []).filter((c) => f(c) && (!repo || c.thread.repo === repo) &&
+    (!q || `${c.thread.repo} ${c.thread.title} ${c.author} ${c.body} ${c.path || ""}`.toLowerCase().includes(q)));
 }
 
 const MINOR_PR_ACTIONS = new Set(["labeled", "unlabeled", "synchronize", "assigned", "unassigned", "review_requested", "review_request_removed", "edited"]);
@@ -696,6 +1000,13 @@ const api = {
   summarizeRhythm,
   summarizeSessions,
   summarizePrPatterns,
+  summarizeTrajectory,
+  summarizeFollowThrough,
+  summarizeReviewFlow,
+  isBotLogin,
+  flattenConversations,
+  filterConversations,
+  CONVERSATION_FILTERS,
   deriveObservations,
   durationLabel,
   filterEvents,

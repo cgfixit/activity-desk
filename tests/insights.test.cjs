@@ -141,3 +141,94 @@ test("groups events into sessions and compares sampled merges with sample guards
     "97% of merged lines landed without a recorded review",
   ]);
 });
+
+test("reports a weekly level shift only when it beats shuffled weeks", () => {
+  const days = (count) => Array.from({ length: 112 }, (_, i) => ({
+    date: new Date(Date.UTC(2026, 0, 1) + i * 864e5).toISOString().slice(0, 10),
+    contributionCount: count(i),
+  }));
+  const step = insights.summarizeTrajectory({ days: days((i) => (i < 56 ? 2 : 10)) });
+  assert.equal(step.weeks, 16);
+  assert.deepEqual([step.shift.weeksBefore, step.shift.before, step.shift.after, step.shift.clear], [8, 14, 70, true]);
+  // Alternating weeks have no level change, so no split should pass.
+  const alternating = insights.summarizeTrajectory({ days: days((i) => (Math.floor(i / 7) % 2 ? 6 : 1)) });
+  assert.equal(alternating.shift.clear, false);
+  // Every other day active: an active day is never followed by another, an idle day always is.
+  const odd = insights.summarizeTrajectory({ days: days((i) => i % 2) });
+  assert.equal(odd.afterActive.rate, 0);
+  assert.equal(odd.afterIdle.rate, 1);
+  assert.equal(insights.summarizeTrajectory({ days: days(() => 1).slice(0, 70) }).shift, null);
+});
+
+test("follows branches to pull requests and measures first human review", () => {
+  const now = Date.parse("2026-03-20T12:00:00Z");
+  const at = (h) => new Date(Date.parse("2026-03-01T00:00:00Z") + h * 36e5).toISOString();
+  const ev = (type, payload, h, repo = "me/app") => ({ type, payload, created_at: at(h), repo: { name: repo } });
+  const events = [
+    ev("CreateEvent", { ref_type: "branch", ref: "fix/a" }, 0),
+    ev("PullRequestEvent", { action: "opened", number: 1, pull_request: { head: { ref: "fix/a" } } }, 1),
+    ev("CreateEvent", { ref_type: "branch", ref: "claude/b" }, 2),
+    ev("PullRequestEvent", { action: "opened", number: 2 }, 3),
+    ev("CreateEvent", { ref_type: "branch", ref: "codex/orphan" }, 4),
+    ev("CreateEvent", { ref_type: "branch", ref: "fix/new" }, 24 * 18.9),
+    ev("PullRequestEvent", { action: "opened", number: 3 }, 5),
+  ];
+  const review = (login, h, bot = false) => ({ login, at: at(h), bot });
+  const pr = (number, extra) => ({ title: `PR ${number}`, repo: "me/app", number, author: "me", createdAt: at(1), reviews: extra.reviewList.length, ...extra });
+  const prInfo = {
+    "me/app#1": pr(1, { headRef: "fix/a", merged: true, state: "MERGED", mergedAt: at(30), mergedBy: "me", reviewList: [review("me", 2), review("ana", 7), review("bo", 9)] }),
+    "me/app#2": pr(2, { headRef: "claude/b", merged: true, state: "MERGED", mergedAt: at(2), mergedBy: "me", reviewList: [review("codex-connector", 1.5, true)] }),
+    "me/app#3": pr(3, { headRef: "x", merged: false, state: "CLOSED", reviewList: [review("ana", 4)] }),
+  };
+  const follow = insights.summarizeFollowThrough(events, prInfo, now);
+  assert.equal(follow.branches, 4);
+  assert.equal(follow.settled, 3, "a branch under two days old is not judged yet");
+  assert.deepEqual(follow.withoutPr.map((b) => b.ref), ["codex/orphan"]);
+  assert.equal(follow.agentWithoutPr, 1);
+  assert.deepEqual(follow.outcomes, { merged: 2, closed: 1, open: 0, unknown: 0 });
+
+  const flow = insights.summarizeReviewFlow(prInfo, "ME");
+  assert.equal(flow.authored, 3);
+  assert.equal(flow.withHumanReview, 2);
+  assert.equal(flow.medianFirstReviewHours, 4.5, "own review at 1 h is skipped; waits are 6 h and 3 h");
+  assert.deepEqual([flow.botOnly, flow.noHuman, flow.selfMerged, flow.reviewedBeforeMerge], [1, 1, 2, 1]);
+  assert.deepEqual(flow.reviewers, [["ana", 2], ["bo", 1]]);
+  assert.equal(insights.isBotLogin("dependabot[bot]"), true);
+  assert.equal(insights.isBotLogin("robot"), false);
+  assert.deepEqual(insights.deriveObservations({ trajectory: insights.summarizeTrajectory(null), follow: insights.summarizeFollowThrough([], {}), review: insights.summarizeReviewFlow({}, "") }), []);
+});
+
+test("flattens issue and pull request conversations and filters them", () => {
+  const who = (login, type = "User") => ({ __typename: type, login });
+  const data = { search: { issueCount: 5, nodes: [
+    { __typename: "PullRequest", number: 4, title: "Add cache", prState: "MERGED", merged: true, repository: { nameWithOwner: "me/app" },
+      comments: { totalCount: 3, nodes: [
+        { author: who("ana"), createdAt: "2026-03-02T10:00:00Z", bodyText: "Looks keyed by login" },
+        { author: who("Me"), createdAt: "2026-03-02T11:00:00Z", bodyText: "Fixed" },
+      ] },
+      reviews: { totalCount: 2, nodes: [
+        { author: who("ana"), createdAt: "2026-03-02T09:00:00Z", bodyText: "", state: "APPROVED", comments: { totalCount: 0, nodes: [] } },
+        { author: who("me"), createdAt: "2026-03-02T08:00:00Z", bodyText: "", state: "COMMENTED",
+          comments: { totalCount: 6, nodes: [{ author: who("me"), createdAt: "2026-03-02T08:00:00Z", bodyText: "note", path: "a.js" }] } },
+      ] } },
+    { __typename: "Issue", number: 9, title: "Crash", issueState: "CLOSED", repository: { nameWithOwner: "org/lib" },
+      comments: { totalCount: 1, nodes: [{ author: who("helper", "Bot"), createdAt: "2026-03-01T00:00:00Z", bodyText: "Triaged" }, { author: null, createdAt: "bad", bodyText: "x" }] } },
+    null,
+  ] } };
+  const conv = insights.flattenConversations(data, "me");
+  assert.equal(conv.threads, 2);
+  assert.equal(conv.matched, 5);
+  assert.deepEqual(conv.truncated, { comments: 1, reviews: 0, reviewComments: 1, threads: 1 }, "one thread, cut short two ways");
+  // The empty COMMENTED review only wraps its inline comment; the unparseable date is dropped.
+  assert.deepEqual(conv.items.map((c) => `${c.kind}:${c.author}`), ["comment:Me", "comment:ana", "review:ana", "inline:me", "comment:helper"]);
+  assert.equal(conv.items[0].mine, true);
+  assert.equal(conv.items[2].verdict, "approved");
+  assert.equal(conv.items[0].thread.state, "merged");
+  assert.equal(conv.items[4].thread.state, "closed");
+  const count = (f, repo, q) => insights.filterConversations(conv.items, f, repo, q).length;
+  assert.deepEqual([count("all"), count("others"), count("mine"), count("reviews"), count("bots")], [5, 3, 2, 2, 1]);
+  assert.equal(count("all", "org/lib"), 1);
+  assert.equal(count("all", "", "KEYED"), 1);
+  assert.equal(count("all", "", "a.js"), 1);
+  assert.deepEqual(insights.flattenConversations(null, "me").items, []);
+});
