@@ -69,3 +69,75 @@ test("includes review and PR comment references without double counting", () => 
   });
   assert.deepEqual(matched, [events[1]]);
 });
+
+test("derives calendar rhythm from concentration, breaks, and rolling windows", () => {
+  const day = (index, contributionCount) => ({
+    date: new Date(Date.parse("2026-01-01") + index * 864e5).toISOString().slice(0, 10), contributionCount,
+  });
+  const tiny = insights.summarizeRhythm({
+    days: [5, 0, 0, 1, 1, 0, 3].map((count, index) => day(index, count)),
+    commits: [{ count: 3 }, { count: 1 }],
+  });
+  assert.equal(tiny.halfDays, 1);
+  assert.equal(tiny.medianRun, 1);
+  assert.deepEqual(tiny.longestGap, { days: 2, from: "2026-01-02", to: "2026-01-03" });
+  assert.equal(tiny.momentum, null);
+  assert.equal(tiny.bands, null);
+  assert.equal(tiny.repoSpread.effective, 1.6);
+
+  const quietThenBusy = insights.summarizeRhythm({
+    days: Array.from({ length: 84 }, (_, index) => day(index, index < 56 ? 1 : 3)),
+  });
+  assert.deepEqual(quietThenBusy.momentum, { last28: 84, percentile: 1, windows: 56 });
+  assert.equal(quietThenBusy.activeWeeks, 12);
+  assert.deepEqual(insights.deriveObservations({ rhythm: tiny }), []);
+});
+
+test("groups events into sessions and compares sampled merges with sample guards", () => {
+  const at = (minutes) => new Date(Date.parse("2026-03-04T12:00:00Z") + minutes * 6e4).toISOString();
+  const event = (minutes, name, type, payload) => ({ type, created_at: at(minutes), repo: { name }, payload });
+  const sessions = insights.summarizeSessions([
+    event(0, "Fixture/one", "CreateEvent", { ref_type: "branch", ref: "codex/a" }),
+    event(30, "fixture/two", "IssueCommentEvent", {}),
+    event(50, "Fixture/one", "DeleteEvent", { ref_type: "branch", ref: "codex/a" }),
+    event(200, "other/three", "PullRequestReviewEvent", {}),
+    { type: "PushEvent", created_at: "not a date" },
+  ], "fixture");
+  assert.equal(sessions.timed, 4);
+  assert.equal(sessions.sessions, 2);
+  assert.equal(sessions.multi, 1);
+  assert.equal(sessions.multiRepo, 1);
+  assert.equal(sessions.ownRepo, 3);
+  assert.deepEqual(sessions.mix, [["Building", 2], ["Reviewing", 1], ["Discussing", 1]]);
+  assert.equal(sessions.branchLifetimes.count, 1);
+  assert.ok(Math.abs(sessions.branchLifetimes.medianHours - 50 / 60) < 1e-9);
+
+  const merged = (index, headRef, hours, reviews, lines) => [`fixture/one#${index}`, {
+    title: "Change", repo: "fixture/one", number: index, merged: true, state: "MERGED", headRef, reviews,
+    createdAt: "2026-03-01T00:00:00Z", mergedAt: new Date(Date.parse("2026-03-01T00:00:00Z") + hours * 36e5).toISOString(),
+    additions: lines, deletions: 0,
+  }];
+  const sample = Object.fromEntries([
+    merged(1, "claude/a", 1, 0, 900), merged(2, "codex/b", 1, 0, 800), merged(3, "cursor/c", 1, 0, 700),
+    merged(4, "fix/d", 10, 1, 30), merged(5, "fix/e", 10, 1, 20), merged(6, "fix/f", 10, 1, 10),
+    ["fixture/one#7", { title: "Open", repo: "fixture/one", number: 7, state: "OPEN", createdAt: "2026-03-01T00:00:00Z" }],
+  ]);
+  const prs = insights.summarizePrPatterns(sample, "2026-03-21T00:00:00Z");
+  assert.equal(prs.agent.medianHours, 1);
+  assert.equal(prs.other.unreviewed, 0);
+  assert.equal(prs.unreviewedLines / prs.mergedLines, 2400 / 2460);
+  assert.equal(prs.larger.agent, 3);
+  assert.deepEqual(prs.oldestOpen, { repo: "fixture/one", number: 7, days: 20 });
+  assert.deepEqual(insights.deriveObservations({ prs }).map((finding) => [finding.tone, finding.title]), [
+    ["warn", "Agent-branch merges skip review more often"],
+    ["warn", "98% of merged lines landed without a recorded review"],
+    ["warn", "1 sampled open PR older than two weeks"],
+    ["info", "Agent-branch PRs merged 10× faster than other PRs"],
+    ["info", "Larger PRs merged at least as fast as smaller ones"],
+  ]);
+  const few = insights.summarizePrPatterns(Object.fromEntries(Object.entries(sample).slice(1, 5)), "2026-03-02T00:00:00Z");
+  assert.equal(few.smaller, null);
+  assert.deepEqual(insights.deriveObservations({ prs: few }).map((finding) => finding.title), [
+    "97% of merged lines landed without a recorded review",
+  ]);
+});
