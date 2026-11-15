@@ -197,3 +197,38 @@ test("follows branches to pull requests and measures first human review", () => 
   assert.equal(insights.isBotLogin("robot"), false);
   assert.deepEqual(insights.deriveObservations({ trajectory: insights.summarizeTrajectory(null), follow: insights.summarizeFollowThrough([], {}), review: insights.summarizeReviewFlow({}, "") }), []);
 });
+
+test("flattens issue and pull request conversations and filters them", () => {
+  const who = (login, type = "User") => ({ __typename: type, login });
+  const data = { search: { issueCount: 5, nodes: [
+    { __typename: "PullRequest", number: 4, title: "Add cache", prState: "MERGED", merged: true, repository: { nameWithOwner: "me/app" },
+      comments: { totalCount: 3, nodes: [
+        { author: who("ana"), createdAt: "2026-03-02T10:00:00Z", bodyText: "Looks keyed by login" },
+        { author: who("Me"), createdAt: "2026-03-02T11:00:00Z", bodyText: "Fixed" },
+      ] },
+      reviews: { totalCount: 2, nodes: [
+        { author: who("ana"), createdAt: "2026-03-02T09:00:00Z", bodyText: "", state: "APPROVED", comments: { totalCount: 0, nodes: [] } },
+        { author: who("me"), createdAt: "2026-03-02T08:00:00Z", bodyText: "", state: "COMMENTED",
+          comments: { totalCount: 6, nodes: [{ author: who("me"), createdAt: "2026-03-02T08:00:00Z", bodyText: "note", path: "a.js" }] } },
+      ] } },
+    { __typename: "Issue", number: 9, title: "Crash", issueState: "CLOSED", repository: { nameWithOwner: "org/lib" },
+      comments: { totalCount: 1, nodes: [{ author: who("helper", "Bot"), createdAt: "2026-03-01T00:00:00Z", bodyText: "Triaged" }, { author: null, createdAt: "bad", bodyText: "x" }] } },
+    null,
+  ] } };
+  const conv = insights.flattenConversations(data, "me");
+  assert.equal(conv.threads, 2);
+  assert.equal(conv.matched, 5);
+  assert.deepEqual(conv.truncated, { comments: 1, reviews: 0, reviewComments: 1, threads: 1 }, "one thread, cut short two ways");
+  // The empty COMMENTED review only wraps its inline comment; the unparseable date is dropped.
+  assert.deepEqual(conv.items.map((c) => `${c.kind}:${c.author}`), ["comment:Me", "comment:ana", "review:ana", "inline:me", "comment:helper"]);
+  assert.equal(conv.items[0].mine, true);
+  assert.equal(conv.items[2].verdict, "approved");
+  assert.equal(conv.items[0].thread.state, "merged");
+  assert.equal(conv.items[4].thread.state, "closed");
+  const count = (f, repo, q) => insights.filterConversations(conv.items, f, repo, q).length;
+  assert.deepEqual([count("all"), count("others"), count("mine"), count("reviews"), count("bots")], [5, 3, 2, 2, 1]);
+  assert.equal(count("all", "org/lib"), 1);
+  assert.equal(count("all", "", "KEYED"), 1);
+  assert.equal(count("all", "", "a.js"), 1);
+  assert.deepEqual(insights.flattenConversations(null, "me").items, []);
+});

@@ -10,6 +10,9 @@ const EVENT_PAGES = 3; // GitHub serves at most 300 events
 const PR_LOOKUP_LIMIT = 40;
 const GLYPHS = { PushEvent: "↑", PullRequestEvent: "⇄", IssuesEvent: "◉", IssueCommentEvent: "✎", CreateEvent: "+", DeleteEvent: "−", PullRequestReviewEvent: "✓", ReleaseEvent: "◆", WatchEvent: "★", ForkEvent: "⑂" };
 const CHIPS = [["all", "All"], ["push", "Pushes"], ["pr", "Pull requests"], ["issue", "Issues"], ["comment", "Comments"], ["branch", "Branches"], ["agent", "Agents"]];
+const CONVERSATION_CHIPS = [["all", "All"], ["others", "From others"], ["mine", "Yours"], ["reviews", "Reviews"], ["bots", "Bots"]];
+const CONVERSATION_GLYPHS = { comment: "✎", review: "✓", inline: "‹›" };
+const BODY_PREVIEW = 280;
 
 const initialState = {
   tokenKind: null,
@@ -25,6 +28,9 @@ const initialState = {
   refreshedAt: null,
   lastSeen: null,
   filter: "all",
+  conversations: null,
+  streamSource: "events",
+  conversationFilter: "all",
   repo: "",
   query: "",
   hideMinor: true,
@@ -167,10 +173,11 @@ async function refresh() {
     setBusy("Loading contribution year and notifications…");
     const refs = I.prRefsFromEvents(events);
     const fineGrained = account.tokenKind === "fine-grained";
-    const [notes, year, prs] = await Promise.allSettled([
+    const [notes, year, prs, talk] = await Promise.allSettled([
       fineGrained ? null : api(account, "notifications"),
       api(account, "year"),
       lookupPullRequests(account, refs),
+      api(account, "conversations", { login: user.login }),
     ]);
     if (account !== state) return;
 
@@ -194,11 +201,21 @@ async function refresh() {
     if (prLookup.found < prLookup.asked) errors.prs = prs.reason?.message || "Some requested pull requests were unavailable.";
     if (prLookup.asked < prLookup.total) errors.prs = `${errors.prs ? `${errors.prs} ` : ""}Details are capped at the first ${PR_LOOKUP_LIMIT} references.`;
 
-    Object.assign(account, { user, viewer, contributions, events, notifications, prLookup, prInfo: prLookup.info, errors, refreshedAt: new Date() });
+    const talkData = talk.value?.data;
+    let conversations = Array.isArray(talkData?.data?.search?.nodes)
+      ? { ...I.flattenConversations(talkData.data, user.login), loadedAt: new Date() } : null;
+    const talkProblem = talk.reason?.message || "GitHub did not return a usable conversation search.";
+    if (!conversations && account.conversations && account.user?.id === user.id) {
+      conversations = account.conversations;
+      errors.conversations = `Conversations did not refresh. ${talkProblem} Showing the previous load.`;
+    } else if (!conversations) errors.conversations = `Conversations did not load. ${talkProblem}`;
+    else if (talkData.errors?.length) errors.conversations = "Some conversations could not be read with this token.";
+
+    Object.assign(account, { user, viewer, contributions, events, notifications, prLookup, prInfo: prLookup.info, conversations, errors, refreshedAt: new Date() });
     if (!events.some((e) => I.repoName(e) === account.repo)) account.repo = "";
     account.lastSeen = localStorage.getItem(seenKey());
-    if (!account.lastSeen && account.events[0]) {
-      account.lastSeen = account.events[0].created_at;
+    if (!account.lastSeen && newestActivity(account)) {
+      account.lastSeen = newestActivity(account);
       localStorage.setItem(seenKey(), account.lastSeen);
     }
     renderIdentity();
@@ -212,6 +229,12 @@ async function refresh() {
   } finally {
     if (account === state) setBusy("");
   }
+}
+
+// The latest timestamp across your events and loaded conversations, used for "seen".
+function newestActivity(account) {
+  const times = [account.events[0]?.created_at, account.conversations?.items[0]?.at].filter(Boolean);
+  return times.sort().pop() || null;
 }
 
 // ---------- rendering ----------
@@ -242,6 +265,8 @@ function renderOverview(c) {
   const { ev, pr, notes, year } = c;
   const parts = [];
   if (ev.fresh) parts.push(`<strong>${fmt(ev.fresh)} new event${ev.fresh === 1 ? "" : "s"}</strong> since you last marked the stream seen.`);
+  const replies = freshConversations();
+  if (replies) parts.push(`<strong>${fmt(replies)} new comment${replies === 1 ? "" : "s"} from others</strong> on issues and pull requests that involve you.`);
   if (year?.last30 != null) {
     const trend = year.trend ? ` (${year.trend > 0 ? "up" : "down"} ${pct(Math.abs(year.trend))} from the prior 30 days)` : "";
     parts.push(`${fmt(year.last30)} contributions in the last 30 days${trend}.`);
@@ -311,8 +336,87 @@ function renderYear(year) {
   $("year-caption").textContent = `${fmt(year.total)} contributions${busiest ? ` · busiest ${busiest.date} (${busiest.contributionCount})` : ""}`;
 }
 
+function freshConversations() {
+  const lastSeen = state.lastSeen ? Date.parse(state.lastSeen) : null;
+  return lastSeen && state.conversations ? state.conversations.items.filter((c) => !c.mine && Date.parse(c.at) > lastSeen).length : 0;
+}
+
+function renderConversations() {
+  const conv = state.conversations;
+  $("hide-minor-label").classList.add("hidden");
+  $("search").setAttribute("aria-label", "Search conversations");
+  $("chips").setAttribute("aria-label", "Comment type");
+  if (!conv) {
+    $("stream-caption").textContent = state.errors.conversations || "Conversations have not loaded.";
+    $("chips").innerHTML = "";
+    $("repo-filter").innerHTML = '<option value="">All repositories</option>';
+    $("stream").innerHTML = `<div class="empty">${esc(state.errors.conversations || "No conversations loaded.")}</div>`;
+    return;
+  }
+  const notes = [];
+  if (conv.matched > conv.threads) notes.push(`Showing the ${fmt(conv.threads)} most recently updated of ${fmt(conv.matched)} matching threads.`);
+  const t = conv.truncated;
+  if (t.threads) notes.push(`Older comments are omitted on ${fmt(t.threads)} busy ${t.threads === 1 ? "thread" : "threads"}; each thread shows its latest 10 comments and reviews.`);
+  if (state.errors.conversations) notes.push(state.errors.conversations);
+  const at = conv.loadedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
+  $("stream-caption").textContent = `${fmt(conv.items.length)} comments and reviews on ${fmt(conv.threads)} issues and pull requests that involve you, open or closed, updated in the last 30 days. Read live from each thread at ${at}. ${notes.join(" ")}`.trim();
+
+  const repos = [...new Set(conv.items.map((c) => c.thread.repo))].sort();
+  if (state.repo && !repos.includes(state.repo)) repos.unshift(state.repo);
+  $("repo-filter").innerHTML = `<option value="">All repositories</option>${repos.map((r) => `<option value="${esc(r)}"${r === state.repo ? " selected" : ""}>${esc(shortRepo(r))}</option>`).join("")}`;
+  $("chips").innerHTML = CONVERSATION_CHIPS.map(([k, label]) =>
+    `<button class="chip" role="tab" type="button" data-filter="${k}" aria-selected="${state.conversationFilter === k}">${esc(label)}<span class="n">${I.filterConversations(conv.items, k, state.repo, "").length}</span></button>`).join("");
+
+  const list = I.filterConversations(conv.items, state.conversationFilter, state.repo, state.query);
+  const lastSeen = state.lastSeen ? Date.parse(state.lastSeen) : null;
+  if (!list.length) {
+    $("stream").innerHTML = `<div class="empty">${conv.items.length ? "No comments match these filters." : "No comments on issues or pull requests that involve you in the last 30 days."}</div>`;
+    return;
+  }
+  const groups = new Map();
+  for (const c of list) {
+    const key = localDayKey(new Date(c.at));
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(c);
+  }
+  $("stream").innerHTML = [...groups.entries()].map(([key, rows]) => `
+    <div class="day"><div class="day-head">${esc(dayHeading(key))} · ${rows.length}</div><div class="rows">${rows.map((c) => {
+      const when = new Date(c.at);
+      const fresh = lastSeen && !c.mine && when.getTime() > lastSeen;
+      const th = c.thread;
+      const action = c.kind === "inline" ? "commented on a change in"
+        : c.kind === "review" ? (c.verdict === "approved" ? "approved" : c.verdict === "changes_requested" ? "requested changes on" : "reviewed")
+        : "commented on";
+      const tags = [];
+      if (fresh) tags.push('<span class="tag new">New</span>');
+      if (c.bot) tags.push('<span class="tag agent">bot</span>');
+      if (c.mine) tags.push('<span class="tag">you</span>');
+      tags.push(`<span class="tag ${th.state}">${th.isPr ? "PR" : "issue"} ${th.state}</span>`);
+      const body = c.body.length > BODY_PREVIEW ? `${c.body.slice(0, BODY_PREVIEW).trimEnd()}…` : c.body;
+      return `<div class="row${fresh ? " fresh" : ""}">
+        <span class="time">${esc(when.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}</span>
+        <span class="glyph" title="${esc(c.kind === "comment" ? "Comment" : c.kind === "review" ? "Review" : "Review comment")}">${esc(CONVERSATION_GLYPHS[c.kind])}</span>
+        <div class="what"><div class="title">${esc(`${c.author} ${action} #${th.number} ${th.title}`)}</div>
+          ${body ? `<p class="excerpt">${esc(body)}</p>` : ""}
+          <div class="meta"><span>${esc(shortRepo(th.repo))}</span>${c.path ? `<span>${esc(c.path)}</span>` : ""}</div></div>
+        <div class="tags">${tags.join("")}</div>
+      </div>`;
+    }).join("")}</div></div>`).join("");
+}
+
 function renderStream(c) {
   const { ev } = c;
+  $("stream-source").querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.stream === state.streamSource)));
+  const others = freshConversations();
+  $("conversation-count").textContent = others ? String(others) : "";
+  const badge = $("fresh-badge");
+  const freshTotal = ev.fresh + others;
+  badge.textContent = freshTotal > 99 ? "99+" : String(freshTotal);
+  badge.classList.toggle("hidden", !freshTotal);
+  if (state.streamSource === "conversations") return renderConversations();
+  $("hide-minor-label").classList.remove("hidden");
+  $("search").setAttribute("aria-label", "Search events");
+  $("chips").setAttribute("aria-label", "Event type");
   const range = dateRange(ev.oldest, ev.newest);
   $("stream-caption").textContent = ev.total
     ? `${fmt(ev.total)} events loaded${range ? ` · ${range}` : ""}.`
@@ -366,9 +470,6 @@ function renderStream(c) {
         </div>`;
       }).join("")}</div></div>`).join("");
   }
-  const badge = $("fresh-badge");
-  badge.textContent = ev.fresh > 99 ? "99+" : String(ev.fresh);
-  badge.classList.toggle("hidden", !ev.fresh);
 }
 
 function insightSection(id, name, caption, content) {
@@ -675,6 +776,10 @@ function renderMeta(c) {
   caps.push(asked
     ? [state.errors.prs ? "part" : "ok", "Pull request details", `${fmt(found)} loaded of ${fmt(asked)} requested (${fmt(total)} references). ${esc(state.errors.prs || "")}`]
     : ["part", "Pull request details", "No pull requests in the loaded events."]);
+  const conv = state.conversations;
+  caps.push(conv
+    ? [state.errors.conversations ? "part" : "ok", "Conversations", `${fmt(conv.items.length)} comments and reviews on ${fmt(conv.threads)} threads. ${esc(state.errors.conversations || "")}`]
+    : ["no", "Conversations", esc(state.errors.conversations || "Not available.")]);
   if (year) {
     caps.push(year.totals.restricted
       ? ["part", "Private contributions", `${fmt(year.totals.restricted)} contributions are counted but hidden from this token.`]
@@ -703,7 +808,7 @@ function renderMeta(c) {
   cards.push(`<article class="card"><h3>This session</h3>
     <dl class="kv">
       <dt>Last refreshed</dt><dd>${state.refreshedAt ? esc(state.refreshedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })) : "—"}</dd>
-      <dt>New since marked seen</dt><dd>${fmt(ev.fresh)}</dd>
+      <dt>New since marked seen</dt><dd>${fmt(ev.fresh)} events, ${fmt(freshConversations())} comments from others</dd>
       <dt>Marked seen at</dt><dd>${state.lastSeen ? esc(new Date(state.lastSeen).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })) : "—"}</dd>
       <dt>Rate limit remaining</dt><dd>${esc(state.remaining ?? "—")}</dd>
     </dl>
@@ -804,7 +909,7 @@ async function signOut() {
   state = { ...initialState };
   for (const id of ["me-name", "me-login", "initials", "summary", "kpis", "attention", "notes", "year-caption",
     "year-heat", "stream-caption", "chips", "repo-filter", "minor-count", "stream", "insights", "meta",
-    "fresh-badge", "refreshed"]) $(id).textContent = "";
+    "fresh-badge", "refreshed", "conversation-count"]) $(id).textContent = "";
   $("search").value = "";
   $("hide-minor").checked = true;
   setBusy("");
@@ -850,8 +955,15 @@ $("insights").addEventListener("click", (event) => {
 $("chips").addEventListener("click", (event) => {
   const chip = event.target.closest(".chip");
   if (!chip) return;
-  state.filter = chip.dataset.filter;
+  state[state.streamSource === "conversations" ? "conversationFilter" : "filter"] = chip.dataset.filter;
   renderStream(computed());
+});
+$("stream-source").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-stream]");
+  if (!button || state.streamSource === button.dataset.stream) return;
+  state.streamSource = button.dataset.stream;
+  renderStream(computed());
+  $("content").scrollTop = 0;
 });
 $("repo-filter").addEventListener("change", (event) => {
   state.repo = event.target.value;
@@ -866,8 +978,9 @@ $("hide-minor").addEventListener("change", (event) => {
   renderStream(computed());
 });
 $("mark-seen").addEventListener("click", () => {
-  if (!state.events[0]) return;
-  state.lastSeen = state.events[0].created_at;
+  const newest = newestActivity(state);
+  if (!newest) return;
+  state.lastSeen = newest;
   localStorage.setItem(seenKey(), state.lastSeen);
   renderAll();
 });

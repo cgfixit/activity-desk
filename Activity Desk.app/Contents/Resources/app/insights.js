@@ -902,6 +902,73 @@ function summarizeNotifications(items) {
   };
 }
 
+// ---------- Conversations ----------
+// Comments, reviews, and review comments on issues and pull requests that involve the user.
+const CONVERSATION_FILTERS = {
+  all: () => true,
+  others: (c) => !c.mine,
+  mine: (c) => c.mine,
+  reviews: (c) => c.kind !== "comment",
+  bots: (c) => c.bot,
+};
+
+function flattenConversations(data, login) {
+  const me = String(login || "").toLowerCase();
+  const search = data && data.search;
+  const nodes = Array.isArray(search?.nodes) ? search.nodes.filter((n) => n && n.repository && Number.isInteger(n.number)) : [];
+  const items = [];
+  const truncated = { comments: 0, reviews: 0, reviewComments: 0, threads: 0 };
+  const person = (author) => {
+    const name = author?.login || "ghost";
+    return { author: name, bot: author?.__typename === "Bot" || isBotLogin(name), mine: name.toLowerCase() === me };
+  };
+  for (const n of nodes) {
+    const isPr = n.__typename === "PullRequest";
+    const raw = String((isPr ? n.prState : n.issueState) || "").toLowerCase();
+    const thread = {
+      repo: n.repository.nameWithOwner,
+      number: n.number,
+      title: String(n.title || ""),
+      isPr,
+      state: isPr && n.merged ? "merged" : raw === "open" ? "open" : "closed",
+      author: n.author?.login || "",
+    };
+    const before = truncated.comments + truncated.reviews + truncated.reviewComments;
+    const comments = n.comments?.nodes || [];
+    if (n.comments?.totalCount > comments.length) truncated.comments += 1;
+    for (const c of comments) if (c) items.push({ kind: "comment", thread, ...person(c.author), at: c.createdAt, body: String(c.bodyText || "") });
+    const reviews = n.reviews?.nodes || [];
+    if (n.reviews?.totalCount > reviews.length) truncated.reviews += 1;
+    for (const r of reviews) {
+      if (!r) continue;
+      const verdict = String(r.state || "").toLowerCase();
+      // A plain COMMENTED review with no body only wraps its inline comments, which are listed below.
+      if (r.bodyText || (verdict && verdict !== "commented" && verdict !== "pending")) {
+        items.push({ kind: "review", thread, ...person(r.author), at: r.createdAt, body: String(r.bodyText || ""), verdict });
+      }
+      const inline = r.comments?.nodes || [];
+      if (r.comments?.totalCount > inline.length) truncated.reviewComments += 1;
+      for (const c of inline) if (c) items.push({ kind: "inline", thread, ...person(c.author), at: c.createdAt, body: String(c.bodyText || ""), path: String(c.path || "") });
+    }
+    if (truncated.comments + truncated.reviews + truncated.reviewComments > before) truncated.threads += 1;
+  }
+  const valid = items.filter((c) => Number.isFinite(Date.parse(c.at)));
+  valid.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  return {
+    items: valid,
+    threads: nodes.length,
+    matched: Number.isInteger(search?.issueCount) ? search.issueCount : nodes.length,
+    truncated,
+  };
+}
+
+function filterConversations(items, filter, repo, query) {
+  const f = CONVERSATION_FILTERS[filter] || CONVERSATION_FILTERS.all;
+  const q = String(query || "").trim().toLowerCase();
+  return (items || []).filter((c) => f(c) && (!repo || c.thread.repo === repo) &&
+    (!q || `${c.thread.repo} ${c.thread.title} ${c.author} ${c.body} ${c.path || ""}`.toLowerCase().includes(q)));
+}
+
 const MINOR_PR_ACTIONS = new Set(["labeled", "unlabeled", "synchronize", "assigned", "unassigned", "review_requested", "review_request_removed", "edited"]);
 function isMinor(event) {
   const p = (event && event.payload) || {};
@@ -937,6 +1004,9 @@ const api = {
   summarizeFollowThrough,
   summarizeReviewFlow,
   isBotLogin,
+  flattenConversations,
+  filterConversations,
+  CONVERSATION_FILTERS,
   deriveObservations,
   durationLabel,
   filterEvents,

@@ -254,3 +254,6 @@ input[type="search"] { width: 180px; }
 .weekly span { flex: 1 1 0; min-width: 2px; border-radius: 2px 2px 0 0; background: color-mix(in srgb, var(--muted) 40%, transparent); }
 .weekly span.after { background: var(--accent); }
 .plain { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 4px; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.stream-source { border-bottom: 0; padding-bottom: 12px; }
+.stream-source .n { margin-left: 4px; color: var(--accent); font-weight: 600; }
+.excerpt { margin: 4px 0 2px; font-size: 12px; line-height: 1.45; color: var(--muted); white-space: pre-line; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
