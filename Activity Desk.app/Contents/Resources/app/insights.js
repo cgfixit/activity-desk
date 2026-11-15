@@ -362,6 +362,289 @@ function summarizeContributions(collection, today) {
   };
 }
 
+// ---------- Derived patterns ----------
+// Everything below is computed from data the other summaries already hold. Nothing here asks GitHub for more.
+const DAY_MS = 864e5;
+const SESSION_GAP_MINUTES = 60;
+const STALE_PR_DAYS = 14;
+const WORK_MIX = {
+  PushEvent: "Building", CreateEvent: "Building", DeleteEvent: "Building", ReleaseEvent: "Building", PullRequestEvent: "Building",
+  PullRequestReviewEvent: "Reviewing", PullRequestReviewCommentEvent: "Reviewing",
+  IssuesEvent: "Discussing", IssueCommentEvent: "Discussing", CommitCommentEvent: "Discussing",
+};
+
+const sum = (values) => values.reduce((a, b) => a + b, 0);
+const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? "" : "s"}`;
+const share = (x) => `${Math.round(x * 100)}%`;
+
+function durationLabel(hours) {
+  if (hours == null || !Number.isFinite(hours)) return "—";
+  if (hours < 1) return `${Math.max(1, Math.round(hours * 60))} min`;
+  if (hours < 48) return `${hours < 10 ? hours.toFixed(1) : Math.round(hours)} h`;
+  return `${Math.round(hours / 24)} days`;
+}
+
+// Shape of the contribution year: how concentrated, how interrupted, and where the latest weeks sit.
+function summarizeRhythm(year) {
+  const days = (year && year.days) || [];
+  const counts = days.map((d) => d.contributionCount || 0);
+  const total = sum(counts);
+  const ranked = counts.filter((n) => n > 0).sort((a, b) => b - a);
+
+  let halfDays = 0;
+  for (let acc = 0; halfDays < ranked.length && acc * 2 < total; halfDays += 1) acc += ranked[halfDays];
+  let bands = null;
+  if (ranked.length >= 10) {
+    const top = Math.round(ranked.length * 0.1);
+    const mid = Math.round(ranked.length * 0.5);
+    bands = [
+      ["Busiest 10% of active days", sum(ranked.slice(0, top)) / total],
+      ["Next 40%", sum(ranked.slice(top, mid)) / total],
+      ["Quietest 50%", sum(ranked.slice(mid)) / total],
+    ];
+  }
+
+  const runs = [];
+  const gaps = [];
+  let previous = null;
+  for (const d of days) {
+    if (!d.contributionCount) continue;
+    const time = Date.parse(d.date);
+    const idle = previous == null ? 0 : Math.round((time - previous) / DAY_MS) - 1;
+    if (previous == null || idle > 0) runs.push(0);
+    if (idle > 0) {
+      gaps.push({
+        days: idle,
+        from: new Date(previous + DAY_MS).toISOString().slice(0, 10),
+        to: new Date(time - DAY_MS).toISOString().slice(0, 10),
+      });
+    }
+    runs[runs.length - 1] += 1;
+    previous = time;
+  }
+  const longestGap = gaps.reduce((best, gap) => (!best || gap.days > best.days ? gap : best), null);
+
+  // Where the latest 28 days rank among every rolling 28-day window in the calendar.
+  let momentum = null;
+  if (counts.length >= 56) {
+    const windows = [];
+    let rolling = sum(counts.slice(0, 28));
+    windows.push(rolling);
+    for (let i = 28; i < counts.length; i += 1) {
+      rolling += counts[i] - counts[i - 28];
+      windows.push(rolling);
+    }
+    const last = windows.pop();
+    momentum = { last28: last, percentile: windows.filter((w) => w < last).length / windows.length, windows: windows.length };
+  }
+
+  const weeks = [];
+  for (let end = counts.length; end >= 7; end -= 7) weeks.push(sum(counts.slice(end - 7, end)));
+
+  const repoCounts = ((year && year.commits) || []).map((row) => row.count);
+  const repoTotal = sum(repoCounts);
+  return {
+    total,
+    activeDays: ranked.length,
+    halfDays,
+    halfShare: ranked.length ? halfDays / ranked.length : null,
+    bands,
+    medianRun: median(runs),
+    longestGap,
+    weekBreaks: gaps.filter((gap) => gap.days >= 7).length,
+    momentum,
+    weeks: weeks.length,
+    activeWeeks: weeks.filter(Boolean).length,
+    repoSpread: repoTotal ? {
+      effective: repoTotal ** 2 / sum(repoCounts.map((n) => n * n)),
+      listed: repoCounts.length,
+    } : null,
+  };
+}
+
+// Work sessions in the Events feed: runs of events separated by less than an hour.
+function summarizeSessions(events, login) {
+  const timed = (events || [])
+    .map((e) => ({ e, time: new Date(e.created_at).getTime() }))
+    .filter((row) => Number.isFinite(row.time))
+    .sort((a, b) => a.time - b.time);
+  const sessions = [];
+  const dayParts = { core: 0, edge: 0, weekend: 0 };
+  const mix = { Building: 0, Reviewing: 0, Discussing: 0, Other: 0 };
+  const created = new Map();
+  const lifetimes = [];
+  const owner = login ? `${String(login).toLowerCase()}/` : "";
+  let ownRepo = 0;
+
+  for (const { e, time } of timed) {
+    const repo = repoName(e);
+    const current = sessions[sessions.length - 1];
+    if (current && time - current.end < SESSION_GAP_MINUTES * 6e4) {
+      current.end = time;
+      current.events += 1;
+      current.repos.add(repo);
+    } else {
+      sessions.push({ start: time, end: time, events: 1, repos: new Set([repo]) });
+    }
+    const when = new Date(time);
+    const weekend = when.getDay() === 0 || when.getDay() === 6;
+    dayParts[weekend ? "weekend" : when.getHours() >= 9 && when.getHours() < 18 ? "core" : "edge"] += 1;
+    mix[WORK_MIX[e.type] || "Other"] += 1;
+    if (owner && repo.toLowerCase().startsWith(owner)) ownRepo += 1;
+    const p = e.payload || {};
+    if (p.ref_type === "branch" && p.ref) {
+      const key = `${repo} ${p.ref}`;
+      if (e.type === "CreateEvent") created.set(key, time);
+      if (e.type === "DeleteEvent" && created.has(key)) {
+        lifetimes.push((time - created.get(key)) / 36e5);
+        created.delete(key);
+      }
+    }
+  }
+
+  const multi = sessions.filter((s) => s.events > 1);
+  const longest = multi.reduce((best, s) => (!best || s.end - s.start > best.end - best.start ? s : best), null);
+  return {
+    timed: timed.length,
+    sessions: sessions.length,
+    multi: multi.length,
+    medianHours: median(multi.map((s) => (s.end - s.start) / 36e5)),
+    longest: longest && { start: longest.start, hours: (longest.end - longest.start) / 36e5, events: longest.events, repos: longest.repos.size },
+    multiRepo: multi.filter((s) => s.repos.size > 1).length,
+    dayParts,
+    mix: Object.entries(mix).filter(([, n]) => n > 0),
+    ownRepo: owner ? ownRepo : null,
+    branchLifetimes: { count: lifetimes.length, medianHours: median(lifetimes) },
+  };
+}
+
+// Comparisons inside the sampled pull requests: agent branches against the rest, larger against smaller.
+function summarizePrPatterns(prInfo, now) {
+  const rows = Object.values(prInfo || {}).filter((pr) => pr?.title);
+  const size = (pr) => (pr.additions || 0) + (pr.deletions || 0);
+  const group = (list) => ({
+    count: list.length,
+    medianHours: median(list
+      .map((pr) => (Date.parse(pr.mergedAt) - Date.parse(pr.createdAt)) / 36e5)
+      .filter((h) => Number.isFinite(h) && h >= 0)),
+    unreviewed: list.filter((pr) => !pr.reviews).length,
+    medianSize: median(list.map(size)),
+    agent: list.filter((pr) => agentFromBranch(pr.headRef)).length,
+  });
+  const merged = rows.filter((pr) => pr.merged);
+  const bySize = merged.slice().sort((a, b) => size(a) - size(b));
+  const half = Math.floor(bySize.length / 2);
+  const mergedLines = sum(merged.map(size));
+  const nowTime = now == null ? Date.now() : new Date(now).getTime();
+  const open = rows.filter((pr) => pr.state === "OPEN")
+    .map((pr) => ({ repo: pr.repo, number: pr.number, days: (nowTime - Date.parse(pr.createdAt)) / DAY_MS }))
+    .filter((pr) => Number.isFinite(pr.days) && pr.days >= 0)
+    .sort((a, b) => b.days - a.days);
+  return {
+    merged: merged.length,
+    agent: group(merged.filter((pr) => agentFromBranch(pr.headRef))),
+    other: group(merged.filter((pr) => !agentFromBranch(pr.headRef))),
+    // An odd middle PR is left out so both halves hold the same number.
+    smaller: half >= 3 ? group(bySize.slice(0, half)) : null,
+    larger: half >= 3 ? group(bySize.slice(-half)) : null,
+    mergedLines,
+    unreviewedLines: sum(merged.filter((pr) => !pr.reviews).map(size)),
+    open: open.length,
+    oldestOpen: open[0] || null,
+    stale: open.filter((pr) => pr.days >= STALE_PR_DAYS).length,
+  };
+}
+
+// Plain-language findings. Each names its source, and each needs a minimum sample before it appears.
+function deriveObservations({ rhythm, sessions, prs }) {
+  const out = [];
+  const add = (tone, source, title, detail) => out.push({ tone, source, title, detail });
+  const YEAR = "Contribution year";
+  const FEED = "Recent events";
+  const PRS = "Sampled pull requests";
+
+  if (rhythm && rhythm.activeDays >= 10) {
+    const shape = rhythm.halfShare <= 0.2 ? " Output arrives in bursts rather than evenly."
+      : rhythm.halfShare >= 0.35 ? " Output is spread fairly evenly across active days." : "";
+    add("info", YEAR, `Half of the year's contributions came from ${plural(rhythm.halfDays, "day")}`,
+      `That is ${share(rhythm.halfShare)} of ${plural(rhythm.activeDays, "active day")}.${shape}`);
+  }
+  if (rhythm?.momentum && rhythm.momentum.last28 > 0 && rhythm.momentum.percentile >= 0.85) {
+    add("good", YEAR, "The last 28 days are among the busiest stretches of the year",
+      rhythm.momentum.percentile === 1 ? `Busier than every one of the ${plural(rhythm.momentum.windows, "earlier rolling 28-day window")}.`
+        : `Busier than ${Math.floor(rhythm.momentum.percentile * 100)}% of the ${plural(rhythm.momentum.windows, "earlier rolling 28-day window")}.`);
+  } else if (rhythm?.momentum && rhythm.total > 0 && rhythm.momentum.percentile <= 0.15) {
+    add("info", YEAR, "The last 28 days are among the quietest stretches of the year",
+      `Busier than only ${Math.ceil(rhythm.momentum.percentile * 100)}% of the ${plural(rhythm.momentum.windows, "earlier rolling 28-day window")}.`);
+  }
+  if (rhythm?.longestGap && rhythm.longestGap.days >= 7) {
+    add("info", YEAR, `The longest break lasted ${plural(rhythm.longestGap.days, "day")}`,
+      `${rhythm.longestGap.from} to ${rhythm.longestGap.to}. ${plural(rhythm.weekBreaks, "break")} of a week or longer between active days.`);
+  }
+  if (rhythm?.repoSpread && rhythm.repoSpread.listed >= 2) {
+    const { effective, listed } = rhythm.repoSpread;
+    const title = effective < 1.5 ? "Commits concentrate in a single repository"
+      : effective >= 4 ? `Commits spread across about ${Math.round(effective)} repositories` : "";
+    if (title) add("info", YEAR, title,
+      `The ${listed} returned repository totals are distributed like ${effective.toFixed(1)} equally used repositories.`);
+  }
+
+  if (sessions && sessions.multi >= 4) {
+    const crossing = sessions.multiRepo / sessions.multi;
+    if (crossing >= 0.5) add("info", FEED, `${sessions.multiRepo} of ${plural(sessions.multi, "work session")} crossed repositories`,
+      "A session is a run of events with gaps under an hour. Frequent crossings can mean context switching.");
+    else if (crossing <= 0.15) add("good", FEED, "Work sessions tend to stay in one repository",
+      `${sessions.multiRepo} of ${plural(sessions.multi, "session")} with several events touched more than one repository.`);
+  }
+  if (sessions && sessions.timed >= 20) {
+    const { core, edge, weekend } = sessions.dayParts;
+    if (core / sessions.timed < 0.5) add("info", FEED, `${share(1 - core / sessions.timed)} of loaded events fall outside weekdays 9am–6pm`,
+      `${plural(weekend, "event")} on weekends and ${edge.toLocaleString()} on weekday early mornings or evenings, local time.`);
+  }
+  if (sessions && sessions.branchLifetimes.count >= 3) {
+    add("info", FEED, `Short-lived branches lasted a median of ${durationLabel(sessions.branchLifetimes.medianHours)}`,
+      `${sessions.branchLifetimes.count} branches were created and deleted within the loaded events.`);
+  }
+
+  if (prs) {
+    const { agent, other, smaller, larger } = prs;
+    if (agent.count >= 3 && other.count >= 3) {
+      if (agent.medianHours > 0 && other.medianHours > 0) {
+        const ratio = other.medianHours / agent.medianHours;
+        const times = (x) => `${x >= 10 ? Math.round(x) : x.toFixed(1)}×`;
+        if (ratio >= 2 || ratio <= 0.5) {
+          add("info", PRS, `Agent-branch PRs merged ${ratio >= 2 ? `${times(ratio)} faster` : `${times(1 / ratio)} slower`} than other PRs`,
+            `Median ${durationLabel(agent.medianHours)} across ${agent.count} agent-branch merges, ${durationLabel(other.medianHours)} across ${other.count} others.`);
+        }
+      }
+      if (agent.unreviewed / agent.count - other.unreviewed / other.count >= 0.3) {
+        add("warn", PRS, "Agent-branch merges skip review more often",
+          `${agent.unreviewed} of ${agent.count} had zero recorded reviews, against ${other.unreviewed} of ${other.count} other merges.`);
+      }
+    }
+    if (prs.merged >= 3 && prs.mergedLines > 0 && prs.unreviewedLines / prs.mergedLines >= 0.5) {
+      add("warn", PRS, `${share(prs.unreviewedLines / prs.mergedLines)} of merged lines landed without a recorded review`,
+        `${prs.unreviewedLines.toLocaleString()} of ${prs.mergedLines.toLocaleString()} changed lines across ${plural(prs.merged, "sampled merge")}.`);
+    }
+    if (smaller && larger && smaller.medianHours > 0 && larger.medianHours != null) {
+      const ratio = larger.medianHours / smaller.medianHours;
+      const basis = `Median ${durationLabel(larger.medianHours)} for the larger half (${Math.round(larger.medianSize).toLocaleString()} lines), ${durationLabel(smaller.medianHours)} for the smaller half (${Math.round(smaller.medianSize).toLocaleString()} lines).`;
+      // Size and branch type overlap, so say so instead of crediting size alone.
+      const skew = Math.abs(larger.agent - smaller.agent) / larger.count >= 0.3
+        ? ` Agent branches make up ${larger.agent} of the larger ${larger.count} and ${smaller.agent} of the smaller ${smaller.count}, so branch type may explain the gap.` : "";
+      if (ratio >= 2) add("info", PRS, "Larger PRs took noticeably longer to merge", basis + skew);
+      else if (ratio <= 1) add("info", PRS, "Larger PRs merged at least as fast as smaller ones", `${basis}${skew || " Time to merge is not scaling with size."}`);
+    }
+    if (prs.stale) {
+      const o = prs.oldestOpen;
+      add("warn", PRS, `${plural(prs.stale, "sampled open PR")} older than two weeks`,
+        `Oldest is ${o.repo} #${o.number}, opened ${plural(Math.floor(o.days), "day")} ago.`);
+    }
+  }
+  const rank = { warn: 0, good: 1, info: 1 };
+  return out.sort((a, b) => rank[a.tone] - rank[b.tone]);
+}
+
 function summarizeNotifications(items) {
   const list = Array.isArray(items) ? items : [];
   const unread = list.filter((item) => item && item.unread);
@@ -410,6 +693,11 @@ const api = {
   summarizePullRequests,
   summarizeContributions,
   summarizeNotifications,
+  summarizeRhythm,
+  summarizeSessions,
+  summarizePrPatterns,
+  deriveObservations,
+  durationLabel,
   filterEvents,
   isMinor,
 };

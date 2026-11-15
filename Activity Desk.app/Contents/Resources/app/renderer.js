@@ -43,12 +43,7 @@ function esc(value) {
 }
 const fmt = (n) => (n == null || Number.isNaN(n) ? "—" : Number(n).toLocaleString());
 const pct = (x) => (x == null || !Number.isFinite(x) ? "—" : `${Math.round(x * 100)}%`);
-function hoursLabel(h) {
-  if (h == null) return "—";
-  if (h < 1) return `${Math.max(1, Math.round(h * 60))} min`;
-  if (h < 48) return `${h < 10 ? h.toFixed(1) : Math.round(h)} h`;
-  return `${Math.round(h / 24)} days`;
-}
+const hoursLabel = I.durationLabel;
 function hourName(h) {
   const am = h < 12 ? "am" : "pm";
   return `${h % 12 === 0 ? 12 : h % 12}${am}`;
@@ -81,7 +76,7 @@ function bars(rows, opts) {
     const label = repo
       ? `<button type="button" class="link name" data-insight-repo="${esc(repo)}" title="View ${esc(repo)} in Stream">${esc(name)}</button>`
       : `<span class="name" title="${esc(name)}">${esc(name)}</span>`;
-    return `<li class="bar${o.violet ? " violet" : ""}">${label}<span class="track" aria-hidden="true"><span class="fill" style="width:${(n / max * 100).toFixed(1)}%"></span></span><span class="num">${esc(fmt(n))}</span></li>`;
+    return `<li class="bar${o.violet ? " violet" : ""}">${label}<span class="track" aria-hidden="true"><span class="fill" style="width:${(n / max * 100).toFixed(1)}%"></span></span><span class="num">${esc(fmt(n))}${o.suffix || ""}</span></li>`;
   }).join("")}</ul>`;
 }
 const shortRepo = (repo) => (state.user && repo.startsWith(`${state.user.login}/`) ? repo.slice(state.user.login.length + 1) : repo);
@@ -229,7 +224,11 @@ function computed() {
   const ev = I.summarizeEvents(state.events, { lastSeen: state.lastSeen });
   const pr = I.summarizePullRequests(state.prInfo, state.user && state.user.login);
   const notes = state.notifications ? I.summarizeNotifications(state.notifications) : null;
-  return { ev, pr, notes, year: state.contributions };
+  const rhythm = state.contributions ? I.summarizeRhythm(state.contributions) : null;
+  const sessions = I.summarizeSessions(state.events, state.user && state.user.login);
+  const prPatterns = I.summarizePrPatterns(state.prInfo, state.refreshedAt);
+  const observations = I.deriveObservations({ rhythm, sessions, prs: prPatterns });
+  return { ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, observations };
 }
 
 function renderOverview(c) {
@@ -518,12 +517,86 @@ function pullRequestInsights(pr) {
     </div>` : ""}`);
 }
 
-function renderInsights({ ev, pr, year }) {
+const sourceTag = (name) => `<span class="src">${esc(name)}</span>`;
+
+function patternInsights({ ev, pr, rhythm, sessions, prPatterns, observations }) {
+  const sources = [
+    rhythm ? "the contribution year" : "",
+    ev.total ? `${fmt(ev.total)} loaded events` : "",
+    pr.total ? `${fmt(pr.total)} sampled pull requests` : "",
+  ].filter(Boolean);
+  const caption = sources.length ? `Derived from ${new Intl.ListFormat(undefined, { type: "conjunction" }).format(sources)}` : "No data loaded";
+  const notice = [state.errors.year, state.errors.events, state.errors.prs].filter(Boolean).join(" ");
+
+  const findings = observations.length
+    ? `<ul class="attention">${observations.map((o) =>
+      `<li class="${esc(o.tone)}"><span class="dot"></span><div><div class="t">${esc(o.title)}</div><div class="d">${esc(o.detail)}</div>${sourceTag(o.source)}</div></li>`).join("")}</ul>`
+    : '<p class="note">Nothing crossed a reporting threshold in the loaded data. Each finding needs a minimum sample before it appears.</p>';
+
+  let rhythmCard = `<p class="note">${esc(state.errors.year || "The contribution calendar did not load.")}</p>`;
+  if (rhythm && rhythm.activeDays) {
+    const m = rhythm.momentum;
+    const spread = rhythm.repoSpread;
+    rhythmCard = `
+      ${stats([["Days holding half the output", fmt(rhythm.halfDays)], ["Typical run of active days", `${fmt(rhythm.medianRun)} d`], ["Longest break", rhythm.longestGap ? `${fmt(rhythm.longestGap.days)} d` : "—"]])}
+      ${rhythm.bands ? bars(rhythm.bands.map(([name, x]) => [name, Math.round(x * 100)]), { suffix: "%" }) + '<p class="note">Share of contributions by how busy the day was.</p>' : ""}
+      <p class="note">${m ? `The last 28 days (${fmt(m.last28)}) were busier than <strong>${Math.floor(m.percentile * 100)}%</strong> of the ${fmt(m.windows)} earlier rolling 28-day windows. ` : "A 28-day ranking needs at least 56 calendar days. "}
+        ${fmt(rhythm.activeWeeks)} of ${fmt(rhythm.weeks)} full weeks had activity.
+        ${spread && spread.listed > 1 ? `Commits are distributed like <strong>${spread.effective.toFixed(1)}</strong> equally used repositories across the ${fmt(spread.listed)} totals GitHub returned.` : ""}</p>`;
+  } else if (rhythm) {
+    rhythmCard = '<p class="note">No active days in the returned calendar.</p>';
+  }
+
+  let sessionCard = '<p class="note">No event timestamps are available.</p>';
+  let mixCard = sessionCard;
+  if (sessions.timed) {
+    const { core, edge, weekend } = sessions.dayParts;
+    const long = sessions.longest;
+    sessionCard = `
+      ${stats([["Sessions", fmt(sessions.sessions)], ["Typical length", sessions.multi ? hoursLabel(sessions.medianHours) : "—"], ["Crossed repositories", sessions.multi ? `${fmt(sessions.multiRepo)} / ${fmt(sessions.multi)}` : "—"]])}
+      ${bars([["Weekdays 9am–6pm", core], ["Weekday early or late", edge], ["Weekends", weekend]])}
+      <p class="note">A session is a run of events with gaps under an hour, in local time. Length and crossings count sessions with more than one event.
+        ${long ? `The longest ran ${esc(hoursLabel(long.hours))} on ${esc(new Date(long.start).toLocaleDateString(undefined, { month: "short", day: "numeric" }))} with ${fmt(long.events)} events in ${fmt(long.repos)} ${long.repos === 1 ? "repository" : "repositories"}.` : ""}</p>`;
+    const life = sessions.branchLifetimes;
+    mixCard = `
+      ${bars(sessions.mix, { violet: true })}
+      <p class="note">Building covers pushes, branches, releases, and pull request changes. Reviewing covers reviews and review comments. Discussing covers issues and comments.
+        ${sessions.ownRepo == null ? "" : `<strong>${pct(sessions.ownRepo / sessions.timed)}</strong> of events were in repositories under your account.`}
+        ${life.count ? `${fmt(life.count)} ${life.count === 1 ? "branch was" : "branches were"} created and deleted inside the feed, living a median of <strong>${esc(hoursLabel(life.medianHours))}</strong>.` : ""}</p>`;
+  }
+
+  const groups = [["Agent-branch PRs", prPatterns.agent], ["Other PRs", prPatterns.other], ["Smaller half by lines", prPatterns.smaller], ["Larger half by lines", prPatterns.larger]]
+    .filter(([, g]) => g && g.count);
+  const prCard = prPatterns.merged ? `
+      ${stats([["Merged lines with no review", prPatterns.mergedLines ? pct(prPatterns.unreviewedLines / prPatterns.mergedLines) : "—"], ["Open over two weeks", prPatterns.open ? `${fmt(prPatterns.stale)} / ${fmt(prPatterns.open)}` : "—"], ["Oldest open", prPatterns.oldestOpen ? `${fmt(Math.floor(prPatterns.oldestOpen.days))} d` : "—"]])}
+      <table class="compare"><caption class="note">Sampled merges by group</caption>
+        <thead><tr><th scope="col">Group</th><th scope="col">Merged</th><th scope="col">Median to merge</th><th scope="col">Zero reviews</th><th scope="col">Median lines</th></tr></thead>
+        <tbody>${groups.map(([name, g]) => `<tr><th scope="row">${esc(name)}</th><td>${fmt(g.count)}</td><td>${esc(hoursLabel(g.medianHours))}</td><td>${fmt(g.unreviewed)} / ${fmt(g.count)}</td><td>${fmt(Math.round(g.medianSize))}</td></tr>`).join("")}</tbody></table>
+      <p class="note">Agent branches are matched by prefix such as <code>claude/</code> or <code>codex/</code>. Size halves appear with six or more merges. Small groups can swing on a single pull request.</p>`
+    : `<p class="note">${pr.total ? "No merged pull requests in the loaded details." : "No pull request details are loaded."}</p>`;
+
+  return insightSection("insight-patterns", "Patterns", caption, `
+    ${notice ? `<p class="insight-notice">${esc(notice)}</p>` : ""}
+    <div class="grid insights">
+      <article class="card insight-wide">
+        <h4>What stands out</h4>
+        ${findings}
+      </article>
+      <article class="card"><h4>Output rhythm</h4>${sourceTag("Contribution year")}${rhythmCard}</article>
+      <article class="card"><h4>Work sessions</h4>${sourceTag("Recent events")}${sessionCard}</article>
+      <article class="card"><h4>Work mix</h4>${sourceTag("Recent events")}${mixCard}</article>
+      <article class="card"><h4>Merge patterns</h4>${sourceTag("Sampled pull requests")}${prCard}</article>
+    </div>`);
+}
+
+function renderInsights(c) {
+  const { ev, pr, year } = c;
   $("insight-nav").querySelectorAll("button").forEach((button) => {
     button.setAttribute("aria-pressed", String(button.dataset.source === state.insight));
   });
   const panel = state.insight === "events" ? eventInsights(ev)
-    : state.insight === "prs" ? pullRequestInsights(pr) : annualInsights(year);
+    : state.insight === "prs" ? pullRequestInsights(pr)
+    : state.insight === "patterns" ? patternInsights(c) : annualInsights(year);
   $("insights").innerHTML = `${state.errors.refresh ? `<p class="insight-notice">${esc(state.errors.refresh)}</p>` : ""}${panel}`;
 }
 

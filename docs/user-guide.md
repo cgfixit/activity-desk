@@ -6,10 +6,22 @@ Activity Desk gives you one place to review GitHub activity across the repositor
 
 - **Overview** highlights recent contribution trends, open pull requests in the loaded sample, and unread notifications when available.
 - **Stream** filters loaded events by type, repository, and search text. Clear **Hide routine changes** to include events such as PR label changes. **Mark all seen** updates a timestamp for your account on this Mac.
-- **Insights** shows your contribution calendar, an event heatmap, and merge timing, recorded reviews, and change sizes for sampled pull requests. In **Recent events**, select a repository to open its events in Stream.
+- **Insights** shows your contribution calendar, an event heatmap, and merge timing, recorded reviews, and change sizes for sampled pull requests. In **Recent events**, select a repository to open its events in Stream. **Patterns** derives findings the other views do not state: how concentrated your output is, where the last four weeks rank in the year, how events group into work sessions, and how agent-branch merges compare with the rest.
 - **Data & access** shows which sources loaded and flags limits, missing data, and permission errors.
 
 ![Recent events and repository filters using fictional activity](screenshots/recent-events.png)
+
+![Patterns derived from fictional activity](screenshots/patterns.png)
+
+### Reading Patterns
+
+Patterns asks GitHub for nothing extra. It recombines the three loaded sources, and each card and finding names the source it came from.
+
+- **Output rhythm** uses the contribution year. It shows how few days hold half of your contributions, the typical run of consecutive active days, the longest break, and the rank of the last 28 days among earlier rolling 28-day windows.
+- **Work sessions** and **Work mix** use recent events. A session is a run of events with gaps under an hour, in local time. A session crosses repositories when its events touch more than one.
+- **Merge patterns** uses the sampled pull requests. It compares agent-branch merges with other merges, and the larger half with the smaller half once six merges are loaded.
+
+A finding appears in **What stands out** only when its sample is large enough, such as three merges in each group. These are descriptions of the loaded samples. A gap between two groups can come from something the app does not measure, and the size comparison says so when agent branches dominate one half.
 
 ## What the numbers cover
 
