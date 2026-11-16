@@ -736,6 +736,100 @@ function summarizeReviewFlow(prInfo, login) {
   };
 }
 
+// Review partners: who reviews the user's pull requests and whose pull requests the user reviews.
+// Both directions use the same window and the same clock as review turnaround: hours from creation
+// to that person's first review, not from the review request, which needs the timeline API.
+const COLLAB_MIN_SIDE = 8;      // reviews on the busier side before a balance finding
+const COLLAB_RATIO = 3;         // how lopsided the balance must be
+const COLLAB_PAIR_MIN = 3;      // pull requests in each direction before a pair finding
+const COLLAB_PAIR_HOURS = 24;   // and the median gap between directions
+const COLLAB = "Review partners";
+// `complete` says both searches loaded without a cap. Without it, a balance comparison
+// would read a missing or truncated side as the user giving or getting fewer reviews.
+function summarizeCollaboration(prInfo, reviewed, login, { complete = false } = {}) {
+  const me = String(login || "").toLowerCase();
+  const people = new Map();
+  const person = (name) => {
+    const key = name.toLowerCase();
+    if (!people.has(key)) people.set(key, { login: name, inHours: [], outHours: [], in: 0, out: 0 });
+    return people.get(key);
+  };
+  const hoursFrom = (start, at) => {
+    const h = (Date.parse(at) - Date.parse(start)) / 36e5;
+    return Number.isFinite(h) && h >= 0 ? h : null;
+  };
+
+  // Inbound: each human reviewer once per pull request the user authored, timed by their first review.
+  let received = 0;
+  let truncated = 0;
+  const authored = Object.values(prInfo || {}).filter((pr) => pr?.title && Array.isArray(pr.reviewList) &&
+    me && String(pr.author || "").toLowerCase() === me);
+  for (const pr of authored) {
+    if (pr.reviews > pr.reviewList.length) truncated += 1;
+    const first = new Map();
+    for (const r of pr.reviewList) {
+      const name = r.login && r.login.toLowerCase();
+      if (!name || r.bot || name === me) continue;
+      const t = Date.parse(r.at);
+      if (!first.has(name) || (Number.isFinite(t) && t < Date.parse(first.get(name).at))) first.set(name, r);
+    }
+    for (const r of first.values()) {
+      const p = person(r.login);
+      p.in += 1;
+      received += 1;
+      const h = hoursFrom(pr.createdAt, r.at);
+      if (h != null) p.inHours.push(h);
+    }
+  }
+
+  // Outbound: pull requests by other humans that the user reviewed, timed by the user's first review.
+  let given = 0;
+  let botAuthored = 0;
+  let unmatched = 0;
+  for (const pr of Object.values(reviewed || {})) {
+    const author = String(pr?.author || "");
+    if (!pr?.title || !author || author.toLowerCase() === me) continue;
+    if (pr.authorBot) { botAuthored += 1; continue; }
+    const p = person(author);
+    p.out += 1;
+    given += 1;
+    const h = pr.myFirstReviewAt ? hoursFrom(pr.createdAt, pr.myFirstReviewAt) : null;
+    if (h != null) p.outHours.push(h); else unmatched += 1;
+  }
+
+  const rows = [...people.values()].map((p) => ({
+    login: p.login, in: p.in, out: p.out,
+    inMedianHours: median(p.inHours), outMedianHours: median(p.outHours),
+    inTimed: p.inHours.length, outTimed: p.outHours.length,
+    kind: p.in && p.out ? "mutual" : p.in ? "reviews-you" : "you-review",
+  })).sort((a, b) => (b.in + b.out) - (a.in + a.out) || a.login.localeCompare(b.login));
+
+  const findings = [];
+  const add = (tone, title, detail) => findings.push({ tone, source: COLLAB, title, detail });
+  const busier = Math.max(given, received);
+  if (complete && busier >= COLLAB_MIN_SIDE && busier >= COLLAB_RATIO * Math.max(1, Math.min(given, received))) {
+    if (given > received) add("info", "You review much more than you are reviewed",
+      `You reviewed ${plural(given, "pull request")} by others and received ${plural(received, "human review")} on your own in the same window.`);
+    else add("info", "Others review you much more than you review them",
+      `Your pull requests received ${plural(received, "human review")} and you reviewed ${plural(given, "pull request")} by others in the same window.`);
+  }
+  for (const r of rows) {
+    if (r.kind !== "mutual" || r.inTimed < COLLAB_PAIR_MIN || r.outTimed < COLLAB_PAIR_MIN) continue;
+    const gap = r.outMedianHours - r.inMedianHours;
+    if (Math.abs(gap) < COLLAB_PAIR_HOURS) continue;
+    const faster = gap < 0;
+    add("info", faster ? `You answer ${r.login} faster than they answer you` : `${r.login} answers you faster than you answer them`,
+      `Median first review: yours on their pull requests ${durationLabel(r.outMedianHours)}, theirs on yours ${durationLabel(r.inMedianHours)}, across ${r.outTimed} and ${r.inTimed} pull requests.`);
+    if (findings.length >= 3) break;
+  }
+
+  return {
+    authored: authored.length, reviewedCount: Object.keys(reviewed || {}).length,
+    received, given, botAuthored, unmatched, truncated, complete,
+    people: rows, mutual: rows.filter((r) => r.kind === "mutual").length, findings,
+  };
+}
+
 // Plain-language findings. Each names its source, and each needs a minimum sample before it appears.
 function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review }) {
   const out = [];
@@ -990,6 +1084,7 @@ function normalizePullRequest(pr, repo, number, source) {
   return {
     ...pr, repo, number, source,
     headRef: pr.headRefName, author: pr.author?.login, mergedBy: pr.mergedBy?.login,
+    authorBot: pr.author?.__typename === "Bot" || isBotLogin(pr.author?.login),
     reviews: pr.reviews.totalCount,
     reviewList: (Array.isArray(pr.reviews.nodes) ? pr.reviews.nodes : []).map((r) => ({
       login: r?.author?.login || "", at: r?.submittedAt,
@@ -1389,6 +1484,7 @@ const api = {
   summarizeRateLimit,
   summarizeFootprint,
   summarizeContributionHistory,
+  summarizeCollaboration,
 };
 
 if (typeof module !== "undefined" && module.exports) module.exports = api;
