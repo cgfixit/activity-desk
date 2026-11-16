@@ -261,6 +261,10 @@ test("finds the text behind comment events in the payload or the loaded conversa
   assert.equal(text(event("IssuesEvent", { action: "opened", issue: { body: "Description" } })).label, "Issue description");
   assert.equal(text(event("IssuesEvent", { action: "closed", issue: { body: "Description" } })), null);
   assert.equal(text(event("PushEvent", {})), null);
+  // Removing one comment can rejoin "<!--" from what surrounds it; nothing hidden may survive.
+  assert.equal(insights.cleanText("visible <!<!-- x -->-- hidden marker -->text"), "visible text");
+  assert.equal(insights.cleanText("keep this <!-- unterminated"), "keep this");
+  assert.equal(insights.cleanText("step one --> step two"), "step one --> step two");
   const long = text(event("CommitCommentEvent", { comment: { body: "x".repeat(20010) } }));
   assert.deepEqual([long.text.length, long.clipped], [20000, 10]);
   const events = [event("IssueCommentEvent", { issue: { number: 9 }, comment: { body: "Mentions the retry loop" } })];

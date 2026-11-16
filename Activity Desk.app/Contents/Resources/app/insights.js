@@ -1094,9 +1094,21 @@ const COMMENT_EVENTS = {
   PullRequestReviewEvent: { kind: "review", label: "Review", always: false },
 };
 
-// Line endings normalized, hidden HTML comments (often left by bots) and runs of blank lines removed.
+// Hidden HTML comments, often left by bots, removed until none remain. One pass is not enough: removing
+// a comment can join the text around it into a new "<!--". An unterminated comment runs to the end.
+// The result is display text and is always HTML-escaped where it is shown.
+function stripHtmlComments(text) {
+  let previous;
+  do {
+    previous = text;
+    text = text.replace(/<!--[\s\S]*?(?:-->|$)/g, "");
+  } while (text !== previous);
+  return text;
+}
+
+// Line endings normalized, hidden HTML comments and runs of blank lines removed.
 function cleanText(value) {
-  return String(value).replace(/\r\n?/g, "\n").replace(/<!--[\s\S]*?-->/g, "").replace(/\n{3,}/g, "\n\n").trim();
+  return stripHtmlComments(String(value).replace(/\r\n?/g, "\n")).replace(/\n{3,}/g, "\n\n").trim();
 }
 
 // Cleaned text, cut at TEXT_LIMIT characters with the remainder counted, or null when nothing is left.
