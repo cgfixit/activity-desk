@@ -454,9 +454,16 @@ function computed() {
   const years = state.contributionHistory
     ? I.summarizeContributionHistory(state.contributionHistory.byYear, localDayKey(new Date()), state.viewer?.createdAt) : null;
   const token = state.tokenKind ? { kind: state.tokenKind, write: I.classicScopes(state.tokenMeta?.scopes)?.write ?? null } : null;
+  // Summaries of a source that failed are passed as null, so its suggestions say "source unavailable"
+  // instead of "nothing found". Events failed when none loaded and the feed reported an issue.
+  const eventsLoaded = state.events.length > 0 || !state.errors.events;
+  const prsLoaded = Boolean(a) || Object.keys(state.prInfo).length > 0;
   const suggestions = I.deriveSuggestions({
-    login: state.user && state.user.login, now: state.refreshedAt, ev, prPatterns, review, follow, sessions, trajectory,
-    notes, footprint, conversations: state.conversations, prInfo: state.prInfo, token,
+    login: state.user && state.user.login, now: state.refreshedAt,
+    ev: eventsLoaded ? ev : null, sessions: eventsLoaded ? sessions : null,
+    follow: eventsLoaded && prsLoaded ? follow : null,
+    prPatterns: prsLoaded ? prPatterns : null, review: a ? review : null, prInfo: a ? state.prInfo : null,
+    trajectory, notes, notesNote: state.errors.notifications || "", footprint, conversations: state.conversations, token,
   });
   return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, observations, footprint, suggestions };
 }
@@ -1129,7 +1136,7 @@ function renderSuggestions(c) {
   const { items, checked } = c.suggestions;
   $("suggestion-count").textContent = items.length ? String(items.length) : "";
   $("suggestions-caption").textContent = items.length
-    ? `${items.length} ${items.length === 1 ? "change" : "changes"} to try, each triggered by a pattern in the loaded data. Each card says what it saw, why the change may help, and what to try, with numbered sources.`
+    ? `${items.length} ${items.length === 1 ? "change" : "changes"} to try, each triggered by a pattern in the loaded data. Each card says what it saw and what to try. Where it gives a reason, each claim links to its source.`
     : "Nothing in the loaded data calls for a change. Each suggestion needs a minimum sample before it appears.";
   const notice = [state.errors.refresh, state.errors.events, state.errors.authored, state.errors.prs, state.errors.year,
     state.errors.conversations, state.errors.footprint].filter(Boolean).join(" ");

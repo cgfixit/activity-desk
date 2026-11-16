@@ -71,31 +71,31 @@ Your events come from GitHub's Events feed, which lists only your own actions an
 
 Suggestions turns patterns in the loaded data into specific changes to try. It adds no GitHub requests. It reads the same events, pull requests, contribution year, conversations, notifications, traffic, and token details as the other views. The sidebar count shows how many apply.
 
-Each card has three parts:
+Each card has up to three parts:
 
 - **Seen** describes what the loaded data shows and names the source.
-- **Why** gives the reason the change may help. Each claim carries a numbered link to its source.
+- **Why** gives the reason the change may help. Each claim carries a numbered link to its source. Cards that rest only on your data, such as **Answer replies waiting on your threads**, have no Why.
 - **Try** is the change to make.
 
 **Further reading** lists the sources in order. Selecting a source opens it in your browser. Activity Desk opens only links from its built-in list, and only on known hosts.
 
-A suggestion appears only when its sample is large enough. **What was checked** lists every suggestion with one of four results: suggested, nothing found, not enough data (with the minimum it needs), or source unavailable. Suggestions describe patterns in the loaded samples, not their causes. A merge without a recorded review, for example, may still have been checked another way.
+A suggestion appears only when its sample is large enough. **What was checked** lists every suggestion with one of four results: suggested, nothing found, not enough data (with the minimum it needs), or source unavailable. A source is unavailable when its request failed, such as the Events feed or the search for pull requests you opened, or when the token cannot read it, such as traffic without Administration access. Suggestions describe patterns in the loaded samples, not their causes. A merge without a recorded review, for example, may still have been checked another way.
 
 | Suggestion | Appears when | Sources |
 | --- | --- | --- |
-| Get a second look before merging | You have 3 or more merged pull requests, and half or more had no review from another person. If nobody else reviewed your work, it suggests required status checks instead of approvals. | GitHub Docs on self-approval and rulesets; Bacchelli and Bird, ICSE 2013 |
-| Review agent branches like a colleague's work | At least 3 agent-branch merges are loaded, and either half or more have no recorded review or their unreviewed share is 30 points above other merges. | Perry et al., ACM CCS 2023; GitHub Docs on Copilot cloud agent and rulesets |
+| Get a second look before merging | You have 3 or more merged pull requests, and half or more had no review from another person. If nobody else reviewed your work, it suggests required status checks instead of approvals. Only the first 10 reviews on each pull request are read, and the card says when that cut any short. | GitHub Docs on self-approval and rulesets; Bacchelli and Bird, ICSE 2013 |
+| Review agent branches like a colleague's work | At least 3 agent-branch merges are loaded, and either half or more have no recorded review or, with at least 3 other merges loaded, their unreviewed share is 30 points above those. | Perry et al., ACM CCS 2023; GitHub Docs on Copilot cloud agent and rulesets |
 | Ask for a reviewer when you open the pull request | Your pull requests waited a median of one day or more for a first review from another person, across 3 or more. | Google Engineering Practices; GitHub Docs on code owners; CHAOSS |
-| Spread reviews beyond one person | One person made 60% or more of the reviews on your work, across 4 or more reviewed pull requests. | Mirsaeedi and Rigby, ICSE 2020; GitHub Docs on team review assignment |
+| Spread reviews beyond one person | One person accounts for 60% or more of reviewer visits on your work, counting each reviewer once per pull request, across 4 or more pull requests reviewed by another person. | Mirsaeedi and Rigby, ICSE 2020; GitHub Docs on team review assignment |
 | Split large pull requests | With 6 or more merges, either the larger half took at least twice as long to merge as the smaller half, or the median merge changed 400 lines or more. | Google Engineering Practices; Kudrjavets et al., MSR 2022 |
 | Settle pull requests that have been open for weeks | Two or more of your pull requests have been open more than 14 days, or one has been open more than 30. | GitHub Docs on drafts; actions/stale |
 | Agree on the approach before building | 30% or more of 4 or more finished pull requests you opened in the loaded events closed without merging. | GitHub Docs on drafts |
 | Open a draft pull request early, or delete the branch | Half or more of 4 or more branches created in the loaded events, each at least 2 days old, have no pull request. | GitHub Docs on drafts and automatic branch deletion |
-| Answer replies waiting on your threads | On 2 or more open issues or pull requests you opened, the latest loaded comment is from another person and is 2 or more days old. Bots are left out. | None. The suggestion rests on your data. |
+| Answer replies waiting on your threads | On 2 or more open issues or pull requests you opened, the latest comment from a person, not a bot, is from someone else and is 2 or more days old. | None. The suggestion rests on your data. |
 | Give each repository its own block of time | Half or more of 4 or more work sessions with several events crossed repositories. | Meyer et al., FSE 2014; Mark et al., CHI 2008 |
-| Leave yourself a next step before a break | An active day is followed by another active day at least 30 points more often than an idle day is. | Parnin and Rugaber, Software Quality Journal 2011 |
+| Leave yourself a next step before a break | An active day is followed by another active day at least 30 points more often than an idle day is. Needs at least 10 days after active days and 10 after idle days. | Parnin and Rugaber, Software Quality Journal 2011 |
 | Review late-night changes the next day | At least 15% of 20 or more loaded events, and at least 5, happened between midnight and 4am local time. | Eyolfson et al., Empirical Software Engineering 2014 |
-| Get Actions notifications only for failures | At least 40% of 10 or more unread notifications are routine CI updates. Needs a classic token with `notifications`. | GitHub Docs on Actions notifications |
+| Get Actions notifications only for failures | At least 40% of 10 or more unread notifications are routine CI updates. Needs a classic token with `notifications`. Only the first page of 50 is read, and the card says so when there are more. | GitHub Docs on Actions notifications |
 | Use labels instead of title prefixes | 3 or more issues you opened in the loaded events start with a bracketed tag such as `[bug]`. | GitHub Docs on filtering and issue forms |
 | Make the README's first screen do the work | A repository you own had 20 or more unique visitors in 14 days and no new stars, by star dates. | GitHub Docs on READMEs, topics, and social previews |
 | Switch to a read-only fine-grained token | The signed-in classic token has a scope that allows writes. | GitHub Docs on personal access tokens |

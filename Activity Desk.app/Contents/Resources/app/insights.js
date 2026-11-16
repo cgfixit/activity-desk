@@ -374,6 +374,8 @@ const WORK_MIX = {
 };
 
 const sum = (values) => values.reduce((a, b) => a + b, 0);
+// Differences of two ratios carry float error (0.7 - 0.4 is 0.29999...), so thresholds on them allow for it.
+const RATIO_EPSILON = 1e-9;
 const plural = (n, word, many = `${word}s`) => `${n.toLocaleString()} ${n === 1 ? word : many}`;
 const share = (x) => `${Math.round(x * 100)}%`;
 
@@ -896,7 +898,7 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review 
             `Median ${durationLabel(agent.medianHours)} across ${agent.count} agent-branch merges, ${durationLabel(other.medianHours)} across ${other.count} others.`);
         }
       }
-      if (agent.unreviewed / agent.count - other.unreviewed / other.count >= 0.3) {
+      if (agent.unreviewed / agent.count - other.unreviewed / other.count >= 0.3 - RATIO_EPSILON) {
         add("warn", PRS, "Agent-branch merges skip review more often",
           `${agent.unreviewed} of ${agent.count} had zero recorded reviews, against ${other.unreviewed} of ${other.count} other merges.`);
       }
@@ -930,7 +932,7 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review 
   if (trajectory?.afterActive && trajectory?.afterIdle) {
     const a = trajectory.afterActive.rate;
     const i = trajectory.afterIdle.rate;
-    if (a - i >= 0.3) {
+    if (a - i >= 0.3 - RATIO_EPSILON) {
       add("info", YEAR, "Activity carries over from one day to the next",
         `An active day was followed by another ${share(a)} of the time; an idle day was followed by an active one ${share(i)} of the time. Restarting after a break is the harder step.`);
     } else if (Math.abs(a - i) < 0.1 && i >= 0.3) {
@@ -1032,12 +1034,13 @@ const SUGGESTION_RULES = [
     id: "review-before-merge", area: "Review", source: "Pull requests you opened",
     title: "Get a second look before merging",
     check: ({ review }) => {
-      if (!review) return { unavailable: "Pull request details did not load." };
+      if (!review) return { unavailable: "The search for pull requests you opened did not load." };
       if (review.merged < SUGGEST_MIN_MERGES) return { short: `Needs ${SUGGEST_MIN_MERGES} merged pull requests you opened; ${review.merged} loaded.` };
       if (review.noHuman / review.merged < 0.5) return null;
       const bots = review.botOnly ? ` ${review.botOnly} had only bot reviews.` : "";
-      const seen = `${review.noHuman} of your ${plural(review.merged, "merged pull request")} had no review from another person.${bots}`;
-      if (!review.reviewers.length) {
+      const cut = review.truncated ? ` ${plural(review.truncated, "pull request")} had more than 10 reviews, and only the first 10 were read.` : "";
+      const seen = `${review.noHuman} of your ${plural(review.merged, "merged pull request")} had no review from another person.${bots}${cut}`;
+      if (!review.reviewers.length && !review.truncated) {
         return {
           tone: "warn",
           seen: `${seen} Nobody else reviewed your pull requests in this window.`,
@@ -1060,11 +1063,11 @@ const SUGGESTION_RULES = [
     id: "review-agent-branches", area: "Review", source: "Pull requests",
     title: "Review agent branches like a colleague's work",
     check: ({ prPatterns: p }) => {
-      if (!p) return { unavailable: "Pull request details did not load." };
+      if (!p) return { unavailable: "No pull request details loaded." };
       const a = p.agent;
       if (a.count < SUGGEST_MIN_MERGES) return { short: `Needs ${SUGGEST_MIN_MERGES} merged agent-branch pull requests; ${a.count} loaded.` };
       const o = p.other;
-      const gap = o.count >= SUGGEST_MIN_MERGES && a.unreviewed / a.count - o.unreviewed / o.count >= 0.3;
+      const gap = o.count >= SUGGEST_MIN_MERGES && a.unreviewed / a.count - o.unreviewed / o.count >= 0.3 - RATIO_EPSILON;
       if (a.unreviewed / a.count < 0.5 && !gap) return null;
       return {
         tone: "warn",
@@ -1081,7 +1084,7 @@ const SUGGESTION_RULES = [
     id: "faster-first-review", area: "Review", source: "Pull requests you opened",
     title: "Ask for a reviewer when you open the pull request",
     check: ({ review }) => {
-      if (!review) return { unavailable: "Pull request details did not load." };
+      if (!review) return { unavailable: "The search for pull requests you opened did not load." };
       if (review.withHumanReview < 3) return { short: `Needs 3 of your pull requests with a review from another person; ${review.withHumanReview} loaded.` };
       if (!(review.medianFirstReviewHours >= SUGGEST_REVIEW_WAIT_HOURS)) return null;
       return {
@@ -1097,7 +1100,7 @@ const SUGGESTION_RULES = [
     id: "spread-reviews", area: "Review", source: "Pull requests you opened",
     title: "Spread reviews beyond one person",
     check: ({ review }) => {
-      if (!review) return { unavailable: "Pull request details did not load." };
+      if (!review) return { unavailable: "The search for pull requests you opened did not load." };
       if (review.withHumanReview < 4 || !review.reviewers.length) return { short: `Needs 4 of your pull requests with a review from another person; ${review.withHumanReview} loaded.` };
       if (review.topReviewerShare < 0.6) return null;
       const [name, count] = review.reviewers[0];
@@ -1113,7 +1116,7 @@ const SUGGESTION_RULES = [
     id: "smaller-prs", area: "Pull requests", source: "Pull requests",
     title: "Split large pull requests",
     check: ({ prPatterns: p }) => {
-      if (!p) return { unavailable: "Pull request details did not load." };
+      if (!p) return { unavailable: "No pull request details loaded." };
       if (!p.smaller || !p.larger) return { short: `Needs 6 merged pull requests; ${p.merged} loaded.` };
       const { smaller: s, larger: l } = p;
       const slow = s.medianHours > 0 && l.medianHours != null && l.medianHours / s.medianHours >= 2;
@@ -1139,7 +1142,7 @@ const SUGGESTION_RULES = [
     id: "settle-stale-prs", area: "Pull requests", source: "Pull requests you opened",
     title: "Settle pull requests that have been open for weeks",
     check: ({ prInfo }, { me, nowTime }) => {
-      if (!prInfo) return { unavailable: "Pull request details did not load." };
+      if (!prInfo) return { unavailable: "The search for pull requests you opened did not load." };
       const stale = Object.values(prInfo).filter((pr) => pr?.title && pr.state === "OPEN" && me && String(pr.author || "").toLowerCase() === me)
         .map((pr) => ({ pr, days: ageDays(nowTime, pr.createdAt) }))
         .filter((r) => r.days >= SUGGEST_STALE_DAYS)
@@ -1160,7 +1163,7 @@ const SUGGESTION_RULES = [
     id: "agree-before-building", area: "Pull requests", source: "Recent events",
     title: "Agree on the approach before building",
     check: ({ follow }) => {
-      if (!follow) return { unavailable: "No events loaded." };
+      if (!follow) return { unavailable: "Recent events or pull request details did not load." };
       const { merged, closed } = follow.outcomes;
       const decided = merged + closed;
       if (decided < 4) return { short: `Needs 4 finished pull requests opened in the loaded events; ${decided} found.` };
@@ -1177,7 +1180,7 @@ const SUGGESTION_RULES = [
     id: "branches-without-prs", area: "Branches", source: "Recent events",
     title: "Open a draft pull request early, or delete the branch",
     check: ({ follow }) => {
-      if (!follow) return { unavailable: "No events loaded." };
+      if (!follow) return { unavailable: "Recent events or pull request details did not load." };
       if (follow.settled < 4) return { short: `Needs 4 branches created in the loaded events and at least 2 days old; ${follow.settled} found.` };
       const n = follow.withoutPr.length;
       if (n / follow.settled < 0.5) return null;
@@ -1199,12 +1202,13 @@ const SUGGESTION_RULES = [
       if (!conversations) return { unavailable: "Conversations did not load." };
       // Items are newest first, so the first item per thread is its latest loaded comment.
       const latest = new Map();
+      // Bot comments are skipped, so a bot posting after a person's reply does not hide it.
       for (const c of conversations.items) {
         const key = `${c.thread.repo}#${c.thread.number}`;
-        if (!latest.has(key)) latest.set(key, c);
+        if (!c.bot && !latest.has(key)) latest.set(key, c);
       }
       const waiting = [...latest.values()]
-        .filter((c) => c.thread.state === "open" && me && String(c.thread.author).toLowerCase() === me && !c.mine && !c.bot)
+        .filter((c) => c.thread.state === "open" && me && String(c.thread.author).toLowerCase() === me && !c.mine)
         .map((c) => ({ c, days: ageDays(nowTime, c.at) }))
         .filter((r) => r.days >= SUGGEST_WAITING_DAYS)
         .sort((a, b) => b.days - a.days);
@@ -1221,7 +1225,7 @@ const SUGGESTION_RULES = [
     id: "batch-by-repo", area: "Focus", source: "Recent events",
     title: "Give each repository its own block of time",
     check: ({ sessions }) => {
-      if (!sessions) return { unavailable: "No events loaded." };
+      if (!sessions) return { unavailable: "Recent events did not load." };
       if (sessions.multi < 4) return { short: `Needs 4 work sessions with several events; ${sessions.multi} found.` };
       if (sessions.multiRepo / sessions.multi < 0.5) return null;
       return {
@@ -1241,7 +1245,7 @@ const SUGGESTION_RULES = [
     check: ({ trajectory: t }) => {
       if (!t) return { unavailable: "The contribution calendar did not load." };
       if (!t.afterActive || !t.afterIdle) return { short: "Needs at least 10 days after active days and 10 after idle days." };
-      if (t.afterActive.rate - t.afterIdle.rate < 0.3) return null;
+      if (t.afterActive.rate - t.afterIdle.rate < 0.3 - RATIO_EPSILON) return null;
       return {
         tone: "info",
         seen: `After an active day you were active again ${share(t.afterActive.rate)} of the time; after an idle day, ${share(t.afterIdle.rate)}. Restarting is the harder step.`,
@@ -1254,7 +1258,7 @@ const SUGGESTION_RULES = [
     id: "late-night-review", area: "Focus", source: "Recent events",
     title: "Review late-night changes the next day",
     check: ({ sessions }) => {
-      if (!sessions) return { unavailable: "No events loaded." };
+      if (!sessions) return { unavailable: "Recent events did not load." };
       if (sessions.timed < 20) return { short: `Needs 20 timed events; ${sessions.timed} loaded.` };
       if (sessions.lateNight < 5 || sessions.lateNight / sessions.timed < SUGGEST_LATE_SHARE) return null;
       return {
@@ -1268,13 +1272,13 @@ const SUGGESTION_RULES = [
   {
     id: "ci-notifications", area: "Notifications", source: "Unread notifications",
     title: "Get Actions notifications only for failures",
-    check: ({ notes }) => {
-      if (!notes) return { unavailable: "Unread notifications need a classic token with the notifications scope." };
+    check: ({ notes, notesNote }) => {
+      if (!notes) return { unavailable: notesNote || "Unread notifications did not load." };
       if (notes.unread < 10) return { short: `Needs 10 unread notifications; ${notes.unread} loaded.` };
       if (notes.ciNoise / notes.unread < SUGGEST_CI_SHARE) return null;
       return {
         tone: "info",
-        seen: `${notes.ciNoise} of ${plural(notes.unread, "unread notification")} are routine CI updates.`,
+        seen: `${notes.ciNoise} of ${plural(notes.unread, "unread notification")}${notesNote ? " on the first page" : ""} are routine CI updates.`,
         act: [["In GitHub's notification settings, under GitHub Actions, choose Only notify for failed workflows.", "gh-notifications"]],
       };
     },
@@ -1283,7 +1287,7 @@ const SUGGESTION_RULES = [
     id: "labels-not-prefixes", area: "Issues", source: "Recent events",
     title: "Use labels instead of title prefixes",
     check: ({ ev }) => {
-      if (!ev) return { unavailable: "No events loaded." };
+      if (!ev) return { unavailable: "Recent events did not load." };
       const n = sum(ev.tags.map(([, k]) => k));
       if (n < 3) return null;
       return {
@@ -1299,7 +1303,9 @@ const SUGGESTION_RULES = [
     title: "Make the README's first screen do the work",
     check: ({ footprint }) => {
       if (!footprint) return { unavailable: "Repository traffic did not load." };
-      const quiet = footprint.rows.filter((r) => r.uniques >= FOOTPRINT_MIN_VISITORS && r.stars14 === 0)
+      const known = footprint.rows.filter((r) => r.uniques != null && r.stars14 != null);
+      if (!known.length) return { unavailable: "Traffic or star dates did not load for your repositories." };
+      const quiet = known.filter((r) => r.uniques >= FOOTPRINT_MIN_VISITORS && r.stars14 === 0)
         .sort((a, b) => b.uniques - a.uniques);
       if (!quiet.length) return null;
       const o = quiet[0];
