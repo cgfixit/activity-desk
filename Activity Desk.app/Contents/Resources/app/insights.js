@@ -475,7 +475,7 @@ function summarizeSessions(events, login) {
   const lifetimes = [];
   const owner = login ? `${String(login).toLowerCase()}/` : "";
   let ownRepo = 0;
-  let lateNight = 0; // midnight to 4am local time, the window Eyolfson et al. compared
+  let lateNight = 0; // midnight to 4am local time, the late-night window in Eyolfson et al.
 
   for (const { e, time } of timed) {
     const repo = repoName(e);
@@ -1003,13 +1003,12 @@ const READING = Object.freeze({
   "gh-social-preview": { title: "Customizing your repository's social media preview", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/customizing-your-repositorys-social-media-preview" },
   "chaoss-first-response": { title: "Time to First Response", by: "CHAOSS", kind: "Metric", url: "https://chaoss.community/kb/metric-time-to-first-response/" },
   "bacchelli-2013": { title: "Expectations, Outcomes, and Challenges of Modern Code Review", by: "Bacchelli and Bird, ICSE 2013", kind: "Study", url: "https://doi.org/10.1109/ICSE.2013.6606617" },
-  "sadowski-2018": { title: "Modern Code Review: A Case Study at Google", by: "Sadowski et al., ICSE-SEIP 2018", kind: "Study", url: "https://doi.org/10.1145/3183519.3183525" },
   "kudrjavets-2022": { title: "Do Small Code Changes Merge Faster? A Multi-Language Empirical Investigation", by: "Kudrjavets, Nagappan, and Rastogi, MSR 2022", kind: "Study", url: "https://doi.org/10.1145/3524842.3528448" },
   "perry-2023": { title: "Do Users Write More Insecure Code with AI Assistants?", by: "Perry, Srivastava, Kumar, and Boneh, ACM CCS 2023", kind: "Study", url: "https://doi.org/10.1145/3576915.3623157" },
   "meyer-2014": { title: "Software Developers' Perceptions of Productivity", by: "Meyer, Fritz, Murphy, and Zimmermann, FSE 2014", kind: "Study", url: "https://doi.org/10.1145/2635868.2635892" },
   "mark-2008": { title: "The Cost of Interrupted Work: More Speed and Stress", by: "Mark, Gudith, and Klocke, CHI 2008", kind: "Study", url: "https://doi.org/10.1145/1357054.1357072" },
   "parnin-2011": { title: "Resumption strategies for interrupted programming tasks", by: "Parnin and Rugaber, Software Quality Journal 2011", kind: "Study", url: "https://doi.org/10.1007/s11219-010-9104-9" },
-  "eyolfson-2011": { title: "Do Time of Day and Developer Experience Affect Commit Bugginess?", by: "Eyolfson, Tan, and Lam, MSR 2011", kind: "Study", url: "https://doi.org/10.1145/1985441.1985464" },
+  "eyolfson-2014": { title: "Correlations between bugginess and time-based commit characteristics", by: "Eyolfson, Tan, and Lam, Empirical Software Engineering 2014", kind: "Study", url: "https://doi.org/10.1007/s10664-013-9245-0" },
   "mirsaeedi-2020": { title: "Mitigating Turnover with Code Review Recommendation", by: "Mirsaeedi and Rigby, ICSE 2020", kind: "Study", url: "https://doi.org/10.1145/3377811.3380335" },
 });
 
@@ -1052,7 +1051,7 @@ const SUGGESTION_RULES = [
       return {
         tone: "warn",
         seen: `${seen}${review.selfMerged ? ` You merged ${review.selfMerged} yourself.` : ""}`,
-        why: [["Developers expect review to find defects, but in a study of reviews at Microsoft much of its value came from knowledge transfer, team awareness, and alternative solutions.", "bacchelli-2013"]],
+        why: [["At Microsoft, finding defects was the main reason developers gave for review, but reviews turned out less about defects than expected and also spread knowledge, team awareness, and alternative solutions.", "bacchelli-2013"]],
         act: [["Add a ruleset on your default branch with Require a pull request before merging and one required approval.", "gh-rulesets"]],
       };
     },
@@ -1071,7 +1070,7 @@ const SUGGESTION_RULES = [
         tone: "warn",
         seen: `${a.unreviewed} of ${plural(a.count, "agent-branch merge")} had no recorded review${o.count ? `, against ${o.unreviewed} of ${o.count} other merges` : ""}. Agent branches are matched by prefix, such as claude/ or codex/.`,
         why: [
-          ["In a controlled study, participants with an AI code assistant wrote less secure code than those without one, and were more likely to believe their code was secure.", "perry-2023"],
+          ["In a 47-person study, participants with an AI code assistant wrote less secure code on four of five tasks, and were more likely to believe it was secure.", "perry-2023"],
           ["GitHub's own coding agent is set up so the person who asked for its pull request cannot approve it.", "gh-copilot-risks"],
         ],
         act: [["Read an agent's diff before merging it, and require tests and code scanning to pass on the default branch.", "gh-rulesets"]],
@@ -1105,7 +1104,7 @@ const SUGGESTION_RULES = [
       return {
         tone: "info",
         seen: `${name} reviewed ${plural(count, "pull request")} of yours, ${share(review.topReviewerShare)} of all reviewer visits.`,
-        why: [["Choosing reviewers to spread knowledge, not only by expertise, reduced the files at risk when a developer leaves.", "mirsaeedi-2020"]],
+        why: [["In a reviewer-recommendation study, picking reviewers by ownership alone concentrated knowledge in a few people; balancing expertise with spreading knowledge cut the files at risk from turnover by 28%.", "mirsaeedi-2020"]],
         act: [["Name a second owner for your busiest paths in CODEOWNERS, or, in an organization, have a team assign reviewers by round robin or load balance.", "gh-team-review"]],
       };
     },
@@ -1130,7 +1129,7 @@ const SUGGESTION_RULES = [
         seen,
         why: [
           ["Google's review guide says small changes are reviewed more quickly and more thoroughly, and are less likely to introduce bugs.", "google-small-cls"],
-          ["Across open-source projects the link between size and time to merge is weaker than that advice suggests, so your own numbers are the better guide.", "kudrjavets-2022"],
+          ["Across 100 open-source projects, though, pull request size was only weakly related to time to merge, so your own numbers are the better guide.", "kudrjavets-2022"],
         ],
         act: [["Split by concern: refactors, renames, and generated files in their own pull requests, and dependent changes stacked one on another."]],
       };
@@ -1229,8 +1228,8 @@ const SUGGESTION_RULES = [
         tone: "info",
         seen: `${sessions.multiRepo} of ${plural(sessions.multi, "work session")} crossed repositories. A session is a run of events with gaps under an hour.`,
         why: [
-          ["Developers rated days with few context switches and interruptions as their most productive.", "meyer-2014"],
-          ["In a lab study, interrupted people finished as fast but reported more stress, frustration, and time pressure.", "mark-2008"],
+          ["Developers describe productive days as finishing tasks without many interruptions or context switches, although when observed they switched often and still felt productive.", "meyer-2014"],
+          ["In a lab study, interrupted people finished faster with no loss of quality, but reported more stress, frustration, time pressure, and effort.", "mark-2008"],
         ],
         act: [["Work one repository per block, and batch cross-repository chores such as dependency bumps into one session."]],
       };
@@ -1246,7 +1245,7 @@ const SUGGESTION_RULES = [
       return {
         tone: "info",
         seen: `After an active day you were active again ${share(t.afterActive.rate)} of the time; after an idle day, ${share(t.afterIdle.rate)}. Restarting is the harder step.`,
-        why: [["Programmers resuming interrupted work rarely started editing right away, and relied on notes and other cues to rebuild context.", "parnin-2011"]],
+        why: [["Across 10,000 recorded sessions, programmers resumed editing within a minute of an interruption only 10% of the time, and used several strategies to rebuild context.", "parnin-2011"]],
         act: [["Before you stop, write the next concrete step in the issue or pull request, or leave a failing test, so the first move back is obvious."]],
       };
     },
@@ -1261,7 +1260,7 @@ const SUGGESTION_RULES = [
       return {
         tone: "info",
         seen: `${share(sessions.lateNight / sessions.timed)} of loaded events (${sessions.lateNight.toLocaleString()}) happened between midnight and 4am, local time.`,
-        why: [["In the Linux kernel and PostgreSQL histories, commits made between midnight and 4am were more likely to introduce bugs.", "eyolfson-2011"]],
+        why: [["In the Linux kernel, PostgreSQL, and X.org server histories, commits made between midnight and 4am were significantly buggier.", "eyolfson-2014"]],
         act: [["Open late-night work as a draft and read the diff the next day before merging."]],
       };
     },

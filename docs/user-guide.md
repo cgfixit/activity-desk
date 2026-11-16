@@ -94,7 +94,7 @@ A suggestion appears only when its sample is large enough. **What was checked** 
 | Answer replies waiting on your threads | On 2 or more open issues or pull requests you opened, the latest loaded comment is from another person and is 2 or more days old. Bots are left out. | None. The suggestion rests on your data. |
 | Give each repository its own block of time | Half or more of 4 or more work sessions with several events crossed repositories. | Meyer et al., FSE 2014; Mark et al., CHI 2008 |
 | Leave yourself a next step before a break | An active day is followed by another active day at least 30 points more often than an idle day is. | Parnin and Rugaber, Software Quality Journal 2011 |
-| Review late-night changes the next day | At least 15% of 20 or more loaded events, and at least 5, happened between midnight and 4am local time. | Eyolfson et al., MSR 2011 |
+| Review late-night changes the next day | At least 15% of 20 or more loaded events, and at least 5, happened between midnight and 4am local time. | Eyolfson et al., Empirical Software Engineering 2014 |
 | Get Actions notifications only for failures | At least 40% of 10 or more unread notifications are routine CI updates. Needs a classic token with `notifications`. | GitHub Docs on Actions notifications |
 | Use labels instead of title prefixes | 3 or more issues you opened in the loaded events start with a bracketed tag such as `[bug]`. | GitHub Docs on filtering and issue forms |
 | Make the README's first screen do the work | A repository you own had 20 or more unique visitors in 14 days and no new stars, by star dates. | GitHub Docs on READMEs, topics, and social previews |
