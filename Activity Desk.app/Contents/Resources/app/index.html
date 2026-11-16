@@ -29,7 +29,7 @@
       <details class="help">
         <summary>Which token should I use?</summary>
         <ul>
-          <li><strong>Fine-grained</strong> works for the stream and insights. For private events, add the account permission <strong>Events: read</strong>. For private pull request details, give it access to those repositories with <strong>Pull requests: read</strong>. For private issue conversations, add <strong>Issues: read</strong>.</li>
+          <li><strong>Fine-grained</strong> (recommended) works for the stream and insights. Set the resource owner to your account and grant read-only access only. For private events, add the account permission <strong>Events: read</strong>. For private pull request details, give it access to those repositories with <strong>Pull requests: read</strong>. For private issue conversations, add <strong>Issues: read</strong>. A fine-grained token covers one account or organization.</li>
           <li><strong>Classic</strong> with <code>notifications</code> enables the unread inbox. GitHub's classic <code>repo</code> scope also grants write access to private repositories.</li>
           <li>Activity Desk encrypts the saved token using macOS Keychain and sends it only to api.github.com.</li>
         </ul>

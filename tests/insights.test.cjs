@@ -131,7 +131,7 @@ test("groups events into sessions and compares sampled merges with sample guards
   assert.deepEqual(insights.deriveObservations({ prs }).map((finding) => [finding.tone, finding.title]), [
     ["warn", "Agent-branch merges skip review more often"],
     ["warn", "98% of merged lines landed without a recorded review"],
-    ["warn", "1 sampled open PR older than two weeks"],
+    ["warn", "1 loaded open PR older than two weeks"],
     ["info", "Agent-branch PRs merged 10× faster than other PRs"],
     ["info", "Larger PRs merged at least as fast as smaller ones"],
   ]);

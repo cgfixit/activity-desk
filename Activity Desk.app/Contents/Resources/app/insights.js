@@ -518,7 +518,7 @@ function summarizeSessions(events, login) {
   };
 }
 
-// Comparisons inside the sampled pull requests: agent branches against the rest, larger against smaller.
+// Comparisons inside the loaded pull requests: agent branches against the rest, larger against smaller.
 function summarizePrPatterns(prInfo, now) {
   const rows = Object.values(prInfo || {}).filter((pr) => pr?.title);
   const size = (pr) => (pr.additions || 0) + (pr.deletions || 0);
@@ -683,7 +683,7 @@ function summarizeFollowThrough(events, prInfo, now) {
 
 const isBotLogin = (login) => /\[bot\]$|-bot$|^copilot/i.test(String(login || ""));
 
-// Review turnaround in the sampled pull requests, after CHAOSS "time to first response":
+// Review turnaround in the loaded pull requests, after CHAOSS "time to first response":
 // the first review by a human who is not the author, measured from when the pull request was created.
 function summarizeReviewFlow(prInfo, login) {
   const me = String(login || "").toLowerCase();
@@ -742,7 +742,7 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review 
   const add = (tone, source, title, detail) => out.push({ tone, source, title, detail });
   const YEAR = "Contribution year";
   const FEED = "Recent events";
-  const PRS = "Sampled pull requests";
+  const PRS = "Pull requests";
 
   if (rhythm && rhythm.activeDays >= 10) {
     const shape = rhythm.halfShare <= 0.2 ? " Output arrives in bursts rather than evenly."
@@ -805,7 +805,7 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review 
     }
     if (prs.merged >= 3 && prs.mergedLines > 0 && prs.unreviewedLines / prs.mergedLines >= 0.5) {
       add("warn", PRS, `${share(prs.unreviewedLines / prs.mergedLines)} of merged lines landed without a recorded review`,
-        `${prs.unreviewedLines.toLocaleString()} of ${prs.mergedLines.toLocaleString()} changed lines across ${plural(prs.merged, "sampled merge")}.`);
+        `${prs.unreviewedLines.toLocaleString()} of ${prs.mergedLines.toLocaleString()} changed lines across ${plural(prs.merged, "loaded merge")}.`);
     }
     if (smaller && larger && smaller.medianHours > 0 && larger.medianHours != null) {
       const ratio = larger.medianHours / smaller.medianHours;
@@ -818,7 +818,7 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review 
     }
     if (prs.stale) {
       const o = prs.oldestOpen;
-      add("warn", PRS, `${plural(prs.stale, "sampled open PR")} older than two weeks`,
+      add("warn", PRS, `${plural(prs.stale, "loaded open PR")} older than two weeks`,
         `Oldest is ${o.repo} #${o.number}, opened ${plural(Math.floor(o.days), "day")} ago.`);
     }
   }
@@ -854,7 +854,7 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review 
     const decided = merged + closed;
     if (decided >= 4 && closed / decided >= 0.3) {
       add("warn", FEED, `${closed} of ${plural(decided, "pull request")} you opened and that are now finished were closed without merging`,
-        `Pull requests opened in the loaded events, with current state from the sampled details. ${follow.outcomes.open} are still open.`);
+        `Pull requests opened in the loaded events, with current state from the loaded details. ${follow.outcomes.open} are still open.`);
     }
   }
 
@@ -868,14 +868,14 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review 
         "These count as reviewed in the Pull requests view, but no person reviewed them.");
     }
     if (review.selfMerged / review.merged >= 0.8 && review.noHuman / review.merged >= 0.5) {
-      add("info", PRS, `You merged ${review.selfMerged} of your ${plural(review.merged, "sampled merge")} yourself`,
+      add("info", PRS, `You merged ${review.selfMerged} of your ${plural(review.merged, "loaded merge")} yourself`,
         `${review.noHuman} of those merges had no human review from anyone else.`);
     }
   }
   if (review && review.reviewers.length && review.withHumanReview >= 4 && review.topReviewerShare >= 0.6) {
     const [name, count] = review.reviewers[0];
     add("info", PRS, `One person handles most reviews of your work`,
-      `${name} reviewed ${count} of your sampled pull requests, ${share(review.topReviewerShare)} of all reviewer visits. Review depends on their availability.`);
+      `${name} reviewed ${count} of your loaded pull requests, ${share(review.topReviewerShare)} of all reviewer visits. Review depends on their availability.`);
   }
 
   const rank = { warn: 0, good: 1, info: 1 };
@@ -982,6 +982,77 @@ function filterEvents(events, filter, repo, query, hideMinor, prInfo) {
     (!q || `${repoName(e)} ${describeEvent(e, prInfo)} ${branchOf(e)}`.toLowerCase().includes(q)));
 }
 
+// ---------- Pull request details, token metadata, and rate limits ----------
+// One shape for a pull request from either the authored search or the event-referenced lookup.
+// Returns null when GitHub left out the fields the summaries depend on.
+function normalizePullRequest(pr, repo, number, source) {
+  if (!pr || typeof pr.title !== "string" || !Number.isInteger(pr.reviews?.totalCount)) return null;
+  return {
+    ...pr, repo, number, source,
+    headRef: pr.headRefName, author: pr.author?.login, mergedBy: pr.mergedBy?.login,
+    reviews: pr.reviews.totalCount,
+    reviewList: (Array.isArray(pr.reviews.nodes) ? pr.reviews.nodes : []).map((r) => ({
+      login: r?.author?.login || "", at: r?.submittedAt,
+      bot: r?.author?.__typename === "Bot" || isBotLogin(r?.author?.login),
+    })),
+  };
+}
+
+// The X-Accepted-GitHub-Permissions value lists the permissions an endpoint needs, comma separated.
+// When several sets work, the sets are separated by semicolons.
+// Header names that differ from the label on GitHub's token settings page.
+const PERMISSION_LABELS = { user_events: "Events (account permission)" };
+function parseAcceptedPermissions(header) {
+  return String(header || "").split(";").map((set) => set.split(",").map((part) => part.trim()).filter(Boolean).map((part) => {
+    const [name, access] = part.split("=").map((x) => x.trim());
+    const label = PERMISSION_LABELS[name] || name.replace(/_/g, " ");
+    return `${label.charAt(0).toUpperCase()}${label.slice(1)}${access ? `: ${access}` : ""}`;
+  })).filter((set) => set.length);
+}
+
+// GitHub can send the expiry of a personal access token, for example "2026-12-01 00:00:00 UTC".
+function parseTokenExpiry(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)\s*(UTC|Z|[+-]\d{2}:?\d{2})?$/.exec(text);
+  let time;
+  if (m) {
+    const zone = !m[3] || m[3] === "UTC" || m[3] === "Z" ? "Z" : m[3].replace(/^([+-]\d{2})(\d{2})$/, "$1:$2");
+    time = Date.parse(`${m[1]}T${m[2].length === 5 ? `${m[2]}:00` : m[2]}${zone}`);
+  } else {
+    time = Date.parse(text);
+  }
+  return Number.isFinite(time) ? new Date(time) : null;
+}
+
+const TOKEN_EXPIRY_WARN_DAYS = 14;
+function tokenExpiryStatus(expires, now) {
+  if (!(expires instanceof Date)) return null;
+  const nowTime = now == null ? Date.now() : new Date(now).getTime();
+  const days = (expires.getTime() - nowTime) / DAY_MS;
+  return { at: expires, days, expired: days <= 0, soon: days > 0 && days <= TOKEN_EXPIRY_WARN_DAYS };
+}
+
+// Classic scopes that allow writes. Activity Desk only reads, so these grant more than it uses.
+const WRITE_SCOPES = new Set(["repo", "public_repo", "write:org", "admin:org", "workflow", "delete_repo", "write:packages", "admin:repo_hook", "admin:public_key", "admin:gpg_key", "gist", "user", "write:discussion", "project", "codespace"]);
+function classicScopes(header) {
+  if (header == null) return null;
+  const scopes = String(header).split(",").map((s) => s.trim()).filter(Boolean);
+  return { scopes, write: scopes.filter((s) => WRITE_SCOPES.has(s)) };
+}
+
+const RATE_LABELS = { core: "REST", graphql: "GraphQL" };
+const RATE_LOW_SHARE = 0.1;
+function summarizeRateLimit(data) {
+  const resources = data?.resources || {};
+  return Object.keys(RATE_LABELS).filter((name) => resources[name]).map((name) => {
+    const r = resources[name];
+    const share = r.limit > 0 ? r.remaining / r.limit : null;
+    return { name, label: RATE_LABELS[name], limit: r.limit, remaining: r.remaining, used: r.used,
+      resetAt: new Date(r.reset * 1000), share, low: share != null && share < RATE_LOW_SHARE };
+  });
+}
+
 const api = {
   eventLabel,
   repoName,
@@ -1011,6 +1082,12 @@ const api = {
   durationLabel,
   filterEvents,
   isMinor,
+  normalizePullRequest,
+  parseAcceptedPermissions,
+  parseTokenExpiry,
+  tokenExpiryStatus,
+  classicScopes,
+  summarizeRateLimit,
 };
 
 if (typeof module !== "undefined" && module.exports) module.exports = api;
