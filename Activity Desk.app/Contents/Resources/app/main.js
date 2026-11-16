@@ -377,7 +377,7 @@ const YEAR_QUERY = `query {
 
 const REPO_NAME = /^[A-Za-z0-9_.-]{1,100}$/;
 const PR_FIELDS = `title state merged isDraft createdAt mergedAt additions deletions headRefName
-  author { login } mergedBy { login }
+  author { __typename login } mergedBy { login }
   reviews(first: 10) { totalCount nodes { submittedAt author { __typename login } } }`;
 
 // Recent comments on issues and pull requests that involve the user, open or closed.
@@ -406,6 +406,16 @@ const AUTHORED_QUERY = `query ($q: String!, $after: String) {
     issueCount
     pageInfo { hasNextPage endCursor }
     nodes { __typename ... on PullRequest { number repository { nameWithOwner } ${PR_FIELDS} } }
+  }
+}`;
+// Pull requests by other people that the user reviewed, over the same window as the authored search.
+// The aliased reviews field returns the user's own first review, which the first 10 reviews can miss.
+const REVIEWED_QUERY = `query ($q: String!, $after: String, $login: String!) {
+  search(query: $q, type: ISSUE, first: 100, after: $after) {
+    issueCount
+    pageInfo { hasNextPage endCursor }
+    nodes { __typename ... on PullRequest { number repository { nameWithOwner } ${PR_FIELDS}
+      myReviews: reviews(first: 1, author: $login) { nodes { submittedAt } } } }
   }
 }`;
 const CURSOR = /^[A-Za-z0-9+/=_:-]{1,256}$/;
@@ -441,6 +451,13 @@ function githubRequest(operation, args) {
       if (after !== undefined && (typeof after !== "string" || !CURSOR.test(after))) break;
       const since = new Date(Date.now() - AUTHORED_DAYS * 864e5).toISOString().slice(0, 10);
       return { route: "/graphql", body: { query: AUTHORED_QUERY, variables: { q: `author:${login} is:pr created:>=${since} sort:created-desc`, after: after ?? null } } };
+    }
+    case "reviewedPullRequests": {
+      const { login, after } = args || {};
+      if (typeof login !== "string" || !LOGIN.test(login)) break;
+      if (after !== undefined && (typeof after !== "string" || !CURSOR.test(after))) break;
+      const since = new Date(Date.now() - AUTHORED_DAYS * 864e5).toISOString().slice(0, 10);
+      return { route: "/graphql", body: { query: REVIEWED_QUERY, variables: { q: `reviewed-by:${login} -author:${login} is:pr created:>=${since} sort:created-desc`, after: after ?? null, login } } };
     }
     case "rateLimit": return { route: "/rate_limit" };
     case "contributionHistory": {
