@@ -6,7 +6,7 @@
 4. In Activity Desk, select **Which token should I use?**, then **Create a fine-grained token**. We recommend one read-only fine-grained personal access token:
    - **Resource owner:** your account. A fine-grained token covers one account or organization, so organization repositories need a token for that organization.
    - **Repository access:** all repositories, or the ones you want covered.
-   - **Permissions, all read-only:** the account permission **Events** for private activity, **Pull requests** for private PR details and review comments, and **Issues** for conversations on private issues. GitHub adds **Metadata** automatically. Activity Desk needs no write permission.
+   - **Permissions, all read-only:** the account permission **Events** for private activity, **Pull requests** for private PR details and review comments, and **Issues** for conversations on private issues. Add **Administration** to see repository traffic in **Footprint**. Read access to Administration cannot change anything. GitHub adds **Metadata** automatically. Activity Desk needs no write permission.
 5. Paste the token into Activity Desk and select **Sign in**. Open **Data & access** to see what GitHub returned for that token. **Token check** shows the expiry when GitHub reports one and names the permission GitHub asks for when a request is denied.
 
 GitHub's unread notifications endpoint requires a classic token with the `notifications` scope. Grant only the permissions you need. [GitHub personal access token documentation](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
