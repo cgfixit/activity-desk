@@ -8,6 +8,8 @@ const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "
 const LAST_SEEN_KEY = "desk.lastSeen";
 const EVENT_PAGES = 3; // GitHub serves at most 300 events
 const PR_LOOKUP_LIMIT = 40;
+const AUTHORED_PAGES = 3; // 100 pull requests per page
+const AUTHORED_DAYS = 90; // matches the authored search window in main.js
 const GLYPHS = { PushEvent: "↑", PullRequestEvent: "⇄", IssuesEvent: "◉", IssueCommentEvent: "✎", CreateEvent: "+", DeleteEvent: "−", PullRequestReviewEvent: "✓", ReleaseEvent: "◆", WatchEvent: "★", ForkEvent: "⑂" };
 const CHIPS = [["all", "All"], ["push", "Pushes"], ["pr", "Pull requests"], ["issue", "Issues"], ["comment", "Comments"], ["branch", "Branches"], ["agent", "Agents"]];
 const CONVERSATION_CHIPS = [["all", "All"], ["others", "From others"], ["mine", "Yours"], ["reviews", "Reviews"], ["bots", "Bots"]];
@@ -20,7 +22,9 @@ const initialState = {
   viewer: null,
   events: [],
   prInfo: {},
-  prLookup: { total: 0, asked: 0, found: 0 },
+  prLookup: { authored: null, referenced: { total: 0, covered: 0, asked: 0, found: 0 } },
+  rateLimit: null,
+  tokenMeta: null,
   contributions: null,
   notifications: null,
   errors: {},
@@ -104,15 +108,30 @@ async function api(account, operation, args) {
   const result = await window.desk.github(operation, args);
   if (account !== state) throw new Error("Session changed.");
   if (result.remaining != null) account.remaining = result.remaining;
+  const accepted = recordToken(account, operation, result);
   if (!result.ok) {
-    const detail = result.error || ({
+    const need = accepted.length && (result.status === 403 || result.status === 404)
+      ? ` GitHub accepts ${accepted.map((set) => set.join(" with ")).join(", or ")} for this request.` : "";
+    const detail = (result.error || ({
       401: "GitHub rejected the saved token.",
       403: "GitHub denied the request. Check token permissions and rate limits.",
       429: "GitHub rate limit reached.",
-    })[result.status] || `GitHub returned HTTP ${result.status}.`;
+    })[result.status] || `GitHub returned HTTP ${result.status}.`) + need;
     throw Object.assign(new Error(detail), { status: result.status });
   }
   return { data: JSON.parse(result.body || "null"), more: /rel="next"/.test(result.link || "") };
+}
+
+// Token metadata from response headers: expiry, classic scopes, and the permissions a denied request needs.
+function recordToken(account, operation, result) {
+  const t = result.token;
+  if (!t) return [];
+  const meta = account.tokenMeta || (account.tokenMeta = { expires: null, scopes: null, denied: {} });
+  if (t.expires) meta.expires = t.expires;
+  if (t.scopes != null) meta.scopes = t.scopes;
+  const accepted = I.parseAcceptedPermissions(t.accepted);
+  if (!result.ok && accepted.length) meta.denied[operation] = accepted;
+  return accepted;
 }
 
 async function loadEvents(account, login) {
@@ -141,25 +160,54 @@ async function lookupPullRequests(account, refs) {
   const failed = new Set(errors.map((error) => error.path?.[0]));
   usable.forEach((r, i) => {
     const alias = `p${i}`;
-    const pr = result?.data?.[alias]?.pullRequest;
-    if (failed.has(undefined) || failed.has(alias) || !pr || !Number.isInteger(pr.reviews?.totalCount)) return;
-    info[I.prKey(r.repo, r.number)] = {
-      ...pr, repo: r.repo, number: r.number,
-      headRef: pr.headRefName, author: pr.author?.login, mergedBy: pr.mergedBy?.login,
-      reviews: pr.reviews.totalCount,
-      reviewList: (Array.isArray(pr.reviews.nodes) ? pr.reviews.nodes : []).map((r) => ({
-        login: r?.author?.login || "", at: r?.submittedAt,
-        bot: r?.author?.__typename === "Bot" || I.isBotLogin(r?.author?.login),
-      })),
-    };
+    const pr = failed.has(undefined) || failed.has(alias) ? null
+      : I.normalizePullRequest(result?.data?.[alias]?.pullRequest, r.repo, r.number, "events");
+    if (pr) info[I.prKey(r.repo, r.number)] = pr;
   });
   return {
     info, total: refs.length, asked: usable.length, found: Object.keys(info).length,
   };
 }
 
+// Pull requests you opened in the last AUTHORED_DAYS days, from search rather than the Events feed.
+// Up to AUTHORED_PAGES pages of 100, newest first. A failure after the first page keeps what loaded.
+async function loadAuthoredPullRequests(account, login) {
+  const info = {};
+  let total = null;
+  let after;
+  let more = false;
+  let partial = false;
+  let issue = "";
+  for (let page = 1; page <= AUTHORED_PAGES; page += 1) {
+    let search;
+    try {
+      const { data } = await api(account, "authoredPullRequests", after ? { login, after } : { login });
+      search = data?.data?.search;
+      if (!search || !Array.isArray(search.nodes)) throw new Error("GitHub did not return a usable pull request search.");
+      if (data.errors?.length) partial = true;
+    } catch (error) {
+      if (page === 1) throw error;
+      issue = `Authored pull requests page ${page} did not load. ${error.message}`;
+      break;
+    }
+    if (Number.isInteger(search.issueCount)) total = search.issueCount;
+    for (const node of search.nodes) {
+      const repo = node?.repository?.nameWithOwner;
+      if (!node || node.__typename !== "PullRequest") { partial = true; continue; }
+      const pr = typeof repo === "string" && Number.isInteger(node.number) ? I.normalizePullRequest(node, repo, node.number, "search") : null;
+      if (pr) info[I.prKey(repo, node.number)] = pr; else partial = true;
+    }
+    more = Boolean(search.pageInfo?.hasNextPage && search.pageInfo.endCursor);
+    if (!more) break;
+    after = search.pageInfo.endCursor;
+  }
+  const loaded = Object.keys(info).length;
+  return { info, loaded, total: total ?? loaded, capped: more || Boolean(issue), partial, issue, days: AUTHORED_DAYS };
+}
+
 async function refresh() {
   const account = state;
+  account.tokenMeta = null;
   setBusy("Loading your profile…");
   try {
     const { data: user } = await api(account, "profile");
@@ -173,12 +221,23 @@ async function refresh() {
     setBusy("Loading contribution year and notifications…");
     const refs = I.prRefsFromEvents(events);
     const fineGrained = account.tokenKind === "fine-grained";
-    const [notes, year, prs, talk] = await Promise.allSettled([
+    // The event-referenced lookup skips pull requests the authored search already returned.
+    let pendingRefs = refs;
+    const authoredTask = loadAuthoredPullRequests(account, user.login);
+    const lookupTask = authoredTask.catch(() => null).then((found) => {
+      pendingRefs = refs.filter((r) => !found?.info[I.prKey(r.repo, r.number)]);
+      return lookupPullRequests(account, pendingRefs);
+    });
+    const [notes, year, prs, talk, authored] = await Promise.allSettled([
       fineGrained ? null : api(account, "notifications"),
       api(account, "year"),
-      lookupPullRequests(account, refs),
+      lookupTask,
       api(account, "conversations", { login: user.login }),
+      authoredTask,
     ]);
+    if (account !== state) return;
+    // Read last so the budget reflects this refresh. GitHub does not count this call against the limit.
+    const rate = await api(account, "rateLimit").catch(() => null);
     if (account !== state) return;
 
     const errors = {};
@@ -197,9 +256,24 @@ async function refresh() {
       ? I.summarizeContributions(collection, localDayKey(new Date())) : null;
     if (!contributions) errors.year = year.reason?.message || "GitHub did not return a usable contribution calendar.";
     else if (yearErrors.length) errors.account = "Some account details are unavailable.";
-    const prLookup = prs.value || { info: {}, total: refs.length, asked: Math.min(refs.length, PR_LOOKUP_LIMIT), found: 0 };
-    if (prLookup.found < prLookup.asked) errors.prs = prs.reason?.message || "Some requested pull requests were unavailable.";
-    if (prLookup.asked < prLookup.total) errors.prs = `${errors.prs ? `${errors.prs} ` : ""}Details are capped at the first ${PR_LOOKUP_LIMIT} references.`;
+    const lookup = prs.value || { info: {}, total: pendingRefs.length, asked: Math.min(pendingRefs.length, PR_LOOKUP_LIMIT), found: 0 };
+    if (lookup.found < lookup.asked) errors.prs = prs.reason?.message || "Some requested pull requests were unavailable.";
+    if (lookup.asked < lookup.total) errors.prs = `${errors.prs ? `${errors.prs} ` : ""}Details for pull requests referenced in events are capped at the first ${PR_LOOKUP_LIMIT}.`;
+    const mine = authored.value || null;
+    if (!mine) errors.authored = `Pull requests you opened did not load. ${authored.reason?.message || ""}`.trim();
+    else {
+      const parts = [];
+      if (mine.issue) parts.push(mine.issue);
+      if (mine.capped) parts.push(`Loaded the newest ${fmt(mine.loaded)} of ${fmt(mine.total)} pull requests you opened in the last ${AUTHORED_DAYS} days.`);
+      if (mine.partial) parts.push("Some pull requests you opened could not be read with this token.");
+      if (parts.length) errors.authored = parts.join(" ");
+    }
+    const prLookup = {
+      authored: mine && { loaded: mine.loaded, total: mine.total, capped: mine.capped, partial: mine.partial, days: mine.days },
+      referenced: { total: refs.length, covered: refs.length - pendingRefs.length, asked: lookup.asked, found: lookup.found },
+    };
+    const prInfo = { ...lookup.info, ...(mine ? mine.info : {}) };
+    const rateLimit = rate ? { resources: I.summarizeRateLimit(rate.data), at: new Date() } : null;
 
     const talkData = talk.value?.data;
     let conversations = Array.isArray(talkData?.data?.search?.nodes)
@@ -211,7 +285,7 @@ async function refresh() {
     } else if (!conversations) errors.conversations = `Conversations did not load. ${talkProblem}`;
     else if (talkData.errors?.length) errors.conversations = "Some conversations could not be read with this token.";
 
-    Object.assign(account, { user, viewer, contributions, events, notifications, prLookup, prInfo: prLookup.info, conversations, errors, refreshedAt: new Date() });
+    Object.assign(account, { user, viewer, contributions, events, notifications, prLookup, prInfo, rateLimit, conversations, errors, refreshedAt: new Date() });
     if (!events.some((e) => I.repoName(e) === account.repo)) account.repo = "";
     account.lastSeen = localStorage.getItem(seenKey());
     if (!account.lastSeen && newestActivity(account)) {
@@ -284,12 +358,13 @@ function renderOverview(c) {
     `<div class="kpi"><div class="label">${esc(label)}</div><div class="value">${value}</div><div class="sub">${sub}</div></div>`).join("");
 
   const items = [];
-  if (pr.unreviewed.length) items.push(["warn", `${pr.unreviewed.length} of ${pr.merged} sampled merges have zero recorded reviews`, pr.unreviewed.slice(0, 3).map((p) => `${shortRepo(p.repo)} #${p.number}`).join(", ")]);
-  if (pr.openMine.length) items.push(["warn", `${pr.openMine.length} of your sampled PRs are still open`, pr.openMine.slice(0, 4).map((p) => `${shortRepo(p.repo)} #${p.number}${p.isDraft ? " (draft)" : ""}`).join(", ")]);
+  for (const w of tokenWarnings()) items.push(["warn", w.title, w.detail]);
+  if (pr.unreviewed.length) items.push(["warn", `${pr.unreviewed.length} of ${pr.merged} loaded merges have zero recorded reviews`, pr.unreviewed.slice(0, 3).map((p) => `${shortRepo(p.repo)} #${p.number}`).join(", ")]);
+  if (pr.openMine.length) items.push(["warn", `${pr.openMine.length} of your loaded PRs are still open`, pr.openMine.slice(0, 4).map((p) => `${shortRepo(p.repo)} #${p.number}${p.isDraft ? " (draft)" : ""}`).join(", ")]);
   if (notes && notes.missed.length) items.push(["warn", `${notes.missed.length} unread notification${notes.missed.length === 1 ? "" : "s"} flagged`, "Includes review requests, mentions, and failed checks."]);
   const coverage = Object.values(state.errors);
   if (coverage.length) items.push(["warn", "Some data is missing or limited", coverage.join(" ")]);
-  else if (!items.length) items.push(["good", "Nothing flagged in the loaded data", "Open PRs, review counts and notifications are limited to the loaded samples."]);
+  else if (!items.length) items.push(["good", "Nothing flagged in the loaded data", `Open PRs and review counts cover pull requests you opened in the last ${AUTHORED_DAYS} days plus those referenced in recent events.`]);
   $("attention").innerHTML = items.map(([cls, t, d]) =>
     `<li class="${cls}"><span class="dot"></span><div><div class="t">${esc(t)}</div><div class="d">${esc(d)}</div></div></li>`).join("");
 
@@ -603,11 +678,8 @@ function eventInsights(ev) {
 }
 
 function pullRequestInsights(pr) {
-  const { asked, found, total } = state.prLookup;
-  const caption = total
-    ? `${fmt(found)} of ${fmt(asked)} requested details loaded · ${fmt(total)} ${total === 1 ? "pull request" : "distinct pull requests"} referenced in the feed`
-    : "No pull requests referenced in the loaded events.";
-  const notice = [state.errors.events, state.errors.prs].filter(Boolean).join(" ");
+  const caption = pullRequestCaption();
+  const notice = [state.errors.authored, state.errors.events, state.errors.prs].filter(Boolean).join(" ");
   return insightSection("insight-prs", "Pull requests", caption, `
     ${notice ? `<p class="insight-notice">${esc(notice)}</p>` : ""}
     ${pr.total ? `<div class="grid insights">
@@ -620,7 +692,7 @@ function pullRequestInsights(pr) {
         <h4>Current status and size</h4>
         ${stats([["Open", fmt(pr.open.length)], ["Open drafts", fmt(pr.drafts)], ["Median lines changed", fmt(pr.medianSize)]])}
         ${bars(pr.largest.map((p) => [`${shortRepo(p.repo)} #${p.number}`, p.additions + p.deletions]))}
-        <p class="note">Largest sampled changes by additions plus deletions. ${fmt(pr.agentBranches)} sampled PRs had a known agent branch prefix.</p>
+        <p class="note">Largest loaded changes by additions plus deletions. ${fmt(pr.agentBranches)} loaded PRs had a known agent branch prefix.</p>
       </article>
     </div>` : ""}`);
 }
@@ -631,10 +703,10 @@ function patternInsights({ ev, pr, rhythm, sessions, prPatterns, trajectory, fol
   const sources = [
     rhythm ? "the contribution year" : "",
     ev.total ? `${fmt(ev.total)} loaded events` : "",
-    pr.total ? `${fmt(pr.total)} sampled pull requests` : "",
+    pr.total ? `${fmt(pr.total)} loaded pull requests` : "",
   ].filter(Boolean);
   const caption = sources.length ? `Derived from ${new Intl.ListFormat(undefined, { type: "conjunction" }).format(sources)}` : "No data loaded";
-  const notice = [state.errors.year, state.errors.events, state.errors.prs].filter(Boolean).join(" ");
+  const notice = [state.errors.year, state.errors.events, state.errors.authored, state.errors.prs].filter(Boolean).join(" ");
 
   const findings = observations.length
     ? `<ul class="attention">${observations.map((o) =>
@@ -677,7 +749,7 @@ function patternInsights({ ev, pr, rhythm, sessions, prPatterns, trajectory, fol
     .filter(([, g]) => g && g.count);
   const prCard = prPatterns.merged ? `
       ${stats([["Merged lines with no review", prPatterns.mergedLines ? pct(prPatterns.unreviewedLines / prPatterns.mergedLines) : "—"], ["Open over two weeks", prPatterns.open ? `${fmt(prPatterns.stale)} / ${fmt(prPatterns.open)}` : "—"], ["Oldest open", prPatterns.oldestOpen ? `${fmt(Math.floor(prPatterns.oldestOpen.days))} d` : "—"]])}
-      <table class="compare"><caption class="note">Sampled merges by group</caption>
+      <table class="compare"><caption class="note">Loaded merges by group</caption>
         <thead><tr><th scope="col">Group</th><th scope="col">Merged</th><th scope="col">Median to merge</th><th scope="col">Zero reviews</th><th scope="col">Median lines</th></tr></thead>
         <tbody>${groups.map(([name, g]) => `<tr><th scope="row">${esc(name)}</th><td>${fmt(g.count)}</td><td>${esc(hoursLabel(g.medianHours))}</td><td>${fmt(g.unreviewed)} / ${fmt(g.count)}</td><td>${fmt(Math.round(g.medianSize))}</td></tr>`).join("")}</tbody></table>
       <p class="note">Agent branches are matched by prefix such as <code>claude/</code> or <code>codex/</code>. Size halves appear with six or more merges. Small groups can swing on a single pull request.</p>`
@@ -693,10 +765,10 @@ function patternInsights({ ev, pr, rhythm, sessions, prPatterns, trajectory, fol
       <article class="card"><h4>Output rhythm</h4>${sourceTag("Contribution year")}${rhythmCard}</article>
       <article class="card"><h4>Work sessions</h4>${sourceTag("Recent events")}${sessionCard}</article>
       <article class="card"><h4>Work mix</h4>${sourceTag("Recent events")}${mixCard}</article>
-      <article class="card"><h4>Merge patterns</h4>${sourceTag("Sampled pull requests")}${prCard}</article>
+      <article class="card"><h4>Merge patterns</h4>${sourceTag("Pull requests")}${prCard}</article>
       <article class="card"><h4>Trajectory</h4>${sourceTag("Contribution year")}${trajectoryCard(trajectory)}</article>
       <article class="card"><h4>Follow-through</h4>${sourceTag("Recent events")}${followCard(follow)}</article>
-      <article class="card insight-wide"><h4>Review turnaround</h4>${sourceTag("Sampled pull requests")}${reviewCard(review, pr)}</article>
+      <article class="card insight-wide"><h4>Review turnaround</h4>${sourceTag("Pull requests you opened")}${reviewCard(review, pr)}</article>
     </div>`);
 }
 
@@ -728,17 +800,38 @@ function followCard(f) {
     ${stats([["Branches with no PR", f.settled ? `${fmt(f.withoutPr.length)} / ${fmt(f.settled)}` : "—"], ["Opened PRs merged", f.opened ? `${fmt(o.merged)} / ${fmt(f.opened)}` : "—"], ["Closed unmerged", fmt(o.closed)]])}
     ${f.opened ? bars([["Merged", o.merged], ["Still open", o.open], ["Closed unmerged", o.closed], ["Details unavailable", o.unknown]].filter(([, n]) => n)) : ""}
     ${list ? `<ul class="plain">${list}</ul>` : ""}
-    <p class="note">Branches count once they are two days old and match a pull request by head branch from the feed or the sampled details. Pull request outcomes use current state, so they cover only the ${fmt(f.opened)} pull requests opened in the loaded events.</p>`;
+    <p class="note">Branches count once they are two days old and match a pull request by head branch from the feed or the loaded details. Pull request outcomes use current state, so they cover only the ${fmt(f.opened)} pull requests opened in the loaded events.</p>`;
 }
 
 function reviewCard(r, pr) {
   if (!pr.total) return '<p class="note">No pull request details are loaded.</p>';
-  if (!r.authored) return '<p class="note">None of the sampled pull requests were authored by you, so there is no review wait to measure.</p>';
+  if (!r.authored) return `<p class="note">${state.prLookup.authored ? `You opened no pull requests in the last ${AUTHORED_DAYS} days that this token can read, so there is no review wait to measure.` : "The search for pull requests you opened did not load, and none of the other loaded pull requests were authored by you."}</p>`;
   const people = r.reviewers.slice(0, 5);
   return `
     ${stats([["Median to first human review", r.withHumanReview ? hoursLabel(r.medianFirstReviewHours) : "—"], ["Merges reviewed only by bots", r.merged ? `${fmt(r.botOnly)} / ${fmt(r.merged)}` : "—"], ["Merged by you", r.merged ? `${fmt(r.selfMerged)} / ${fmt(r.merged)}` : "—"]])}
-    ${people.length ? bars(people, { violet: true }) + '<p class="note">Pull requests each person reviewed.</p>' : '<p class="note">No one besides you or a bot reviewed the sampled pull requests you authored.</p>'}
-    <p class="note">Measured on ${fmt(r.authored)} sampled ${r.authored === 1 ? "pull request" : "pull requests"} you authored, following the CHAOSS time-to-first-response definition: the first review by a human who is not the author, from creation. Draft time counts toward the wait. ${fmt(r.withHumanReview)} had a human review; ${fmt(r.reviewedBeforeMerge)} of ${fmt(r.merged)} merges got one before merging.${r.truncated ? ` ${fmt(r.truncated)} had more than 10 reviews, and only the first 10 are read.` : ""}</p>`;
+    ${people.length ? bars(people, { violet: true }) + '<p class="note">Pull requests each person reviewed.</p>' : '<p class="note">No one besides you or a bot reviewed the pull requests you authored.</p>'}
+    <p class="note">Measured on ${fmt(r.authored)} ${r.authored === 1 ? "pull request" : "pull requests"} you authored${authoredCoverage()}, following the CHAOSS time-to-first-response definition: the first review by a human who is not the author, from creation. Draft time counts toward the wait. ${fmt(r.withHumanReview)} had a human review; ${fmt(r.reviewedBeforeMerge)} of ${fmt(r.merged)} merges got one before merging.${r.truncated ? ` ${fmt(r.truncated)} had more than 10 reviews, and only the first 10 are read.` : ""}</p>`;
+}
+
+// Where the loaded pull requests came from, for captions.
+function pullRequestCaption() {
+  const { authored, referenced } = state.prLookup;
+  const parts = [];
+  if (authored) parts.push(`${fmt(authored.loaded)}${authored.capped ? ` of ${fmt(authored.total)}` : ""} you opened in the last ${authored.days} days`);
+  if (referenced.total) {
+    const others = referenced.asked ? `, ${fmt(referenced.found)} of ${fmt(referenced.asked)} others loaded` : "";
+    parts.push(`${fmt(referenced.total)} referenced in the feed${referenced.covered ? `, ${fmt(referenced.covered)} already among yours` : ""}${others}`);
+  }
+  return parts.length ? parts.join(" · ") : "No pull requests loaded.";
+}
+
+function authoredCoverage() {
+  const a = state.prLookup.authored;
+  if (!a) return " among pull requests referenced in recent events";
+  const older = Object.values(state.prInfo).filter((p) => p.source === "events" && p.author && state.user &&
+    p.author.toLowerCase() === state.user.login.toLowerCase()).length;
+  const window = a.capped ? `the newest ${fmt(a.loaded)} of ${fmt(a.total)} opened in the last ${a.days} days` : `every one opened in the last ${a.days} days that this token can read`;
+  return ` (${window}${older ? `, plus ${fmt(older)} older ${older === 1 ? "one" : "ones"} referenced in recent events` : ""})`;
 }
 
 function renderInsights(c) {
@@ -772,10 +865,13 @@ function renderMeta(c) {
   caps.push(state.notifications ? [state.errors.notifications ? "part" : "ok", "Notifications", `${fmt(state.notifications.length)} unread loaded. ${esc(state.errors.notifications || "")}`]
     : ["no", "Notifications", esc(state.errors.notifications || "Not available.")]);
   caps.push(year ? ["ok", "Contribution year", `${fmt(year.total)} contributions.`] : ["no", "Contribution year", esc(state.errors.year || "")]);
-  const { total, asked, found } = state.prLookup;
-  caps.push(asked
-    ? [state.errors.prs ? "part" : "ok", "Pull request details", `${fmt(found)} loaded of ${fmt(asked)} requested (${fmt(total)} references). ${esc(state.errors.prs || "")}`]
-    : ["part", "Pull request details", "No pull requests in the loaded events."]);
+  const { authored, referenced } = state.prLookup;
+  caps.push(authored
+    ? [state.errors.authored ? "part" : "ok", "Pull requests you opened", esc(state.errors.authored || `${fmt(authored.loaded)} from the last ${fmt(authored.days)} days, found by search.`)]
+    : ["no", "Pull requests you opened", esc(state.errors.authored || "Not available.")]);
+  caps.push(referenced.asked
+    ? [state.errors.prs ? "part" : "ok", "Other pull requests in events", `${fmt(referenced.found)} loaded of ${fmt(referenced.asked)} requested. ${fmt(referenced.total)} referenced in events, ${fmt(referenced.covered)} already among yours. ${esc(state.errors.prs || "")}`]
+    : ["ok", "Other pull requests in events", referenced.total ? `All ${fmt(referenced.total)} referenced in events were already among yours.` : "No pull requests in the loaded events."]);
   const conv = state.conversations;
   caps.push(conv
     ? [state.errors.conversations ? "part" : "ok", "Conversations", `${fmt(conv.items.length)} comments and reviews on ${fmt(conv.threads)} threads. ${esc(state.errors.conversations || "")}`]
@@ -805,17 +901,88 @@ function renderMeta(c) {
     </article>`);
   }
 
+  cards.push(tokenCard());
+  cards.push(rateCard());
+
   cards.push(`<article class="card"><h3>This session</h3>
     <dl class="kv">
       <dt>Last refreshed</dt><dd>${state.refreshedAt ? esc(state.refreshedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })) : "—"}</dd>
       <dt>New since marked seen</dt><dd>${fmt(ev.fresh)} events, ${fmt(freshConversations())} comments from others</dd>
       <dt>Marked seen at</dt><dd>${state.lastSeen ? esc(new Date(state.lastSeen).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })) : "—"}</dd>
-      <dt>Rate limit remaining</dt><dd>${esc(state.remaining ?? "—")}</dd>
+      <dt>Last response's remaining limit</dt><dd>${esc(state.remaining ?? "—")}</dd>
     </dl>
-    <p class="note">The limit is from the last GitHub response. REST and GraphQL use separate limits.</p>
+    <p class="note">From whichever GitHub response arrived last, REST or GraphQL. See <strong>Rate-limit budget</strong> for both.</p>
   </article>`);
 
   $("meta").innerHTML = cards.join("");
+}
+
+const OPERATION_LABELS = {
+  profile: "Profile", events: "Activity stream", notifications: "Notifications", year: "Contribution year",
+  pullRequests: "Pull request details", authoredPullRequests: "Pull requests you opened",
+  conversations: "Conversations", rateLimit: "Rate-limit budget",
+};
+
+// Problems with the token itself: expiry, write-capable classic scopes, and a low rate-limit budget.
+function tokenWarnings() {
+  const out = [];
+  const meta = state.tokenMeta;
+  const expiry = I.tokenExpiryStatus(I.parseTokenExpiry(meta?.expires), new Date());
+  const day = (d) => d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  if (expiry?.expired) out.push({ title: "The GitHub token has expired", detail: `GitHub reported ${day(expiry.at)}. Create a new token and sign in again.` });
+  else if (expiry?.soon) {
+    const days = Math.max(1, Math.ceil(expiry.days));
+    out.push({ title: `The GitHub token expires in ${days} ${days === 1 ? "day" : "days"}`, detail: `On ${day(expiry.at)}. Create a replacement and sign in with it before then.` });
+  }
+  const scopes = I.classicScopes(meta?.scopes);
+  if (state.tokenKind === "classic" && scopes?.write.length) {
+    out.push({ title: "This classic token can make changes", detail: `Its ${scopes.write.join(", ")} ${scopes.write.length === 1 ? "scope allows" : "scopes allow"} writes. Activity Desk only reads, so a read-only fine-grained token limits what a leaked copy could do.` });
+  }
+  for (const r of state.rateLimit?.resources || []) {
+    if (r.low) out.push({ title: `${r.label} rate limit is low`, detail: `${fmt(r.remaining)} of ${fmt(r.limit)} left until ${r.resetAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}.` });
+  }
+  return out;
+}
+
+function tokenCard() {
+  const meta = state.tokenMeta || {};
+  const kind = state.tokenKind;
+  const expiry = I.tokenExpiryStatus(I.parseTokenExpiry(meta.expires), new Date());
+  const scopes = I.classicScopes(meta.scopes);
+  const denied = Object.entries(meta.denied || {});
+  const rows = [
+    ["Type", esc(kind || "GitHub")],
+    ["Expires", expiry
+      ? `${esc(expiry.at.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }))}${expiry.expired ? " (expired)" : ` (in ${fmt(Math.max(1, Math.ceil(expiry.days)))} days)`}`
+      : "Not reported by GitHub"],
+  ];
+  if (kind === "classic" || scopes?.scopes.length) rows.push(["Classic scopes", scopes?.scopes.length ? esc(scopes.scopes.join(", ")) : "None reported"]);
+  const deniedList = denied.length
+    ? `<ul class="cap">${denied.map(([op, sets]) => `<li><span class="no">✕</span><div><div>${esc(OPERATION_LABELS[op] || op)}</div><div class="d">GitHub accepts ${esc(sets.map((set) => set.join(" with ")).join(", or "))}.</div></div></li>`).join("")}</ul>`
+    : "";
+  const advice = kind === "fine-grained"
+    ? "Recommended setup: resource owner set to your account, access to all repositories you want covered, and read-only permissions only: <strong>Pull requests</strong>, <strong>Issues</strong>, and the account permission <strong>Events</strong>. GitHub adds <strong>Metadata</strong> automatically."
+    : "Recommended: a fine-grained token with read-only permissions. A fine-grained token covers one resource owner and cannot read notifications, so keep a classic token only if you need the unread inbox.";
+  const warnings = tokenWarnings().filter((w) => !/rate limit/.test(w.title));
+  return `<article class="card"><h3>Token check</h3>
+    ${warnings.map((w) => `<div class="callout">${esc(w.title)}. ${esc(w.detail)}</div>`).join("")}
+    <dl class="kv">${rows.map(([t, d]) => `<dt>${esc(t)}</dt><dd>${d}</dd>`).join("")}</dl>
+    ${deniedList}
+    <p class="note">${advice}</p>
+    <p class="note">${denied.length ? "Denied requests list the permissions GitHub reported for them." : "No request was denied with a permission hint."} GraphQL sources report missing access as partial results in the list above instead. Activity Desk only sends allowlisted reads, whatever the token allows.</p>
+  </article>`;
+}
+
+function rateCard() {
+  const r = state.rateLimit;
+  if (!r || !r.resources.length) {
+    return `<article class="card"><h3>Rate-limit budget</h3><p class="note">GitHub did not return rate-limit details for this token.</p></article>`;
+  }
+  const time = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return `<article class="card"><h3>Rate-limit budget</h3>
+    <ul class="bars">${r.resources.map((x) => `<li class="bar"><span class="name">${esc(x.label)}</span><span class="track" aria-hidden="true"><span class="fill" style="width:${((x.share ?? 0) * 100).toFixed(1)}%"></span></span><span class="num">${esc(fmt(x.remaining))} / ${esc(fmt(x.limit))}</span></li>`).join("")}</ul>
+    <p class="note">${r.resources.map((x) => `${esc(x.label)}: ${esc(fmt(x.used))} used, resets at ${esc(time(x.resetAt))}.`).join(" ")} Read at ${esc(time(r.at))}, after this refresh. Checking the budget does not count against it. GraphQL charges points by query size, so one GraphQL request can use more than one point.</p>
+  </article>`;
 }
 
 function renderAll() {

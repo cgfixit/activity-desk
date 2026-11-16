@@ -217,6 +217,19 @@ const CONVERSATIONS_QUERY = `query ($q: String!) {
 }`;
 const CONVERSATION_DAYS = 30;
 
+// Pull requests the user authored in a recent window, found by search instead of the Events feed.
+const AUTHORED_DAYS = 90;
+const AUTHORED_QUERY = `query ($q: String!, $after: String) {
+  search(query: $q, type: ISSUE, first: 100, after: $after) {
+    issueCount
+    pageInfo { hasNextPage endCursor }
+    nodes { __typename ... on PullRequest { number repository { nameWithOwner } ${PR_FIELDS} } }
+  }
+}`;
+const CURSOR = /^[A-Za-z0-9+/=_:-]{1,256}$/;
+const LOGIN = /^[A-Za-z0-9-]{1,39}$/;
+const RATE_RESOURCES = ["core", "graphql"];
+
 function githubRequest(operation, args) {
   switch (operation) {
     case "conversations": {
@@ -225,6 +238,14 @@ function githubRequest(operation, args) {
       const since = new Date(Date.now() - CONVERSATION_DAYS * 864e5).toISOString().slice(0, 10);
       return { route: "/graphql", body: { query: CONVERSATIONS_QUERY, variables: { q: `involves:${login} updated:>=${since} sort:updated-desc` } } };
     }
+    case "authoredPullRequests": {
+      const { login, after } = args || {};
+      if (typeof login !== "string" || !LOGIN.test(login)) break;
+      if (after !== undefined && (typeof after !== "string" || !CURSOR.test(after))) break;
+      const since = new Date(Date.now() - AUTHORED_DAYS * 864e5).toISOString().slice(0, 10);
+      return { route: "/graphql", body: { query: AUTHORED_QUERY, variables: { q: `author:${login} is:pr created:>=${since} sort:created-desc`, after: after ?? null } } };
+    }
+    case "rateLimit": return { route: "/rate_limit" };
     case "profile": return { route: "/user" };
     case "notifications": return { route: "/notifications?all=false&per_page=50" };
     case "year": return { route: "/graphql", body: { query: YEAR_QUERY } };
@@ -283,14 +304,32 @@ handle("github", async (operation, args) => {
       redirect: "error",
       signal: AbortSignal.any([credential.signal, AbortSignal.timeout(30000)]),
     });
+    // Token metadata GitHub reports on responses: the permissions an endpoint accepts for
+    // fine-grained tokens, the granted scopes of a classic token, and the token's expiry when sent.
+    const tokenInfo = {
+      accepted: response.headers.get("x-accepted-github-permissions"),
+      scopes: response.headers.get("x-oauth-scopes"),
+      expires: response.headers.get("github-authentication-token-expiration"),
+    };
     if (!response.ok) {
       await response.body?.cancel();
-      return { ok: false, status: response.status, remaining: response.headers.get("x-ratelimit-remaining") };
+      return { ok: false, status: response.status, remaining: response.headers.get("x-ratelimit-remaining"), token: tokenInfo };
     }
     let body = await response.text();
     if (operation === "profile") {
       const { id, login, name } = JSON.parse(body);
       body = JSON.stringify({ id, login, name });
+    }
+    if (operation === "rateLimit") {
+      const resources = JSON.parse(body)?.resources || {};
+      const kept = {};
+      for (const name of RATE_RESOURCES) {
+        const r = resources[name];
+        if (r && [r.limit, r.remaining, r.used, r.reset].every(Number.isFinite)) {
+          kept[name] = { limit: r.limit, remaining: r.remaining, used: r.used, reset: r.reset };
+        }
+      }
+      body = JSON.stringify({ resources: kept });
     }
     return {
       ok: true,
@@ -298,6 +337,7 @@ handle("github", async (operation, args) => {
       body,
       link: response.headers.get("link"),
       remaining: response.headers.get("x-ratelimit-remaining"),
+      token: tokenInfo,
     };
   } catch {
     return { ok: false, status: 0, error: "GitHub request did not complete." };
