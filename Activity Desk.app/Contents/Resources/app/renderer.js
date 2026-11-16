@@ -453,7 +453,19 @@ function computed() {
   const footprint = state.footprint ? I.summarizeFootprint(state.footprint, state.savedHistory, state.refreshedAt) : null;
   const years = state.contributionHistory
     ? I.summarizeContributionHistory(state.contributionHistory.byYear, localDayKey(new Date()), state.viewer?.createdAt) : null;
-  return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, observations, footprint };
+  const token = state.tokenKind ? { kind: state.tokenKind, write: I.classicScopes(state.tokenMeta?.scopes)?.write ?? null } : null;
+  // Summaries of a source that failed are passed as null, so its suggestions say "source unavailable"
+  // instead of "nothing found". Events failed when none loaded and the feed reported an issue.
+  const eventsLoaded = state.events.length > 0 || !state.errors.events;
+  const prsLoaded = Boolean(a) || Object.keys(state.prInfo).length > 0;
+  const suggestions = I.deriveSuggestions({
+    login: state.user && state.user.login, now: state.refreshedAt,
+    ev: eventsLoaded ? ev : null, sessions: eventsLoaded ? sessions : null,
+    follow: eventsLoaded && prsLoaded ? follow : null,
+    prPatterns: prsLoaded ? prPatterns : null, review: a ? review : null, prInfo: a ? state.prInfo : null,
+    trajectory, notes, notesNote: state.errors.notifications || "", footprint, conversations: state.conversations, token,
+  });
+  return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, observations, footprint, suggestions };
 }
 
 function renderOverview(c) {
@@ -1085,6 +1097,64 @@ function renderInsights(c) {
   $("insights").innerHTML = `${state.errors.refresh ? `<p class="insight-notice">${esc(state.errors.refresh)}</p>` : ""}${panel}`;
 }
 
+// ---------- suggestions ----------
+const SUGGESTION_STATUS = {
+  shown: ["→", "part", "Suggested"],
+  clear: ["✓", "ok", "Nothing found"],
+  short: ["…", "muted", "Not enough data"],
+  unavailable: ["✕", "no", "Source unavailable"],
+};
+const readingHost = (url) => new URL(url).hostname.replace(/^www\./, "");
+
+// Text segments are [text, ...reading ids]; each cited id becomes a numbered button that opens the source.
+function citedText(segments, numbers) {
+  return segments.map(([text, ...ids]) => `${esc(text)}${ids.filter((id) => numbers.has(id)).map((id) => {
+    const r = I.READING[id];
+    return `<sup><button type="button" class="cite" data-reading="${esc(id)}" title="${esc(`${r.title} · ${readingHost(r.url)}`)}" aria-label="${esc(`Source ${numbers.get(id)}: ${r.title}`)}">[${numbers.get(id)}]</button></sup>`;
+  }).join("")}`).join(" ");
+}
+
+function suggestionCard(s) {
+  const numbers = new Map(s.reading.map((id, i) => [id, i + 1]));
+  const reading = s.reading.map((id) => {
+    const r = I.READING[id];
+    return `<li><button type="button" class="link" data-reading="${esc(id)}">${esc(r.title)}</button> <span class="muted">${esc(r.by)} · ${esc(readingHost(r.url))}</span></li>`;
+  }).join("");
+  return `<article class="card suggestion ${esc(s.tone)}">
+    <div class="suggestion-tags"><span class="src area">${esc(s.area)}</span>${sourceTag(s.source)}</div>
+    <h4>${esc(s.title)}</h4>
+    <dl class="suggestion-body">
+      <dt>Seen</dt><dd>${esc(s.seen)}</dd>
+      ${s.why.length ? `<dt>Why</dt><dd>${citedText(s.why, numbers)}</dd>` : ""}
+      <dt>Try</dt><dd>${citedText(s.act, numbers)}</dd>
+    </dl>
+    ${reading ? `<h5>Further reading</h5><ol class="reading">${reading}</ol>` : ""}
+  </article>`;
+}
+
+function renderSuggestions(c) {
+  const { items, checked } = c.suggestions;
+  $("suggestion-count").textContent = items.length ? String(items.length) : "";
+  $("suggestions-caption").textContent = items.length
+    ? `${items.length} ${items.length === 1 ? "change" : "changes"} to try, each triggered by a pattern in the loaded data. Each card says what it saw and what to try. Where it gives a reason, each claim links to its source.`
+    : "Nothing in the loaded data calls for a change. Each suggestion needs a minimum sample before it appears.";
+  const notice = [state.errors.refresh, state.errors.events, state.errors.authored, state.errors.prs, state.errors.year,
+    state.errors.conversations, state.errors.footprint].filter(Boolean).join(" ");
+  const rows = checked.map((r) => {
+    const [mark, cls, label] = SUGGESTION_STATUS[r.status];
+    return `<li><span class="${cls}" aria-hidden="true">${mark}</span><div><div>${esc(r.title)} <span class="muted small">· ${esc(label)}</span></div>${r.detail ? `<div class="d">${esc(r.detail)}</div>` : ""}</div></li>`;
+  }).join("");
+  $("suggestions").innerHTML = `
+    ${notice ? `<p class="insight-notice">${esc(notice)}</p>` : ""}
+    <p class="msg error" id="reading-status" role="status"></p>
+    ${items.length ? `<div class="grid suggestion-grid">${items.map(suggestionCard).join("")}</div>` : ""}
+    <details class="card checked">
+      <summary>What was checked: ${fmt(items.length)} of ${fmt(checked.length)} suggested</summary>
+      <ul class="cap">${rows}</ul>
+      <p class="note">Suggestions describe patterns in the loaded samples, not their causes. Pull request suggestions cover the pull requests you opened in the last ${AUTHORED_DAYS} days plus those referenced in recent events. Sources open in your browser.</p>
+    </details>`;
+}
+
 function renderMeta(c) {
   const { ev, year } = c;
   const v = state.viewer;
@@ -1268,6 +1338,7 @@ function renderAll() {
   renderOverview(c);
   renderStream(c);
   renderInsights(c);
+  renderSuggestions(c);
   renderMeta(c);
   $("refreshed").textContent = state.refreshedAt ? `Updated ${state.refreshedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : "";
 }
@@ -1354,7 +1425,7 @@ async function signOut() {
   state = { ...initialState };
   for (const id of ["me-name", "me-login", "initials", "summary", "kpis", "attention", "notes", "year-caption",
     "year-heat", "stream-caption", "chips", "repo-filter", "minor-count", "stream", "insights", "meta",
-    "fresh-badge", "refreshed", "conversation-count"]) $(id).textContent = "";
+    "fresh-badge", "refreshed", "conversation-count", "suggestions", "suggestions-caption", "suggestion-count"]) $(id).textContent = "";
   $("search").value = "";
   $("hide-minor").checked = true;
   setBusy("");
@@ -1428,6 +1499,17 @@ $("insights").addEventListener("click", (event) => {
   renderStream(computed());
   $("repo-filter").focus();
 });
+$("suggestions").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-reading]");
+  if (!button) return;
+  const id = button.dataset.reading;
+  let ok = false;
+  try {
+    ok = (await window.desk.openReading(id)).ok;
+  } catch { /* The system browser could not be opened. */ }
+  const status = $("reading-status");
+  if (status) status.textContent = ok ? "" : `Could not open ${I.READING[id]?.title || "that source"} in your browser.`;
+});
 $("chips").addEventListener("click", (event) => {
   const chip = event.target.closest(".chip");
   if (!chip) return;
@@ -1465,9 +1547,8 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault();
     if (!state.busy && !$("app").classList.contains("hidden")) $("refresh").click();
   }
-  if ((event.metaKey || event.ctrlKey) && ["1", "2", "3", "4"].includes(event.key)) {
-    showTab(["overview", "stream", "insights", "meta"][Number(event.key) - 1]);
-  }
+  const tabs = ["overview", "stream", "insights", "suggestions", "meta"];
+  if ((event.metaKey || event.ctrlKey) && /^[1-5]$/.test(event.key)) showTab(tabs[Number(event.key) - 1]);
 });
 
 boot().catch((error) => signinMessage(error.message, true));

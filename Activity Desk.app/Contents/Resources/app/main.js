@@ -3,10 +3,13 @@
 const { app, BrowserWindow, ipcMain, safeStorage, shell, Tray, Menu, nativeImage } = require("electron");
 const fs = require("node:fs");
 const path = require("node:path");
-const { pathToFileURL } = require("node:url");
+const { pathToFileURL, URL: NodeURL } = require("node:url");
 
 const TOKEN_PAGE = "https://github.com/settings/personal-access-tokens/new?name=Activity%20Desk";
 const API = "https://api.github.com";
+// Suggestions cite sources from this catalogue. The renderer asks for a link by id only.
+const { READING } = require(path.join(__dirname, "insights.js"));
+const READING_HOSTS = new Set(["docs.github.com", "github.com", "google.github.io", "chaoss.community", "doi.org"]);
 
 const DOCUMENT = pathToFileURL(path.join(__dirname, "index.html")).href;
 const singleInstance = app.requestSingleInstanceLock();
@@ -357,6 +360,26 @@ handle("sign-out", () => withCredentials(() => {
 
 handle("open-token-page", async () => {
   await shell.openExternal(TOKEN_PAGE);
+  return { ok: true };
+});
+
+// Opens a further-reading link in the browser. Only catalogued ids on allowlisted HTTPS hosts open.
+function readingUrl(id) {
+  if (typeof id !== "string" || !Object.hasOwn(READING, id)) return null;
+  let url;
+  try {
+    url = new NodeURL(READING[id].url);
+  } catch {
+    return null;
+  }
+  const plain = url.protocol === "https:" && !url.username && !url.password && !url.port;
+  return plain && READING_HOSTS.has(url.hostname) ? url.href : null;
+}
+
+handle("open-reading", async (id) => {
+  const url = readingUrl(id);
+  if (!url) return { ok: false, status: 400, error: "Unknown reading link." };
+  await shell.openExternal(url);
   return { ok: true };
 });
 
