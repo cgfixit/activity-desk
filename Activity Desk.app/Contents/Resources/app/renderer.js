@@ -10,6 +10,9 @@ const EVENT_PAGES = 3; // GitHub serves at most 300 events
 const PR_LOOKUP_LIMIT = 40;
 const AUTHORED_PAGES = 3; // 100 pull requests per page
 const AUTHORED_DAYS = 90; // matches the authored search window in main.js
+const FOOTPRINT_REPOS = 10; // most recently pushed repositories you own
+const STAR_DATES_MAX = 100; // star dates are read for repositories with at most one page of stars
+const TRAFFIC_CONCURRENCY = 4;
 const GLYPHS = { PushEvent: "↑", PullRequestEvent: "⇄", IssuesEvent: "◉", IssueCommentEvent: "✎", CreateEvent: "+", DeleteEvent: "−", PullRequestReviewEvent: "✓", ReleaseEvent: "◆", WatchEvent: "★", ForkEvent: "⑂" };
 const CHIPS = [["all", "All"], ["push", "Pushes"], ["pr", "Pull requests"], ["issue", "Issues"], ["comment", "Comments"], ["branch", "Branches"], ["agent", "Agents"]];
 const CONVERSATION_CHIPS = [["all", "All"], ["others", "From others"], ["mine", "Yours"], ["reviews", "Reviews"], ["bots", "Bots"]];
@@ -25,6 +28,8 @@ const initialState = {
   prLookup: { authored: null, referenced: { total: 0, covered: 0, asked: 0, found: 0 } },
   rateLimit: null,
   tokenMeta: null,
+  footprint: null,
+  savedHistory: null,
   contributions: null,
   notifications: null,
   errors: {},
@@ -169,6 +174,56 @@ async function lookupPullRequests(account, refs) {
   };
 }
 
+async function mapLimit(items, limit, fn) {
+  const queue = items.slice();
+  await Promise.all(Array.from({ length: Math.min(limit, queue.length) }, async () => {
+    while (queue.length) await fn(queue.shift());
+  }));
+}
+
+// Traffic for your most recently pushed repositories, plus star dates for small ones.
+// The first repository's views decide whether the token can read traffic at all, so a token
+// without Administration: read costs one request instead of thirty.
+async function loadFootprint(account) {
+  const { data } = await api(account, "ownedRepos");
+  if (!Array.isArray(data)) throw new Error("GitHub did not return a usable repository list.");
+  const own = data.filter((r) => !r.fork && !r.archived);
+  const repos = own.slice().sort((a, b) => String(b.pushed_at).localeCompare(String(a.pushed_at))).slice(0, FOOTPRINT_REPOS);
+  const fp = { repos, listed: own.length, more: data.length >= 100, traffic: {}, stars: {}, denied: "", issues: [] };
+  const read = async (repo) => {
+    const t = {};
+    for (const kind of ["views", "clones", "referrers"]) t[kind] = (await api(account, "traffic", { repo: repo.full_name, kind })).data;
+    fp.traffic[repo.full_name] = t;
+  };
+  if (repos.length) {
+    try {
+      await read(repos[0]);
+    } catch (error) {
+      if (error.message === "Session changed.") throw error;
+      fp.denied = error.message;
+    }
+    if (!fp.denied) {
+      await mapLimit(repos.slice(1), TRAFFIC_CONCURRENCY, (r) => read(r).catch((error) => {
+        if (error.message === "Session changed.") throw error;
+        fp.issues.push(`${r.full_name}: ${error.message}`);
+      }));
+    }
+  }
+  for (const r of repos) if (r.stargazers_count === 0) fp.stars[r.full_name] = [];
+  const small = repos.filter((r) => r.stargazers_count > 0 && r.stargazers_count <= STAR_DATES_MAX);
+  await mapLimit(small, TRAFFIC_CONCURRENCY, async (r) => {
+    try {
+      const { data: dates } = await api(account, "stargazers", { repo: r.full_name });
+      if (Array.isArray(dates)) fp.stars[r.full_name] = dates;
+    } catch (error) {
+      if (error.message === "Session changed.") throw error;
+      fp.issues.push(`${r.full_name} stars: ${error.message}`);
+    }
+  });
+  const saved = await window.desk.history().catch(() => null);
+  return { fp, saved };
+}
+
 // Pull requests you opened in the last AUTHORED_DAYS days, from search rather than the Events feed.
 // Up to AUTHORED_PAGES pages of 100, newest first. A failure after the first page keeps what loaded.
 async function loadAuthoredPullRequests(account, login) {
@@ -228,12 +283,13 @@ async function refresh() {
       pendingRefs = refs.filter((r) => !found?.info[I.prKey(r.repo, r.number)]);
       return lookupPullRequests(account, pendingRefs);
     });
-    const [notes, year, prs, talk, authored] = await Promise.allSettled([
+    const [notes, year, prs, talk, authored, footprint] = await Promise.allSettled([
       fineGrained ? null : api(account, "notifications"),
       api(account, "year"),
       lookupTask,
       api(account, "conversations", { login: user.login }),
       authoredTask,
+      loadFootprint(account),
     ]);
     if (account !== state) return;
     // Read last so the budget reflects this refresh. GitHub does not count this call against the limit.
@@ -275,6 +331,19 @@ async function refresh() {
     const prInfo = { ...lookup.info, ...(mine ? mine.info : {}) };
     const rateLimit = rate ? { resources: I.summarizeRateLimit(rate.data), at: new Date() } : null;
 
+    const fpLoad = footprint.value || null;
+    if (!fpLoad) errors.footprint = `Repository traffic did not load. ${footprint.reason?.message || ""}`.trim();
+    else {
+      const parts = [];
+      if (fpLoad.fp.denied) parts.push(`Repository traffic needs read access to Administration on your repositories. ${fpLoad.fp.denied}`);
+      if (fpLoad.fp.issues.length) parts.push(`Some repositories did not load: ${fpLoad.fp.issues.slice(0, 3).join("; ")}${fpLoad.fp.issues.length > 3 ? "; …" : ""}`);
+      if (parts.length) errors.footprint = parts.join(" ");
+      if (!fpLoad.saved?.ok) errors.history = `Saved history is unavailable. ${fpLoad.saved?.error || ""}`.trim();
+      else if (fpLoad.saved.note) errors.history = fpLoad.saved.note;
+    }
+    const footprintData = fpLoad ? fpLoad.fp : null;
+    const savedHistory = fpLoad?.saved?.ok ? fpLoad.saved : null;
+
     const talkData = talk.value?.data;
     let conversations = Array.isArray(talkData?.data?.search?.nodes)
       ? { ...I.flattenConversations(talkData.data, user.login), loadedAt: new Date() } : null;
@@ -285,7 +354,7 @@ async function refresh() {
     } else if (!conversations) errors.conversations = `Conversations did not load. ${talkProblem}`;
     else if (talkData.errors?.length) errors.conversations = "Some conversations could not be read with this token.";
 
-    Object.assign(account, { user, viewer, contributions, events, notifications, prLookup, prInfo, rateLimit, conversations, errors, refreshedAt: new Date() });
+    Object.assign(account, { user, viewer, contributions, events, notifications, prLookup, prInfo, rateLimit, footprint: footprintData, savedHistory, conversations, errors, refreshedAt: new Date() });
     if (!events.some((e) => I.repoName(e) === account.repo)) account.repo = "";
     account.lastSeen = localStorage.getItem(seenKey());
     if (!account.lastSeen && newestActivity(account)) {
@@ -332,7 +401,8 @@ function computed() {
   const follow = I.summarizeFollowThrough(state.events, state.prInfo, state.refreshedAt);
   const review = I.summarizeReviewFlow(state.prInfo, state.user && state.user.login);
   const observations = I.deriveObservations({ rhythm, sessions, prs: prPatterns, trajectory, follow, review });
-  return { ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, observations };
+  const footprint = state.footprint ? I.summarizeFootprint(state.footprint, state.savedHistory, state.refreshedAt) : null;
+  return { ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, observations, footprint };
 }
 
 function renderOverview(c) {
@@ -346,6 +416,8 @@ function renderOverview(c) {
     parts.push(`${fmt(year.last30)} contributions in the last 30 days${trend}.`);
   }
   if (ev.agentEvents) parts.push(`${pct(ev.agentShare)} of loaded events matched a known agent app or branch prefix.`);
+  const fpt = c.footprint?.totals;
+  if (fpt?.views != null) parts.push(`${fmt(fpt.views)} page views across ${fmt(fpt.withTraffic)} of your repositories in the last 14 days.`);
   $("summary").innerHTML = parts.join(" ");
 
   const kpis = [
@@ -834,6 +906,55 @@ function authoredCoverage() {
   return ` (${window}${older ? `, plus ${fmt(older)} older ${older === 1 ? "one" : "ones"} referenced in recent events` : ""})`;
 }
 
+function footprintInsights(f) {
+  const fp = state.footprint;
+  const notice = [state.errors.footprint, state.errors.history].filter(Boolean).join(" ");
+  const noticeHtml = notice ? `<p class="insight-notice">${esc(notice)}</p>` : "";
+  if (!f || !fp) return insightSection("insight-footprint", "Footprint", "No repository data loaded", noticeHtml || '<p class="card muted">Repository traffic did not load.</p>');
+  const saved = state.savedHistory;
+  const caption = [
+    `${fmt(f.totals.withTraffic)} of ${fmt(fp.listed)}${fp.more ? "+" : ""} repositories you own · 14-day traffic`,
+    saved?.enabled === false ? "saved history off" : f.firstSaved ? `daily views since ${f.firstSaved}` : "",
+  ].filter(Boolean).join(" · ");
+
+  const findings = f.findings.length
+    ? `<ul class="attention">${f.findings.map((o) => `<li class="${esc(o.tone)}"><span class="dot"></span><div><div class="t">${esc(o.title)}</div><div class="d">${esc(o.detail)}</div>${sourceTag(o.source)}</div></li>`).join("")}</ul>`
+    : `<p class="note">Nothing crossed a reporting threshold. Findings need at least ${fmt(20)} visitors, and trend findings need 56 days of saved history.</p>`;
+
+  const max = Math.max(1, ...f.weeks.map((w) => w.count));
+  const cols = f.weeks.map((w) => `<span class="${w.known ? "after" : ""}" style="height:${w.known ? Math.max(2, Math.round(w.count / max * 100)) : 2}%" title="${esc(`Week of ${w.start}: ${w.known ? fmt(w.count) : "no data"}`)}"></span>`).join("");
+  const trendText = f.trend
+    ? `Last 28 days: <strong>${fmt(f.trend.last)}</strong> views, against ${fmt(f.trend.prev)} in the 28 before.`
+    : `A four-week comparison needs 56 days of saved history; ${fmt(f.coveredDays)} ${f.coveredDays === 1 ? "day is" : "days are"} covered so far.`;
+
+  const refs = f.referrers.slice(0, 6).map((r) => [r.referrer, r.count]);
+  const newRefs = f.newReferrers.slice(0, 5).map((r) => `<li><strong>${esc(r.referrer)}</strong> · ${esc(shortRepo(r.repo))} · first seen ${esc(r.first)}</li>`).join("");
+
+  const stars30 = (r) => r.stars30 == null ? "—" : `${r.stars30 > 0 ? "+" : ""}${fmt(r.stars30)}${r.starSource === "history" ? "*" : ""}`;
+  const table = `<table class="compare"><caption class="note">Your most recently pushed repositories, up to ${FOOTPRINT_REPOS}</caption>
+    <thead><tr><th scope="col">Repository</th><th scope="col">Views</th><th scope="col">Unique</th><th scope="col">Clones</th><th scope="col">Stars</th><th scope="col">Stars, 30 d</th><th scope="col">Forks</th></tr></thead>
+    <tbody>${f.rows.map((r) => `<tr><th scope="row">${esc(shortRepo(r.repo))}${r.private ? ' <span class="src">private</span>' : ""}</th><td>${fmt(r.views)}</td><td>${fmt(r.uniques)}</td><td>${fmt(r.clones)}</td><td>${fmt(r.stars)}</td><td>${stars30(r)}</td><td>${fmt(r.forks)}</td></tr>`).join("")}</tbody></table>`;
+
+  return insightSection("insight-footprint", "Footprint", caption, `
+    ${noticeHtml}
+    <div class="grid insights">
+      <article class="card insight-wide"><h4>What stands out</h4>${findings}</article>
+      <article class="card"><h4>Views by week</h4>${sourceTag("Traffic and saved history")}
+        <div class="weekly" role="img" aria-label="Weekly page views across your repositories, oldest first">${cols}</div>
+        <p class="note">${trendText} GitHub keeps 14 days of traffic. Older weeks come from history saved on this Mac, and grey weeks have no data.</p>
+      </article>
+      <article class="card"><h4>Where visitors come from</h4>${sourceTag("Traffic, last 14 days")}
+        ${refs.length ? bars(refs) : '<p class="note">No referrers reported.</p>'}
+        ${newRefs ? `<p class="note">First seen in the last 30 days:</p><ul class="plain">${newRefs}</ul>` : ""}
+        <p class="note">Views from each referring site, summed across repositories. GitHub lists up to 10 per repository.</p>
+      </article>
+      <article class="card insight-wide"><h4>Repositories</h4>${sourceTag("Traffic and repository list")}
+        ${table}
+        <p class="note">Views, unique visitors, and clones cover the last 14 days. Stars over 30 days come from star dates for repositories with up to ${STAR_DATES_MAX} stars, or from saved daily counts (marked *). Clones can include automated ones such as CI checkouts.</p>
+      </article>
+    </div>`);
+}
+
 function renderInsights(c) {
   const { ev, pr, year } = c;
   $("insight-nav").querySelectorAll("button").forEach((button) => {
@@ -841,7 +962,8 @@ function renderInsights(c) {
   });
   const panel = state.insight === "events" ? eventInsights(ev)
     : state.insight === "prs" ? pullRequestInsights(pr)
-    : state.insight === "patterns" ? patternInsights(c) : annualInsights(year);
+    : state.insight === "patterns" ? patternInsights(c)
+    : state.insight === "footprint" ? footprintInsights(c.footprint) : annualInsights(year);
   $("insights").innerHTML = `${state.errors.refresh ? `<p class="insight-notice">${esc(state.errors.refresh)}</p>` : ""}${panel}`;
 }
 
@@ -881,6 +1003,10 @@ function renderMeta(c) {
       ? ["part", "Private contributions", `${fmt(year.totals.restricted)} contributions are counted but hidden from this token.`]
       : ["ok", "Restricted contributions", "GitHub reported no restricted contribution count."]);
   }
+  const fp = state.footprint;
+  caps.push(!fp ? ["no", "Repository traffic", esc(state.errors.footprint || "Not available.")]
+    : fp.denied ? ["no", "Repository traffic", esc(state.errors.footprint)]
+    : [state.errors.footprint ? "part" : "ok", "Repository traffic", `${fmt(Object.keys(fp.traffic).length)} of ${fmt(fp.repos.length)} repositories read. ${esc(state.errors.footprint || "")}`]);
   if (state.errors.account) caps.push(["part", "Account details", esc(state.errors.account)]);
   cards.push(`<article class="card"><h3>What this token can see</h3>
     <p class="big">Signed in with a <strong>${esc(kind || "GitHub")}</strong> token.</p>
@@ -903,6 +1029,7 @@ function renderMeta(c) {
 
   cards.push(tokenCard());
   cards.push(rateCard());
+  cards.push(historyCard());
 
   cards.push(`<article class="card"><h3>This session</h3>
     <dl class="kv">
@@ -961,7 +1088,7 @@ function tokenCard() {
     ? `<ul class="cap">${denied.map(([op, sets]) => `<li><span class="no">✕</span><div><div>${esc(OPERATION_LABELS[op] || op)}</div><div class="d">GitHub accepts ${esc(sets.map((set) => set.join(" with ")).join(", or "))}.</div></div></li>`).join("")}</ul>`
     : "";
   const advice = kind === "fine-grained"
-    ? "Recommended setup: resource owner set to your account, access to all repositories you want covered, and read-only permissions only: <strong>Pull requests</strong>, <strong>Issues</strong>, and the account permission <strong>Events</strong>. GitHub adds <strong>Metadata</strong> automatically."
+    ? "Recommended setup: resource owner set to your account, access to all repositories you want covered, and read-only permissions only: <strong>Pull requests</strong>, <strong>Issues</strong>, and the account permission <strong>Events</strong>, plus <strong>Administration</strong> if you want repository traffic in Footprint. GitHub adds <strong>Metadata</strong> automatically."
     : "Recommended: a fine-grained token with read-only permissions. A fine-grained token covers one resource owner and cannot read notifications, so keep a classic token only if you need the unread inbox.";
   const warnings = tokenWarnings().filter((w) => !/rate limit/.test(w.title));
   return `<article class="card"><h3>Token check</h3>
@@ -970,6 +1097,32 @@ function tokenCard() {
     ${deniedList}
     <p class="note">${advice}</p>
     <p class="note">${denied.length ? "Denied requests list the permissions GitHub reported for them." : "No request was denied with a permission hint."} GraphQL sources report missing access as partial results in the list above instead. Activity Desk only sends allowlisted reads, whatever the token allows.</p>
+  </article>`;
+}
+
+function historyCard() {
+  const h = state.savedHistory;
+  const head = '<article class="card"><h3>Saved history</h3>';
+  if (!h) return `${head}<p class="note">${esc(state.errors.history || "Saved history loads with repository traffic.")}</p></article>`;
+  if (h.enabled === false) {
+    return `${head}<p class="big">Off. Nothing is saved on this Mac.</p>
+      <p class="note">Footprint shows only the 14 days GitHub keeps.</p>
+      <button class="btn ghost" type="button" data-action="history-on">Turn on saved history</button></article>`;
+  }
+  const repos = Object.values(h.repos || {});
+  const days = new Set();
+  for (const r of repos) for (const series of [r.views, r.clones, r.counts]) for (const d of Object.keys(series || {})) days.add(d);
+  const sorted = [...days].sort();
+  return `${head}
+    ${h.note ? `<div class="callout">${esc(h.note)}</div>` : ""}
+    <dl class="kv">
+      <dt>Repositories</dt><dd>${fmt(repos.length)}</dd>
+      <dt>Days covered</dt><dd>${sorted.length ? `${fmt(sorted.length)} · ${esc(sorted[0])} to ${esc(sorted.at(-1))}` : "—"}</dd>
+      <dt>File size</dt><dd>${h.bytes ? `${fmt(Math.ceil(h.bytes / 1024))} KB, encrypted` : "Not written yet"}</dd>
+    </dl>
+    <p class="note">Each refresh saves daily views and clones, star and fork counts, and referring sites for repositories you own, so Footprint can show more than GitHub's 14 days. It is encrypted with the same macOS Keychain-backed key as the token and kept for 400 days. Signing out keeps it.</p>
+    <div class="actions"><button class="btn ghost" type="button" data-action="history-clear">Delete this account's history</button>
+    <button class="btn ghost" type="button" data-action="history-off">Turn off and delete all</button></div>
   </article>`;
 }
 
@@ -1101,6 +1254,31 @@ async function signOut() {
 $("signout").addEventListener("click", signOut);
 $("forget-token").addEventListener("click", signOut);
 $("refresh").addEventListener("click", refresh);
+$("meta").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-action]");
+  if (!button || state.busy) return;
+  const action = button.dataset.action;
+  const prompts = {
+    "history-clear": "Delete the saved history for this account? The next refresh starts saving again.",
+    "history-off": "Turn off saved history and delete it for every account on this Mac?",
+  };
+  if (prompts[action] && !window.confirm(prompts[action])) return;
+  button.disabled = true;
+  const account = state;
+  try {
+    const result = action === "history-clear" ? await window.desk.clearHistory()
+      : await window.desk.setHistory(action === "history-on");
+    if (!result.ok) throw new Error(result.error);
+    const saved = await window.desk.history();
+    if (account !== state) return;
+    state.savedHistory = saved.ok ? saved : null;
+    delete state.errors.history;
+  } catch (error) {
+    if (account !== state) return;
+    state.errors.history = error.message;
+  }
+  renderAll();
+});
 document.querySelectorAll(".nav").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
 $("insight-nav").addEventListener("click", (event) => {
   const button = event.target.closest("[data-source]");

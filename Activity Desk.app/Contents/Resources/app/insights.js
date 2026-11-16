@@ -1005,7 +1005,7 @@ const PERMISSION_LABELS = { user_events: "Events (account permission)" };
 function parseAcceptedPermissions(header) {
   return String(header || "").split(";").map((set) => set.split(",").map((part) => part.trim()).filter(Boolean).map((part) => {
     const [name, access] = part.split("=").map((x) => x.trim());
-    const label = PERMISSION_LABELS[name] || name.replace(/_/g, " ");
+    const label = Object.hasOwn(PERMISSION_LABELS, name) ? PERMISSION_LABELS[name] : name.replace(/_/g, " ");
     return `${label.charAt(0).toUpperCase()}${label.slice(1)}${access ? `: ${access}` : ""}`;
   })).filter((set) => set.length);
 }
@@ -1053,6 +1053,164 @@ function summarizeRateLimit(data) {
   });
 }
 
+// ---------- Footprint: repository traffic, stars, and saved history ----------
+const FOOTPRINT_WEEKS = 13;
+const FOOTPRINT_MIN_VISITORS = 20;
+const NEW_REFERRER_DAYS = 30;
+
+const sumKnown = (values) => {
+  const known = values.filter((v) => Number.isFinite(v));
+  return known.length ? sum(known) : null;
+};
+
+// fp: { repos, traffic: { repo: { views, clones, referrers } }, stars: { repo: [starred_at] } }
+// saved: the main process's saved history for this account, { repos: { repo: { views, clones, counts, referrers } } }
+function summarizeFootprint(fp, saved, now) {
+  const nowTime = now == null ? Date.now() : new Date(now).getTime();
+  const dayKey = (offset) => new Date(nowTime - offset * DAY_MS).toISOString().slice(0, 10);
+  const savedRepos = saved?.repos || {};
+  const traffic = fp?.traffic || {};
+  const starLists = fp?.stars || {};
+
+  const rows = (fp?.repos || []).map((r) => {
+    const t = traffic[r.full_name] || {};
+    const times = starLists[r.full_name];
+    let stars14 = null;
+    let stars30 = null;
+    let starSource = null;
+    if (Array.isArray(times)) {
+      const ages = times.map((at) => (nowTime - Date.parse(at)) / DAY_MS).filter(Number.isFinite);
+      stars14 = ages.filter((a) => a >= 0 && a < 14).length;
+      stars30 = ages.filter((a) => a >= 0 && a < 30).length;
+      starSource = "timestamps";
+    } else {
+      // Without timestamps, compare with the saved count from 30 or more days ago.
+      const counts = savedRepos[r.full_name]?.counts || {};
+      const past = Object.keys(counts).filter((d) => d <= dayKey(30)).sort().pop();
+      if (past && Number.isFinite(r.stargazers_count)) {
+        stars30 = r.stargazers_count - counts[past][0];
+        starSource = "history";
+      }
+    }
+    return {
+      repo: r.full_name, private: r.private, stars: r.stargazers_count, forks: r.forks_count,
+      views: t.views?.count ?? null, uniques: t.views?.uniques ?? null,
+      clones: t.clones?.count ?? null, cloners: t.clones?.uniques ?? null,
+      stars14, stars30, starSource,
+    };
+  });
+
+  const totals = {
+    views: sumKnown(rows.map((r) => r.views)),
+    uniques: sumKnown(rows.map((r) => r.uniques)),
+    clones: sumKnown(rows.map((r) => r.clones)),
+    cloners: sumKnown(rows.map((r) => r.cloners)),
+    withTraffic: rows.filter((r) => r.views != null).length,
+  };
+
+  // Daily views across repositories: saved days first, then today's 14-day response on top.
+  const daily = new Map();
+  let firstSaved = null;
+  for (const r of rows) {
+    const merged = { ...(savedRepos[r.repo]?.views || {}) };
+    for (const d of traffic[r.repo]?.views?.views || []) {
+      const day = String(d?.timestamp || "").slice(0, 10);
+      if (day && Number.isFinite(d.count)) merged[day] = [d.count, d.uniques];
+    }
+    for (const [day, [n]] of Object.entries(merged)) {
+      daily.set(day, (daily.get(day) || 0) + n);
+      if (!firstSaved || day < firstSaved) firstSaved = day;
+    }
+  }
+  const weeks = [];
+  for (let w = FOOTPRINT_WEEKS - 1; w >= 0; w -= 1) {
+    let n = 0;
+    let known = false;
+    for (let d = 0; d < 7; d += 1) {
+      const day = dayKey(w * 7 + d);
+      if (daily.has(day)) { n += daily.get(day); known = true; }
+      else if (firstSaved && day >= firstSaved) known = true; // GitHub omits days with no views
+    }
+    weeks.push({ start: dayKey(w * 7 + 6), count: n, known });
+  }
+  const coveredDays = firstSaved ? Math.floor((nowTime - Date.parse(`${firstSaved}T00:00:00Z`)) / DAY_MS) + 1 : 0;
+  let trend = null;
+  if (coveredDays >= 56) {
+    const range = (from, to) => { let n = 0; for (let d = from; d < to; d += 1) n += daily.get(dayKey(d)) || 0; return n; };
+    const last = range(0, 28);
+    const prev = range(28, 56);
+    trend = { last, prev, change: prev ? (last - prev) / prev : null };
+  }
+
+  // Where visitors come from in the current 14-day window, summed across repositories.
+  const refMap = new Map();
+  for (const r of rows) {
+    for (const x of traffic[r.repo]?.referrers || []) {
+      if (typeof x?.referrer !== "string") continue;
+      const cur = refMap.get(x.referrer) || { referrer: x.referrer, count: 0, uniques: 0, repos: 0 };
+      cur.count += x.count || 0;
+      cur.uniques += x.uniques || 0;
+      cur.repos += 1;
+      refMap.set(x.referrer, cur);
+    }
+  }
+  const referrers = [...refMap.values()].sort((a, b) => b.count - a.count);
+
+  // Referrers first seen recently. A sighting counts only when saved history began at least
+  // 14 days earlier, so the first refresh does not report every referrer as new.
+  let historyStart = null;
+  for (const entry of Object.values(savedRepos)) {
+    for (const series of [entry.views, entry.clones, entry.counts]) {
+      for (const day of Object.keys(series || {})) if (!historyStart || day < historyStart) historyStart = day;
+    }
+    for (const seen of Object.values(entry.referrers || {})) if (!historyStart || seen.first < historyStart) historyStart = seen.first;
+  }
+  const newReferrers = [];
+  for (const [repo, entry] of Object.entries(savedRepos)) {
+    for (const [name, seen] of Object.entries(entry.referrers || {})) {
+      const lead = historyStart ? (Date.parse(seen.first) - Date.parse(historyStart)) / DAY_MS : 0;
+      if (seen.first >= dayKey(NEW_REFERRER_DAYS) && lead >= 14) newReferrers.push({ referrer: name, repo, first: seen.first, peak: seen.peak });
+    }
+  }
+  newReferrers.sort((a, b) => b.first.localeCompare(a.first));
+
+  const findings = [];
+  const add = (tone, title, detail) => findings.push({ tone, source: "Repository traffic", title, detail });
+  const pctText = (x) => `${Math.round(x * 100)}%`;
+  const ranked = rows.filter((r) => r.views).sort((a, b) => b.views - a.views);
+  if (totals.views >= FOOTPRINT_MIN_VISITORS && ranked.length > 1 && ranked[0].views / totals.views >= 0.6) {
+    add("info", `${ranked[0].repo} drew ${pctText(ranked[0].views / totals.views)} of page views`,
+      `${ranked[0].views.toLocaleString()} of ${totals.views.toLocaleString()} views across ${totals.withTraffic} repositories in the last 14 days. One repository carries most of your visible footprint.`);
+  }
+  const starred = rows.filter((r) => r.starSource === "timestamps" && r.uniques != null);
+  const starVisitors = sum(starred.map((r) => r.uniques));
+  if (starVisitors >= FOOTPRINT_MIN_VISITORS) {
+    const gained = sum(starred.map((r) => r.stars14));
+    add("info", `${(gained / starVisitors * 100).toFixed(1)} new stars per 100 unique visitors`,
+      `${gained} stars in the last 14 days against ${starVisitors.toLocaleString()} unique visitors, summed per repository, across ${starred.length} ${starred.length === 1 ? "repository" : "repositories"} with star dates. A person who visits two repositories counts twice.`);
+  }
+  for (const r of rows) {
+    if (r.uniques >= FOOTPRINT_MIN_VISITORS && r.stars14 === 0) {
+      add("warn", `${r.repo} had ${r.uniques} unique visitors and no new stars`,
+        "Visitors arrived in the last 14 days but none starred it. The README and first screen are what they saw.");
+    }
+    if (r.cloners != null && r.uniques != null && r.cloners >= 10 && r.cloners > r.uniques * 2) {
+      add("info", `${r.repo} has more cloners than visitors`,
+        `${r.cloners} unique cloners against ${r.uniques} unique visitors in 14 days. Clones that skip the page usually come from automation such as CI, mirrors, or package tools.`);
+    }
+  }
+  if (trend && trend.prev >= FOOTPRINT_MIN_VISITORS && trend.change != null && Math.abs(trend.change) >= 0.25) {
+    add(trend.change > 0 ? "good" : "warn", `Page views ${trend.change > 0 ? "rose" : "fell"} ${pctText(Math.abs(trend.change))} over four weeks`,
+      `${trend.last.toLocaleString()} views in the last 28 days against ${trend.prev.toLocaleString()} in the 28 before, from saved history.`);
+  }
+  if (newReferrers.length) {
+    add("good", `${newReferrers.length} new ${newReferrers.length === 1 ? "referrer" : "referrers"} in the last ${NEW_REFERRER_DAYS} days`,
+      newReferrers.slice(0, 4).map((x) => `${x.referrer} → ${x.repo.split("/")[1]} (${x.first})`).join(", "));
+  }
+
+  return { rows, totals, weeks, coveredDays, firstSaved, trend, referrers, newReferrers, historyStart, findings };
+}
+
 const api = {
   eventLabel,
   repoName,
@@ -1088,6 +1246,7 @@ const api = {
   tokenExpiryStatus,
   classicScopes,
   summarizeRateLimit,
+  summarizeFootprint,
 };
 
 if (typeof module !== "undefined" && module.exports) module.exports = api;

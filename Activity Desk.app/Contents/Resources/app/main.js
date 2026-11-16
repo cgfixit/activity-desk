@@ -32,17 +32,22 @@ function readIfPresent(file) {
   }
 }
 
-async function writeToken(token) {
-  const encrypted = await safeStorage.encryptStringAsync(token);
+// Encrypts with safeStorage and replaces the target file in one rename.
+async function writeEncrypted(name, text) {
+  const encrypted = await safeStorage.encryptStringAsync(text);
   const profile = app.getPath("userData");
   const staging = fs.mkdtempSync(path.join(profile, "credential-"));
   try {
-    const file = path.join(staging, "token");
+    const file = path.join(staging, "data");
     fs.writeFileSync(file, encrypted, { mode: 0o600 });
-    fs.renameSync(file, path.join(profile, "github-token.enc"));
+    fs.renameSync(file, path.join(profile, name));
   } finally {
     fs.rmSync(staging, { recursive: true, force: true });
   }
+}
+
+function writeToken(token) {
+  return writeEncrypted("github-token.enc", token);
 }
 
 async function readToken() {
@@ -135,7 +140,182 @@ function handle(channel, operation) {
 function resetSession() {
   session.abort();
   session = new AbortController();
+  sessionUser = null;
 }
+
+// ---------- Saved history ----------
+// Daily repository traffic, star and fork counts, and referrer sightings, kept so trends can outlast
+// GitHub's 14-day traffic window. Only the main process writes it, and only from GitHub responses it
+// fetched itself for the signed-in account's own repositories. It is encrypted like the token.
+const HISTORY_FILE = "history.enc";
+const HISTORY_OFF = "history-off"; // present when the user turned saved history off
+const HISTORY_VERSION = 1;
+const HISTORY_DAYS = 400;
+const HISTORY_REPOS = 50;
+const HISTORY_REFERRERS = 50;
+const DAY = /^\d{4}-\d{2}-\d{2}$/;
+const REFERRER = /^[A-Za-z0-9.-]{1,100}$/;
+
+let sessionUser = null; // { id, login } from the profile read in this session
+let history = null;
+let historyNote = "";
+let historyQueue = Promise.resolve();
+let historyTimer = null;
+let historyDirty = false;
+
+function withHistory(operation) {
+  const pending = historyQueue.then(operation);
+  historyQueue = pending.catch(() => {});
+  return pending;
+}
+
+const count = (n) => Number.isSafeInteger(n) && n >= 0;
+const today = () => new Date().toISOString().slice(0, 10);
+
+async function loadHistory() {
+  if (history) return history;
+  history = { version: HISTORY_VERSION, accounts: {} };
+  const encrypted = readIfPresent(path.join(app.getPath("userData"), HISTORY_FILE));
+  if (!encrypted) return history;
+  try {
+    const { result } = await safeStorage.decryptStringAsync(encrypted);
+    const parsed = JSON.parse(result);
+    if (parsed?.version === HISTORY_VERSION && parsed.accounts && typeof parsed.accounts === "object") history = parsed;
+    else historyNote = "Saved history used an unknown format, so it started again.";
+  } catch {
+    historyNote = "Saved history could not be decrypted, so it started again.";
+  }
+  return history;
+}
+
+function accountHistory(store, user) {
+  const key = String(user.id);
+  const account = store.accounts[key] || (store.accounts[key] = { login: user.login, repos: {} });
+  account.login = user.login;
+  return account;
+}
+
+function repoHistory(account, repo) {
+  const entry = account.repos[repo] || (account.repos[repo] = { views: {}, clones: {}, counts: {}, referrers: {}, seen: "" });
+  entry.seen = today();
+  return entry;
+}
+
+function pruneHistory(store) {
+  const oldest = new Date(Date.now() - HISTORY_DAYS * 864e5).toISOString().slice(0, 10);
+  for (const account of Object.values(store.accounts)) {
+    for (const [repo, entry] of Object.entries(account.repos)) {
+      if (!entry.seen || entry.seen < oldest) { delete account.repos[repo]; continue; }
+      for (const series of [entry.views, entry.clones, entry.counts]) {
+        for (const day of Object.keys(series)) if (day < oldest) delete series[day];
+      }
+      const refs = Object.entries(entry.referrers).sort((a, b) => b[1].last.localeCompare(a[1].last));
+      for (const [name] of refs.slice(HISTORY_REFERRERS)) delete entry.referrers[name];
+    }
+    const repos = Object.entries(account.repos).sort((a, b) => b[1].seen.localeCompare(a[1].seen));
+    for (const [repo] of repos.slice(HISTORY_REPOS)) delete account.repos[repo];
+  }
+}
+
+async function saveHistory() {
+  clearTimeout(historyTimer);
+  if (!historyDirty || !history) return;
+  historyDirty = false;
+  pruneHistory(history);
+  await writeEncrypted(HISTORY_FILE, JSON.stringify(history));
+}
+
+function scheduleHistorySave() {
+  historyDirty = true;
+  clearTimeout(historyTimer);
+  historyTimer = setTimeout(() => withHistory(saveHistory).catch(() => {}), 400);
+}
+
+const historyEnabled = () => readIfPresent(path.join(app.getPath("userData"), HISTORY_OFF)) === null;
+
+// Records a traffic or repository-list response for the account that requested it.
+function recordHistory(user, operation, args, data) {
+  return withHistory(async () => {
+    if (!historyEnabled()) return;
+    const store = await loadHistory();
+    const account = accountHistory(store, user);
+    if (operation === "ownedRepos") {
+      const day = today();
+      for (const repo of data) {
+        if (!repo.full_name.toLowerCase().startsWith(`${user.login.toLowerCase()}/`)) continue;
+        if (count(repo.stargazers_count) && count(repo.forks_count)) repoHistory(account, repo.full_name).counts[day] = [repo.stargazers_count, repo.forks_count];
+      }
+    } else if (operation === "traffic") {
+      const entry = repoHistory(account, args.repo);
+      if (args.kind === "referrers") {
+        const day = today();
+        for (const r of Array.isArray(data) ? data : []) {
+          if (typeof r?.referrer !== "string" || !REFERRER.test(r.referrer) || !count(r.count)) continue;
+          const seen = entry.referrers[r.referrer] || (entry.referrers[r.referrer] = { first: day, last: day, peak: 0 });
+          seen.last = day;
+          seen.peak = Math.max(seen.peak, r.count);
+        }
+      } else {
+        const series = entry[args.kind];
+        for (const d of Array.isArray(data?.[args.kind]) ? data[args.kind] : []) {
+          const day = typeof d?.timestamp === "string" ? d.timestamp.slice(0, 10) : "";
+          if (DAY.test(day) && count(d.count) && count(d.uniques)) series[day] = [d.count, d.uniques];
+        }
+      }
+    }
+    scheduleHistorySave();
+  });
+}
+
+handle("history", () => withHistory(async () => {
+  if (!sessionUser) return { ok: false, error: "Sign in first." };
+  try {
+    const store = await loadHistory();
+    await saveHistory();
+    const account = store.accounts[String(sessionUser.id)];
+    const file = readIfPresent(path.join(app.getPath("userData"), HISTORY_FILE));
+    return { ok: true, enabled: historyEnabled(), repos: account ? account.repos : {}, bytes: file ? file.length : 0, note: historyNote };
+  } catch {
+    return { ok: false, error: "Saved history could not be read or saved." };
+  }
+}));
+
+// Turning saved history off deletes it for every account on this Mac and stops recording.
+handle("history-setting", (enabled) => withHistory(async () => {
+  if (typeof enabled !== "boolean") return { ok: false, error: "Invalid setting." };
+  const profile = app.getPath("userData");
+  try {
+    if (enabled) {
+      fs.rmSync(path.join(profile, HISTORY_OFF), { force: true });
+    } else {
+      fs.writeFileSync(path.join(profile, HISTORY_OFF), "", { mode: 0o600 });
+      clearTimeout(historyTimer);
+      historyDirty = false;
+      history = { version: HISTORY_VERSION, accounts: {} };
+      historyNote = "";
+      fs.rmSync(path.join(profile, HISTORY_FILE), { force: true });
+    }
+    return { ok: true, enabled: historyEnabled() };
+  } catch {
+    return { ok: false, error: "The saved history setting could not be changed." };
+  }
+}));
+
+handle("clear-history", () => withHistory(async () => {
+  if (!sessionUser) return { ok: false, error: "Sign in first." };
+  try {
+    const store = await loadHistory();
+    delete store.accounts[String(sessionUser.id)];
+    historyDirty = false;
+    clearTimeout(historyTimer);
+    if (Object.keys(store.accounts).length) await writeEncrypted(HISTORY_FILE, JSON.stringify(store));
+    else fs.rmSync(path.join(app.getPath("userData"), HISTORY_FILE), { force: true });
+    historyNote = "";
+    return { ok: true };
+  } catch {
+    return { ok: false, error: "Saved history could not be removed. Try again." };
+  }
+}));
 
 handle("status", () => withCredentials(async () => {
   try {
@@ -229,6 +409,14 @@ const AUTHORED_QUERY = `query ($q: String!, $after: String) {
 const CURSOR = /^[A-Za-z0-9+/=_:-]{1,256}$/;
 const LOGIN = /^[A-Za-z0-9-]{1,39}$/;
 const RATE_RESOURCES = ["core", "graphql"];
+const TRAFFIC_ROUTES = { views: "views?per=day", clones: "clones?per=day", referrers: "popular/referrers" };
+
+function validRepo(value) {
+  if (typeof value !== "string") return false;
+  const [owner, repo, extra] = value.split("/");
+  // Names made only of dots would turn into path segments that leave /repos/{owner}/{repo}.
+  return extra === undefined && [owner, repo].every((part) => part && REPO_NAME.test(part) && !/^\.+$/.test(part));
+}
 
 function githubRequest(operation, args) {
   switch (operation) {
@@ -246,6 +434,16 @@ function githubRequest(operation, args) {
       return { route: "/graphql", body: { query: AUTHORED_QUERY, variables: { q: `author:${login} is:pr created:>=${since} sort:created-desc`, after: after ?? null } } };
     }
     case "rateLimit": return { route: "/rate_limit" };
+    case "ownedRepos": return { route: "/user/repos?affiliation=owner&sort=pushed&per_page=100" };
+    case "traffic": {
+      const { repo, kind } = args || {};
+      if (!validRepo(repo) || typeof kind !== "string" || !Object.hasOwn(TRAFFIC_ROUTES, kind)) break;
+      return { route: `/repos/${repo}/traffic/${TRAFFIC_ROUTES[kind]}` };
+    }
+    case "stargazers": {
+      if (!validRepo(args?.repo)) break;
+      return { route: `/repos/${args.repo}/stargazers?per_page=100`, accept: "application/vnd.github.star+json" };
+    }
     case "profile": return { route: "/user" };
     case "notifications": return { route: "/notifications?all=false&per_page=50" };
     case "year": return { route: "/graphql", body: { query: YEAR_QUERY } };
@@ -290,7 +488,7 @@ handle("github", async (operation, args) => {
   if (!credential.token) return { ok: false, status: 401, error: "Sign in first." };
 
   const headers = {
-    Accept: "application/vnd.github+json",
+    Accept: request.accept || "application/vnd.github+json",
     Authorization: `Bearer ${credential.token}`,
     "User-Agent": "ActivityDesk",
     "X-GitHub-Api-Version": "2022-11-28",
@@ -319,6 +517,24 @@ handle("github", async (operation, args) => {
     if (operation === "profile") {
       const { id, login, name } = JSON.parse(body);
       body = JSON.stringify({ id, login, name });
+      if (!credential.signal.aborted && Number.isSafeInteger(id) && typeof login === "string" && LOGIN.test(login)) sessionUser = { id, login };
+    }
+    if (operation === "ownedRepos") {
+      const repos = JSON.parse(body);
+      const kept = (Array.isArray(repos) ? repos : []).filter((r) => validRepo(r?.full_name)).map((r) => ({
+        full_name: r.full_name, private: Boolean(r.private), fork: Boolean(r.fork), archived: Boolean(r.archived),
+        stargazers_count: r.stargazers_count, forks_count: r.forks_count, pushed_at: r.pushed_at,
+      }));
+      body = JSON.stringify(kept);
+    }
+    if (operation === "stargazers") {
+      const stars = JSON.parse(body);
+      body = JSON.stringify((Array.isArray(stars) ? stars : []).map((s) => s?.starred_at).filter((t) => typeof t === "string"));
+    }
+    const user = sessionUser;
+    if (user && !credential.signal.aborted && (operation === "ownedRepos" ||
+        (operation === "traffic" && args.repo.toLowerCase().startsWith(`${user.login.toLowerCase()}/`)))) {
+      await recordHistory(user, operation, args, JSON.parse(body)).catch(() => {});
     }
     if (operation === "rateLimit") {
       const resources = JSON.parse(body)?.resources || {};

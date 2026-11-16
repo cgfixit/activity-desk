@@ -29,7 +29,7 @@
       <details class="help">
         <summary>Which token should I use?</summary>
         <ul>
-          <li><strong>Fine-grained</strong> (recommended) works for the stream and insights. Set the resource owner to your account and grant read-only access only. For private events, add the account permission <strong>Events: read</strong>. For private pull request details, give it access to those repositories with <strong>Pull requests: read</strong>. For private issue conversations, add <strong>Issues: read</strong>. A fine-grained token covers one account or organization.</li>
+          <li><strong>Fine-grained</strong> (recommended) works for the stream and insights. Set the resource owner to your account and grant read-only access only. For private events, add the account permission <strong>Events: read</strong>. For private pull request details, give it access to those repositories with <strong>Pull requests: read</strong>. For private issue conversations, add <strong>Issues: read</strong>. For repository traffic in Footprint, add <strong>Administration: read</strong>. A fine-grained token covers one account or organization.</li>
           <li><strong>Classic</strong> with <code>notifications</code> enables the unread inbox. GitHub's classic <code>repo</code> scope also grants write access to private repositories.</li>
           <li>Activity Desk encrypts the saved token using macOS Keychain and sends it only to api.github.com.</li>
         </ul>
@@ -119,6 +119,7 @@
           <button type="button" data-source="events" aria-pressed="false" aria-controls="insights">Recent events</button>
           <button type="button" data-source="prs" aria-pressed="false" aria-controls="insights">Pull requests</button>
           <button type="button" data-source="patterns" aria-pressed="false" aria-controls="insights">Patterns</button>
+          <button type="button" data-source="footprint" aria-pressed="false" aria-controls="insights">Footprint</button>
         </div>
         <div id="insights"></div>
       </section>
