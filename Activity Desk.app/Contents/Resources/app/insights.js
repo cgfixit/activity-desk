@@ -374,7 +374,7 @@ const WORK_MIX = {
 };
 
 const sum = (values) => values.reduce((a, b) => a + b, 0);
-const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? "" : "s"}`;
+const plural = (n, word, many = `${word}s`) => `${n.toLocaleString()} ${n === 1 ? word : many}`;
 const share = (x) => `${Math.round(x * 100)}%`;
 
 function durationLabel(hours) {
@@ -475,6 +475,7 @@ function summarizeSessions(events, login) {
   const lifetimes = [];
   const owner = login ? `${String(login).toLowerCase()}/` : "";
   let ownRepo = 0;
+  let lateNight = 0; // midnight to 4am local time, the window Eyolfson et al. compared
 
   for (const { e, time } of timed) {
     const repo = repoName(e);
@@ -489,6 +490,7 @@ function summarizeSessions(events, login) {
     const when = new Date(time);
     const weekend = when.getDay() === 0 || when.getDay() === 6;
     dayParts[weekend ? "weekend" : when.getHours() >= 9 && when.getHours() < 18 ? "core" : "edge"] += 1;
+    if (when.getHours() < 4) lateNight += 1;
     mix[WORK_MIX[e.type] || "Other"] += 1;
     if (owner && repo.toLowerCase().startsWith(owner)) ownRepo += 1;
     const p = e.payload || {};
@@ -512,6 +514,7 @@ function summarizeSessions(events, login) {
     longest: longest && { start: longest.start, hours: (longest.end - longest.start) / 36e5, events: longest.events, repos: longest.repos.size },
     multiRepo: multi.filter((s) => s.repos.size > 1).length,
     dayParts,
+    lateNight,
     mix: Object.entries(mix).filter(([, n]) => n > 0),
     ownRepo: owner ? ownRepo : null,
     branchLifetimes: { count: lifetimes.length, medianHours: median(lifetimes) },
@@ -542,6 +545,7 @@ function summarizePrPatterns(prInfo, now) {
     .sort((a, b) => b.days - a.days);
   return {
     merged: merged.length,
+    all: group(merged),
     agent: group(merged.filter((pr) => agentFromBranch(pr.headRef))),
     other: group(merged.filter((pr) => !agentFromBranch(pr.headRef))),
     // An odd middle PR is left out so both halves hold the same number.
@@ -939,7 +943,7 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review 
     const missing = follow.withoutPr.length;
     if (missing / follow.settled >= 0.5) {
       const agents = follow.agentWithoutPr ? ` ${follow.agentWithoutPr} of them are agent branches.` : "";
-      add("info", FEED, `${missing} of ${plural(follow.settled, "branch")} created in the feed never got a pull request`,
+      add("info", FEED, `${missing} of ${plural(follow.settled, "branch", "branches")} created in the feed never got a pull request`,
         `Counting branches at least ${FOLLOW_GRACE_DAYS} days old. Oldest is ${follow.withoutPr[0].ref} in ${follow.withoutPr[0].repo}.${agents}`);
     }
   }
@@ -974,6 +978,383 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review 
 
   const rank = { warn: 0, good: 1, info: 1 };
   return out.sort((a, b) => rank[a.tone] - rank[b.tone]);
+}
+
+// ---------- Suggestions ----------
+// Further reading for suggestions. The renderer shows these titles, and the main process opens a link
+// only by its id here, after checking the URL against its own host allowlist.
+const READING = Object.freeze({
+  "google-small-cls": { title: "Small CLs", by: "Google Engineering Practices", kind: "Guide", url: "https://google.github.io/eng-practices/review/developer/small-cls.html" },
+  "google-speed": { title: "Speed of code reviews", by: "Google Engineering Practices", kind: "Guide", url: "https://google.github.io/eng-practices/review/reviewer/speed.html#fast" },
+  "gh-rulesets": { title: "Available rules for rulesets", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets" },
+  "gh-approve": { title: "Approving a pull request with required reviews", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/pull-requests/how-tos/review-pull-requests/approving-a-pull-request-with-required-reviews" },
+  "gh-codeowners": { title: "About code owners", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners" },
+  "gh-team-review": { title: "Managing code review settings for your team", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/organizations/organizing-members-into-teams/managing-code-review-settings-for-your-team#routing-algorithms" },
+  "gh-draft": { title: "Pull requests: draft pull requests", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/pull-requests/reference/pull-requests#draft-pull-requests" },
+  "gh-auto-delete": { title: "Managing the automatic deletion of branches", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-the-automatic-deletion-of-branches" },
+  "actions-stale": { title: "actions/stale", by: "GitHub Actions", kind: "Tool", url: "https://github.com/actions/stale" },
+  "gh-notifications": { title: "Managing GitHub Actions notifications", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/subscriptions-and-notifications/how-tos/managing-github-actions-notifications" },
+  "gh-labels": { title: "Filtering and searching issues and pull requests", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/filtering-and-searching-issues-and-pull-requests" },
+  "gh-issue-forms": { title: "Syntax for issue forms", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/syntax-for-issue-forms#top-level-syntax" },
+  "gh-pat": { title: "Managing your personal access tokens", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#types-of-personal-access-tokens" },
+  "gh-copilot-risks": { title: "Risks and mitigations for Copilot cloud agent", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/copilot/concepts/security-governance-and-network-settings/risks-and-mitigations#copilot-cloud-agent-can-push-code-changes-to-your-repository" },
+  "gh-readme": { title: "About the repository README file", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-readmes#about-readmes" },
+  "gh-topics": { title: "Classifying your repository with topics", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/classifying-your-repository-with-topics#about-topics" },
+  "gh-social-preview": { title: "Customizing your repository's social media preview", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/customizing-your-repositorys-social-media-preview" },
+  "chaoss-first-response": { title: "Time to First Response", by: "CHAOSS", kind: "Metric", url: "https://chaoss.community/kb/metric-time-to-first-response/" },
+  "bacchelli-2013": { title: "Expectations, Outcomes, and Challenges of Modern Code Review", by: "Bacchelli and Bird, ICSE 2013", kind: "Study", url: "https://doi.org/10.1109/ICSE.2013.6606617" },
+  "sadowski-2018": { title: "Modern Code Review: A Case Study at Google", by: "Sadowski et al., ICSE-SEIP 2018", kind: "Study", url: "https://doi.org/10.1145/3183519.3183525" },
+  "kudrjavets-2022": { title: "Do Small Code Changes Merge Faster? A Multi-Language Empirical Investigation", by: "Kudrjavets, Nagappan, and Rastogi, MSR 2022", kind: "Study", url: "https://doi.org/10.1145/3524842.3528448" },
+  "perry-2023": { title: "Do Users Write More Insecure Code with AI Assistants?", by: "Perry, Srivastava, Kumar, and Boneh, ACM CCS 2023", kind: "Study", url: "https://doi.org/10.1145/3576915.3623157" },
+  "meyer-2014": { title: "Software Developers' Perceptions of Productivity", by: "Meyer, Fritz, Murphy, and Zimmermann, FSE 2014", kind: "Study", url: "https://doi.org/10.1145/2635868.2635892" },
+  "mark-2008": { title: "The Cost of Interrupted Work: More Speed and Stress", by: "Mark, Gudith, and Klocke, CHI 2008", kind: "Study", url: "https://doi.org/10.1145/1357054.1357072" },
+  "parnin-2011": { title: "Resumption strategies for interrupted programming tasks", by: "Parnin and Rugaber, Software Quality Journal 2011", kind: "Study", url: "https://doi.org/10.1007/s11219-010-9104-9" },
+  "eyolfson-2011": { title: "Do Time of Day and Developer Experience Affect Commit Bugginess?", by: "Eyolfson, Tan, and Lam, MSR 2011", kind: "Study", url: "https://doi.org/10.1145/1985441.1985464" },
+  "mirsaeedi-2020": { title: "Mitigating Turnover with Code Review Recommendation", by: "Mirsaeedi and Rigby, ICSE 2020", kind: "Study", url: "https://doi.org/10.1145/3377811.3380335" },
+});
+
+const SUGGEST_MIN_MERGES = 3;
+const SUGGEST_REVIEW_WAIT_HOURS = 24;   // Google's one-business-day guideline, rounded to a day
+const SUGGEST_LARGE_LINES = 400;        // median merged lines that count as large
+const SUGGEST_STALE_DAYS = 14;
+const SUGGEST_WAITING_DAYS = 2;
+const SUGGEST_LATE_SHARE = 0.15;
+const SUGGEST_CI_SHARE = 0.4;
+
+const lines = (n) => Math.round(n).toLocaleString();
+const ageDays = (nowTime, at) => (nowTime - Date.parse(at)) / DAY_MS;
+
+// Each rule returns null when it checked the data and found nothing to suggest, { unavailable } when
+// its source did not load, { short } when the sample is below its minimum, or the suggestion.
+// `seen` describes the loaded data. Each `why` claim names its source; `act` is what to try.
+// Segments are [text, ...reading ids].
+const SUGGESTION_RULES = [
+  {
+    id: "review-before-merge", area: "Review", source: "Pull requests you opened",
+    title: "Get a second look before merging",
+    check: ({ review }) => {
+      if (!review) return { unavailable: "Pull request details did not load." };
+      if (review.merged < SUGGEST_MIN_MERGES) return { short: `Needs ${SUGGEST_MIN_MERGES} merged pull requests you opened; ${review.merged} loaded.` };
+      if (review.noHuman / review.merged < 0.5) return null;
+      const bots = review.botOnly ? ` ${review.botOnly} had only bot reviews.` : "";
+      const seen = `${review.noHuman} of your ${plural(review.merged, "merged pull request")} had no review from another person.${bots}`;
+      if (!review.reviewers.length) {
+        return {
+          tone: "warn",
+          seen: `${seen} Nobody else reviewed your pull requests in this window.`,
+          why: [
+            ["GitHub does not let authors approve their own pull requests, so a required approval has to come from someone else.", "gh-approve"],
+            ["A required status check works alone: merging waits until the checks you name pass. On GitHub Free, rulesets cover public repositories only.", "gh-rulesets"],
+          ],
+          act: [["Add a ruleset on your default branch with Require status checks to pass before merging, naming your tests and code scanning, and read the whole diff under Files changed before you merge."]],
+        };
+      }
+      return {
+        tone: "warn",
+        seen: `${seen}${review.selfMerged ? ` You merged ${review.selfMerged} yourself.` : ""}`,
+        why: [["Developers expect review to find defects, but in a study of reviews at Microsoft much of its value came from knowledge transfer, team awareness, and alternative solutions.", "bacchelli-2013"]],
+        act: [["Add a ruleset on your default branch with Require a pull request before merging and one required approval.", "gh-rulesets"]],
+      };
+    },
+  },
+  {
+    id: "review-agent-branches", area: "Review", source: "Pull requests",
+    title: "Review agent branches like a colleague's work",
+    check: ({ prPatterns: p }) => {
+      if (!p) return { unavailable: "Pull request details did not load." };
+      const a = p.agent;
+      if (a.count < SUGGEST_MIN_MERGES) return { short: `Needs ${SUGGEST_MIN_MERGES} merged agent-branch pull requests; ${a.count} loaded.` };
+      const o = p.other;
+      const gap = o.count >= SUGGEST_MIN_MERGES && a.unreviewed / a.count - o.unreviewed / o.count >= 0.3;
+      if (a.unreviewed / a.count < 0.5 && !gap) return null;
+      return {
+        tone: "warn",
+        seen: `${a.unreviewed} of ${plural(a.count, "agent-branch merge")} had no recorded review${o.count ? `, against ${o.unreviewed} of ${o.count} other merges` : ""}. Agent branches are matched by prefix, such as claude/ or codex/.`,
+        why: [
+          ["In a controlled study, participants with an AI code assistant wrote less secure code than those without one, and were more likely to believe their code was secure.", "perry-2023"],
+          ["GitHub's own coding agent is set up so the person who asked for its pull request cannot approve it.", "gh-copilot-risks"],
+        ],
+        act: [["Read an agent's diff before merging it, and require tests and code scanning to pass on the default branch.", "gh-rulesets"]],
+      };
+    },
+  },
+  {
+    id: "faster-first-review", area: "Review", source: "Pull requests you opened",
+    title: "Ask for a reviewer when you open the pull request",
+    check: ({ review }) => {
+      if (!review) return { unavailable: "Pull request details did not load." };
+      if (review.withHumanReview < 3) return { short: `Needs 3 of your pull requests with a review from another person; ${review.withHumanReview} loaded.` };
+      if (!(review.medianFirstReviewHours >= SUGGEST_REVIEW_WAIT_HOURS)) return null;
+      return {
+        tone: "info",
+        seen: `Your pull requests waited a median of ${durationLabel(review.medianFirstReviewHours)} for a first review from another person, across ${plural(review.withHumanReview, "pull request")}. Time as a draft counts toward the wait.`,
+        why: [["Google's review guide sets one business day as the maximum time to respond to a review request.", "google-speed"]],
+        act: [["Request a reviewer as you open it, or add a CODEOWNERS file so GitHub requests one automatically. Code owners are not requested on drafts until they are marked ready.", "gh-codeowners"]],
+        more: ["chaoss-first-response"],
+      };
+    },
+  },
+  {
+    id: "spread-reviews", area: "Review", source: "Pull requests you opened",
+    title: "Spread reviews beyond one person",
+    check: ({ review }) => {
+      if (!review) return { unavailable: "Pull request details did not load." };
+      if (review.withHumanReview < 4 || !review.reviewers.length) return { short: `Needs 4 of your pull requests with a review from another person; ${review.withHumanReview} loaded.` };
+      if (review.topReviewerShare < 0.6) return null;
+      const [name, count] = review.reviewers[0];
+      return {
+        tone: "info",
+        seen: `${name} reviewed ${plural(count, "pull request")} of yours, ${share(review.topReviewerShare)} of all reviewer visits.`,
+        why: [["Choosing reviewers to spread knowledge, not only by expertise, reduced the files at risk when a developer leaves.", "mirsaeedi-2020"]],
+        act: [["Name a second owner for your busiest paths in CODEOWNERS, or, in an organization, have a team assign reviewers by round robin or load balance.", "gh-team-review"]],
+      };
+    },
+  },
+  {
+    id: "smaller-prs", area: "Pull requests", source: "Pull requests",
+    title: "Split large pull requests",
+    check: ({ prPatterns: p }) => {
+      if (!p) return { unavailable: "Pull request details did not load." };
+      if (!p.smaller || !p.larger) return { short: `Needs 6 merged pull requests; ${p.merged} loaded.` };
+      const { smaller: s, larger: l } = p;
+      const slow = s.medianHours > 0 && l.medianHours != null && l.medianHours / s.medianHours >= 2;
+      const big = p.all.medianSize >= SUGGEST_LARGE_LINES;
+      if (!slow && !big) return null;
+      const skew = Math.abs(l.agent - s.agent) / l.count >= 0.3
+        ? ` Agent branches make up ${l.agent} of the larger half and ${s.agent} of the smaller, so branch type may explain part of the gap.` : "";
+      const seen = slow
+        ? `The larger half of loaded merges (median ${lines(l.medianSize)} lines) took ${durationLabel(l.medianHours)} to merge, the smaller half (${lines(s.medianSize)} lines) ${durationLabel(s.medianHours)}.${skew}`
+        : `Loaded merges changed a median of ${lines(p.all.medianSize)} lines.`;
+      return {
+        tone: "info",
+        seen,
+        why: [
+          ["Google's review guide says small changes are reviewed more quickly and more thoroughly, and are less likely to introduce bugs.", "google-small-cls"],
+          ["Across open-source projects the link between size and time to merge is weaker than that advice suggests, so your own numbers are the better guide.", "kudrjavets-2022"],
+        ],
+        act: [["Split by concern: refactors, renames, and generated files in their own pull requests, and dependent changes stacked one on another."]],
+      };
+    },
+  },
+  {
+    id: "settle-stale-prs", area: "Pull requests", source: "Pull requests you opened",
+    title: "Settle pull requests that have been open for weeks",
+    check: ({ prInfo }, { me, nowTime }) => {
+      if (!prInfo) return { unavailable: "Pull request details did not load." };
+      const stale = Object.values(prInfo).filter((pr) => pr?.title && pr.state === "OPEN" && me && String(pr.author || "").toLowerCase() === me)
+        .map((pr) => ({ pr, days: ageDays(nowTime, pr.createdAt) }))
+        .filter((r) => r.days >= SUGGEST_STALE_DAYS)
+        .sort((a, b) => b.days - a.days);
+      if (!stale.length || (stale.length < 2 && stale[0].days < 30)) return null;
+      const o = stale[0];
+      return {
+        tone: "warn",
+        seen: `${plural(stale.length, "pull request")} you opened ${stale.length === 1 ? "has" : "have"} been open more than two weeks. Oldest: ${o.pr.repo} #${o.pr.number}${o.pr.isDraft ? " (draft)" : ""}, ${plural(Math.floor(o.days), "day")}.`,
+        act: [
+          ["Decide each one: merge it, close it with a one-line reason, or convert it to a draft so it stops reading as ready.", "gh-draft"],
+          ["Where outside contributors open pull requests, actions/stale can label inactive ones and close them later.", "actions-stale"],
+        ],
+      };
+    },
+  },
+  {
+    id: "agree-before-building", area: "Pull requests", source: "Recent events",
+    title: "Agree on the approach before building",
+    check: ({ follow }) => {
+      if (!follow) return { unavailable: "No events loaded." };
+      const { merged, closed } = follow.outcomes;
+      const decided = merged + closed;
+      if (decided < 4) return { short: `Needs 4 finished pull requests opened in the loaded events; ${decided} found.` };
+      if (closed / decided < 0.3) return null;
+      const agents = follow.closed.filter((c) => c.agent).length;
+      return {
+        tone: "info",
+        seen: `${closed} of ${plural(decided, "finished pull request")} you opened in the loaded events closed without merging${agents ? `, ${agents} of them from agent branches` : ""}.`,
+        act: [["For larger changes, open an issue or a draft pull request first and settle the approach before polishing it.", "gh-draft"]],
+      };
+    },
+  },
+  {
+    id: "branches-without-prs", area: "Branches", source: "Recent events",
+    title: "Open a draft pull request early, or delete the branch",
+    check: ({ follow }) => {
+      if (!follow) return { unavailable: "No events loaded." };
+      if (follow.settled < 4) return { short: `Needs 4 branches created in the loaded events and at least 2 days old; ${follow.settled} found.` };
+      const n = follow.withoutPr.length;
+      if (n / follow.settled < 0.5) return null;
+      const o = follow.withoutPr[0];
+      return {
+        tone: "info",
+        seen: `${n} of ${plural(follow.settled, "branch", "branches")} created in the loaded events have no pull request${follow.agentWithoutPr ? `, ${follow.agentWithoutPr} of them agent branches` : ""}. Oldest: ${o.ref} in ${o.repo}.`,
+        act: [
+          ["Open a draft pull request once a branch has a direction, so the work is visible.", "gh-draft"],
+          ["Delete branches you have abandoned, and turn on Automatically delete head branches so merged ones go too.", "gh-auto-delete"],
+        ],
+      };
+    },
+  },
+  {
+    id: "answer-waiting-threads", area: "Conversations", source: "Conversations",
+    title: "Answer replies waiting on your threads",
+    check: ({ conversations }, { me, nowTime }) => {
+      if (!conversations) return { unavailable: "Conversations did not load." };
+      // Items are newest first, so the first item per thread is its latest loaded comment.
+      const latest = new Map();
+      for (const c of conversations.items) {
+        const key = `${c.thread.repo}#${c.thread.number}`;
+        if (!latest.has(key)) latest.set(key, c);
+      }
+      const waiting = [...latest.values()]
+        .filter((c) => c.thread.state === "open" && me && String(c.thread.author).toLowerCase() === me && !c.mine && !c.bot)
+        .map((c) => ({ c, days: ageDays(nowTime, c.at) }))
+        .filter((r) => r.days >= SUGGEST_WAITING_DAYS)
+        .sort((a, b) => b.days - a.days);
+      if (waiting.length < 2) return null;
+      const o = waiting[0];
+      return {
+        tone: "info",
+        seen: `${waiting.length} open issues or pull requests you opened end with a reply from someone else, ${SUGGEST_WAITING_DAYS} or more days old. Oldest: ${o.c.thread.repo} #${o.c.thread.number}, from ${o.c.author}, ${plural(Math.floor(o.days), "day")} ago.`,
+        act: [["Reply, resolve, or close each thread. If one no longer needs you, close it with a note so nobody keeps waiting."]],
+      };
+    },
+  },
+  {
+    id: "batch-by-repo", area: "Focus", source: "Recent events",
+    title: "Give each repository its own block of time",
+    check: ({ sessions }) => {
+      if (!sessions) return { unavailable: "No events loaded." };
+      if (sessions.multi < 4) return { short: `Needs 4 work sessions with several events; ${sessions.multi} found.` };
+      if (sessions.multiRepo / sessions.multi < 0.5) return null;
+      return {
+        tone: "info",
+        seen: `${sessions.multiRepo} of ${plural(sessions.multi, "work session")} crossed repositories. A session is a run of events with gaps under an hour.`,
+        why: [
+          ["Developers rated days with few context switches and interruptions as their most productive.", "meyer-2014"],
+          ["In a lab study, interrupted people finished as fast but reported more stress, frustration, and time pressure.", "mark-2008"],
+        ],
+        act: [["Work one repository per block, and batch cross-repository chores such as dependency bumps into one session."]],
+      };
+    },
+  },
+  {
+    id: "re-entry-notes", area: "Focus", source: "Contribution year",
+    title: "Leave yourself a next step before a break",
+    check: ({ trajectory: t }) => {
+      if (!t) return { unavailable: "The contribution calendar did not load." };
+      if (!t.afterActive || !t.afterIdle) return { short: "Needs at least 10 days after active days and 10 after idle days." };
+      if (t.afterActive.rate - t.afterIdle.rate < 0.3) return null;
+      return {
+        tone: "info",
+        seen: `After an active day you were active again ${share(t.afterActive.rate)} of the time; after an idle day, ${share(t.afterIdle.rate)}. Restarting is the harder step.`,
+        why: [["Programmers resuming interrupted work rarely started editing right away, and relied on notes and other cues to rebuild context.", "parnin-2011"]],
+        act: [["Before you stop, write the next concrete step in the issue or pull request, or leave a failing test, so the first move back is obvious."]],
+      };
+    },
+  },
+  {
+    id: "late-night-review", area: "Focus", source: "Recent events",
+    title: "Review late-night changes the next day",
+    check: ({ sessions }) => {
+      if (!sessions) return { unavailable: "No events loaded." };
+      if (sessions.timed < 20) return { short: `Needs 20 timed events; ${sessions.timed} loaded.` };
+      if (sessions.lateNight < 5 || sessions.lateNight / sessions.timed < SUGGEST_LATE_SHARE) return null;
+      return {
+        tone: "info",
+        seen: `${share(sessions.lateNight / sessions.timed)} of loaded events (${sessions.lateNight.toLocaleString()}) happened between midnight and 4am, local time.`,
+        why: [["In the Linux kernel and PostgreSQL histories, commits made between midnight and 4am were more likely to introduce bugs.", "eyolfson-2011"]],
+        act: [["Open late-night work as a draft and read the diff the next day before merging."]],
+      };
+    },
+  },
+  {
+    id: "ci-notifications", area: "Notifications", source: "Unread notifications",
+    title: "Get Actions notifications only for failures",
+    check: ({ notes }) => {
+      if (!notes) return { unavailable: "Unread notifications need a classic token with the notifications scope." };
+      if (notes.unread < 10) return { short: `Needs 10 unread notifications; ${notes.unread} loaded.` };
+      if (notes.ciNoise / notes.unread < SUGGEST_CI_SHARE) return null;
+      return {
+        tone: "info",
+        seen: `${notes.ciNoise} of ${plural(notes.unread, "unread notification")} are routine CI updates.`,
+        act: [["In GitHub's notification settings, under GitHub Actions, choose Only notify for failed workflows.", "gh-notifications"]],
+      };
+    },
+  },
+  {
+    id: "labels-not-prefixes", area: "Issues", source: "Recent events",
+    title: "Use labels instead of title prefixes",
+    check: ({ ev }) => {
+      if (!ev) return { unavailable: "No events loaded." };
+      const n = sum(ev.tags.map(([, k]) => k));
+      if (n < 3) return null;
+      return {
+        tone: "info",
+        seen: `${plural(n, "issue")} you opened in the loaded events start with a bracketed tag: ${ev.tags.slice(0, 3).map(([t]) => `[${t}]`).join(", ")}.`,
+        why: [["Labels let you find issues and pull requests by label, for example label:\"bug\".", "gh-labels"]],
+        act: [["Create matching labels and apply them instead. An issue form can add existing labels automatically.", "gh-issue-forms"]],
+      };
+    },
+  },
+  {
+    id: "readme-first-screen", area: "Visibility", source: "Repository traffic",
+    title: "Make the README's first screen do the work",
+    check: ({ footprint }) => {
+      if (!footprint) return { unavailable: "Repository traffic did not load." };
+      const quiet = footprint.rows.filter((r) => r.uniques >= FOOTPRINT_MIN_VISITORS && r.stars14 === 0)
+        .sort((a, b) => b.uniques - a.uniques);
+      if (!quiet.length) return null;
+      const o = quiet[0];
+      return {
+        tone: "info",
+        seen: `${o.repo} had ${o.uniques.toLocaleString()} unique visitors in 14 days and no new stars${quiet.length > 1 ? `, and so did ${plural(quiet.length - 1, "other repository", "other repositories")}` : ""}.`,
+        why: [["A README is often the first item a visitor will see.", "gh-readme"], ["Topics help other people find and contribute to a project.", "gh-topics"]],
+        act: [["Open the README with what the project does, a screenshot or example of it working, and how to start. Then add topics and, for a public repository, a social preview image.", "gh-social-preview"]],
+      };
+    },
+  },
+  {
+    id: "fine-grained-token", area: "Access", source: "Token check",
+    title: "Switch to a read-only fine-grained token",
+    check: ({ token }) => {
+      if (!token || !token.kind) return { unavailable: "GitHub has not reported the token type." };
+      if (token.kind !== "classic") return null;
+      if (!token.write) return { unavailable: "GitHub has not reported this token's scopes." };
+      if (!token.write.length) return null;
+      return {
+        tone: "warn",
+        seen: `This classic token has ${token.write.length === 1 ? "a scope that allows" : "scopes that allow"} writes: ${token.write.join(", ")}. Activity Desk only reads.`,
+        why: [["GitHub recommends fine-grained tokens over classic ones whenever possible.", "gh-pat"]],
+        act: [["Create a fine-grained token with only the read permissions in Quick start, sign in with it, and revoke the classic token."]],
+      };
+    },
+  },
+];
+
+// Suggestions built on the loaded summaries. Returns the suggestions that apply and, for every rule,
+// whether it was shown, found nothing, lacked data, or lacked a source, so the view can say what it checked.
+function deriveSuggestions(input) {
+  const x = input || {};
+  const me = String(x.login || "").toLowerCase();
+  const nowTime = x.now == null ? Date.now() : new Date(x.now).getTime();
+  const items = [];
+  const checked = [];
+  for (const rule of SUGGESTION_RULES) {
+    const result = rule.check(x, { me, nowTime });
+    const base = { id: rule.id, area: rule.area, source: rule.source, title: rule.title };
+    if (!result) checked.push({ ...base, status: "clear" });
+    else if (result.unavailable) checked.push({ ...base, status: "unavailable", detail: result.unavailable });
+    else if (result.short) checked.push({ ...base, status: "short", detail: result.short });
+    else {
+      // Number the sources in the order the text cites them, then any further reading.
+      const cited = [...(result.why || []), ...(result.act || [])].flatMap((segment) => segment.slice(1));
+      const reading = [...new Set([...cited, ...(result.more || [])])].filter((id) => Object.hasOwn(READING, id));
+      items.push({ ...base, tone: result.tone, seen: result.seen, why: result.why || [], act: result.act || [], reading });
+      checked.push({ ...base, status: "shown" });
+    }
+  }
+  const rank = { warn: 0, info: 1 };
+  items.sort((a, b) => rank[a.tone] - rank[b.tone]);
+  return { items, checked };
 }
 
 function summarizeNotifications(items) {
@@ -1473,6 +1854,8 @@ const api = {
   filterConversations,
   CONVERSATION_FILTERS,
   deriveObservations,
+  deriveSuggestions,
+  READING,
   durationLabel,
   filterEvents,
   isMinor,

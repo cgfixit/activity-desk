@@ -51,6 +51,7 @@
       <button class="nav active" data-tab="overview" type="button" aria-current="page"><span class="ico" aria-hidden="true">◎</span>Overview</button>
       <button class="nav" data-tab="stream" type="button"><span class="ico" aria-hidden="true">≡</span>Stream <span class="badge hidden" id="fresh-badge"></span></button>
       <button class="nav" data-tab="insights" type="button"><span class="ico" aria-hidden="true">◇</span>Insights</button>
+      <button class="nav" data-tab="suggestions" type="button"><span class="ico" aria-hidden="true">✦</span>Suggestions <span class="count" id="suggestion-count"></span></button>
       <button class="nav" data-tab="meta" type="button"><span class="ico" aria-hidden="true">ⓘ</span>Data &amp; access</button>
       <div class="sidebar-foot">
         <button class="btn ghost wide" id="refresh" type="button">Refresh</button>
@@ -123,6 +124,14 @@
           <button type="button" data-source="footprint" aria-pressed="false" aria-controls="insights">Footprint</button>
         </div>
         <div id="insights"></div>
+      </section>
+
+      <section data-view="suggestions" class="view hidden">
+        <header class="view-head">
+          <h2>Suggestions</h2>
+          <p class="lede" id="suggestions-caption"></p>
+        </header>
+        <div id="suggestions" class="suggestions"></div>
       </section>
 
       <section data-view="meta" class="view hidden">
