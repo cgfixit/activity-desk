@@ -1211,6 +1211,147 @@ function summarizeFootprint(fp, saved, now) {
   return { rows, totals, weeks, coveredDays, firstSaved, trend, referrers, newReferrers, historyStart, findings };
 }
 
+// ---------- Contribution history across calendar years ----------
+const HISTORY_MIN_YEAR_TOTAL = 50;
+const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+// byYear: { [year]: contributionsCollection for that calendar year }. todayKey: local YYYY-MM-DD.
+function summarizeContributionHistory(byYear, todayKey, createdAt) {
+  const thisYear = Number(String(todayKey).slice(0, 4));
+  const createdYear = createdAt ? new Date(createdAt).getUTCFullYear() : null;
+  const years = [];
+  const allDays = [];
+  for (const [key, c] of Object.entries(byYear || {})) {
+    const year = Number(key);
+    const days = [];
+    for (const week of c?.contributionCalendar?.weeks || []) {
+      for (const d of week.contributionDays || []) {
+        if (typeof d?.date === "string" && d.date.startsWith(`${year}-`) && d.date <= todayKey && Number.isFinite(d.contributionCount)) days.push(d);
+      }
+    }
+    days.sort((a, b) => a.date.localeCompare(b.date));
+    let run = 0;
+    let longest = 0;
+    const monthly = Array(12).fill(0);
+    const weekday = Array(7).fill(0);
+    for (const d of days) {
+      run = d.contributionCount > 0 ? run + 1 : 0;
+      longest = Math.max(longest, run);
+      monthly[Number(d.date.slice(5, 7)) - 1] += d.contributionCount;
+      weekday[new Date(`${d.date}T00:00:00Z`).getUTCDay()] += d.contributionCount;
+    }
+    const total = days.reduce((a, d) => a + d.contributionCount, 0);
+    allDays.push(...days);
+    years.push({
+      year, total, days: days.length,
+      activeDays: days.filter((d) => d.contributionCount > 0).length,
+      longestStreak: longest,
+      commits: c?.totalCommitContributions || 0,
+      prs: c?.totalPullRequestContributions || 0,
+      issues: c?.totalIssueContributions || 0,
+      reviews: c?.totalPullRequestReviewContributions || 0,
+      restricted: c?.restrictedContributionsCount || 0,
+      monthly, weekday,
+      weekendShare: total ? (weekday[0] + weekday[6]) / total : null,
+      // A full year: before this year, and not the year the account was created.
+      complete: year < thisYear && (createdYear == null || year > createdYear),
+      partial: year === thisYear,
+    });
+  }
+  years.sort((a, b) => a.year - b.year);
+  allDays.sort((a, b) => a.date.localeCompare(b.date));
+
+  // Records across years, so a streak that crosses New Year counts once.
+  let run = 0;
+  let runStart = null;
+  let bestRun = { days: 0, start: null, end: null };
+  let lastActive = null;
+  let bestGap = { days: 0, start: null, end: null };
+  let prevTime = null;
+  for (const d of allDays) {
+    const time = Date.parse(`${d.date}T00:00:00Z`);
+    if (prevTime != null && time - prevTime !== DAY_MS) run = 0;
+    prevTime = time;
+    if (d.contributionCount > 0) {
+      if (run === 0) runStart = d.date;
+      run += 1;
+      if (run > bestRun.days) bestRun = { days: run, start: runStart, end: d.date };
+      if (lastActive) {
+        const gap = Math.round((time - Date.parse(`${lastActive}T00:00:00Z`)) / DAY_MS) - 1;
+        if (gap > bestGap.days) bestGap = { days: gap, start: lastActive, end: d.date };
+      }
+      lastActive = d.date;
+    } else run = 0;
+  }
+  const busiestDay = allDays.reduce((best, d) => (!best || d.contributionCount > best.contributionCount ? d : best), null);
+
+  // Year to date against the same date last year.
+  const current = years.find((y) => y.year === thisYear);
+  const last = years.find((y) => y.year === thisYear - 1);
+  let pace = null;
+  if (current && last && last.days) {
+    const cutoff = `${thisYear - 1}${String(todayKey).slice(4)}`;
+    const lastYtd = allDays.filter((d) => d.date.startsWith(`${thisYear - 1}-`) && d.date <= cutoff).reduce((a, d) => a + d.contributionCount, 0);
+    pace = { ytd: current.total, lastYtd, change: lastYtd ? (current.total - lastYtd) / lastYtd : null };
+  }
+
+  // Seasonality across full years: each year's monthly share, averaged, so a big year does not dominate.
+  const full = years.filter((y) => y.complete && y.total >= HISTORY_MIN_YEAR_TOTAL);
+  let seasons = null;
+  if (full.length >= 2) {
+    const share = Array.from({ length: 12 }, (_, m) => sum(full.map((y) => y.monthly[m] / y.total)) / full.length);
+    const peak = share.indexOf(Math.max(...share));
+    const low = share.indexOf(Math.min(...share));
+    const peakYears = full.filter((y) => {
+      const ranked = y.monthly.map((n, m) => [n, m]).sort((a, b) => b[0] - a[0]).slice(0, 3).map(([, m]) => m);
+      return ranked.includes(peak);
+    }).length;
+    seasons = { share, peak, low, years: full.length, peakYears };
+  }
+
+  const findings = [];
+  const add = (tone, title, detail) => findings.push({ tone, source: "Contribution history", title, detail });
+  const pctText = (x) => `${Math.round(Math.abs(x) * 100)}%`;
+  if (pace && pace.change != null && pace.lastYtd >= HISTORY_MIN_YEAR_TOTAL && Math.abs(pace.change) >= 0.1) {
+    add(pace.change > 0 ? "good" : "warn", `${pctText(pace.change)} ${pace.change > 0 ? "ahead of" : "behind"} last year's pace`,
+      `${pace.ytd.toLocaleString()} contributions so far this year against ${pace.lastYtd.toLocaleString()} by the same date last year.`);
+  }
+  const ranked = full.slice().sort((a, b) => b.total - a.total);
+  if (ranked.length >= 2) {
+    add("info", `${ranked[0].year} was your busiest full year`,
+      `${ranked[0].total.toLocaleString()} contributions on ${ranked[0].activeDays} active days. The next was ${ranked[1].year} with ${ranked[1].total.toLocaleString()}.`);
+  }
+  const lastTwo = full.slice(-2);
+  if (lastTwo.length === 2) {
+    const [a, b] = lastTwo;
+    const change = (b.total - a.total) / a.total;
+    if (Math.abs(change) >= 0.25) {
+      add(change > 0 ? "good" : "info", `${b.year} ${change > 0 ? "grew" : "fell"} ${pctText(change)} on ${a.year}`,
+        `${b.total.toLocaleString()} contributions against ${a.total.toLocaleString()}. Active days went from ${a.activeDays} to ${b.activeDays}.`);
+    }
+  }
+  if (seasons && seasons.share[seasons.peak] >= 0.13 && seasons.peakYears * 2 >= seasons.years) {
+    add("info", `${MONTH_NAMES[seasons.peak]} is your strongest month`,
+      `It averaged ${pctText(seasons.share[seasons.peak])} of each full year's contributions across ${seasons.years} years, and was a top-three month in ${seasons.peakYears} of them. An even spread would be 8%.`);
+  }
+  const weekendYears = full.filter((y) => y.total >= 100 && y.weekendShare != null);
+  if (weekendYears.length >= 2) {
+    const first = weekendYears[0];
+    const latest = weekendYears.at(-1);
+    const shift = latest.weekendShare - first.weekendShare;
+    if (Math.abs(shift) >= 0.15) {
+      add("info", `Weekend work ${shift > 0 ? "rose" : "fell"} from ${pctText(first.weekendShare)} to ${pctText(latest.weekendShare)}`,
+        `Share of contributions on Saturdays and Sundays in ${first.year} against ${latest.year}.`);
+    }
+  }
+  if (bestRun.days >= 7) {
+    add("info", `Longest streak: ${bestRun.days} days`, `From ${bestRun.start} to ${bestRun.end}, across every year loaded.`);
+  }
+
+  return { years, bestRun, bestGap, busiestDay, pace, seasons, findings,
+    restricted: sum(years.map((y) => y.restricted)), total: sum(years.map((y) => y.total)) };
+}
+
 const api = {
   eventLabel,
   repoName,
@@ -1247,6 +1388,7 @@ const api = {
   classicScopes,
   summarizeRateLimit,
   summarizeFootprint,
+  summarizeContributionHistory,
 };
 
 if (typeof module !== "undefined" && module.exports) module.exports = api;
