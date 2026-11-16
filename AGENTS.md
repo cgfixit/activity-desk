@@ -4,13 +4,14 @@ The workspace copy of `Activity Desk.app` is the starting point. Its unpacked ap
 
 ## Code map
 
-- `main.js` owns the window, tray, token storage, authenticated GitHub requests, the encrypted saved history it records from those responses, and the encrypted per-account notes behind Stream → Notes. `preload.js` exposes the `window.desk` IPC bridge.
-- `renderer.js` loads GitHub REST and GraphQL data and renders Overview, Stream, Insights, and Data & access. `insights.js` computes the summaries and comment text and can be required from Node. `notes.js` formats notes for display and can be required from Node.
+- `main.js` owns the window, tray, token storage, authenticated GitHub requests, the encrypted saved history it records from those responses, and the encrypted per-account notes behind Stream → Notes. It also opens Suggestions' further-reading links by catalogue id. `preload.js` exposes the `window.desk` IPC bridge.
+- `renderer.js` loads GitHub REST and GraphQL data and renders Overview, Stream, Insights, Suggestions, and Data & access. `insights.js` computes the summaries, comment text, the suggestion rules, and the `READING` catalogue of sources. It can be required from Node. `notes.js` formats notes for display and can be required from Node.
 - `index.html` defines the views and Content Security Policy. `styles.css` controls their layout. `Activity Desk.app/Contents/Info.plist` holds the macOS bundle metadata.
 
 ## Working on the app
 
 - Preserve renderer sandboxing, context isolation, disabled Node integration, and the renderer's network restrictions. Keep stored credentials in the main process. Enforce read-only GitHub operations at the main-process boundary.
 - Distinguish the recent Events feed, sampled pull-request details, and the contribution year. Show capped, partial, and unavailable results explicitly when changing summaries.
+- Give each suggestion a minimum sample. Cite a `READING` entry for every claim in its Why text, and check the claim against the source first. The main process opens only catalogued links whose host is in `READING_HOSTS`.
 - Use `node --check` on changed JavaScript and run the affected behavior with synthetic GitHub responses. The package has no build or test scripts. The HTML requires the preload bridge for authenticated views.
 - For native verification, use a scratch bundle with a distinct app identity. Set Electron's `userData` and `sessionData` to a verified temporary directory before startup and use synthetic tokens. Confirm Computer Use is attached to the scratch bundle before interacting with it.
