@@ -366,6 +366,7 @@ const YEAR_QUERY = `query {
     followers { totalCount }
     repositories(ownerAffiliations: OWNER) { totalCount }
     contributionsCollection {
+      contributionYears
       totalCommitContributions totalIssueContributions totalPullRequestContributions
       totalPullRequestReviewContributions restrictedContributionsCount totalRepositoriesWithContributedCommits
       contributionCalendar { totalContributions weeks { contributionDays { date contributionCount } } }
@@ -410,6 +411,13 @@ const AUTHORED_QUERY = `query ($q: String!, $after: String) {
 const CURSOR = /^[A-Za-z0-9+/=_:-]{1,256}$/;
 const LOGIN = /^[A-Za-z0-9-]{1,39}$/;
 const RATE_RESOURCES = ["core", "graphql"];
+
+// Calendar years of contributions, batched into one GraphQL request with an alias per year.
+// GitHub limits a contributionsCollection range to one year, so each alias covers one calendar year.
+const HISTORY_YEARS_MAX = 20;
+const HISTORY_FIELDS = `totalCommitContributions totalIssueContributions totalPullRequestContributions
+  totalPullRequestReviewContributions restrictedContributionsCount
+  contributionCalendar { totalContributions weeks { contributionDays { date contributionCount } } }`;
 const TRAFFIC_ROUTES = { views: "views?per=day", clones: "clones?per=day", referrers: "popular/referrers" };
 
 function validRepo(value) {
@@ -435,6 +443,23 @@ function githubRequest(operation, args) {
       return { route: "/graphql", body: { query: AUTHORED_QUERY, variables: { q: `author:${login} is:pr created:>=${since} sort:created-desc`, after: after ?? null } } };
     }
     case "rateLimit": return { route: "/rate_limit" };
+    case "contributionHistory": {
+      const current = new Date().getUTCFullYear();
+      const years = args?.years;
+      if (!Array.isArray(years) || years.length < 1 || years.length > HISTORY_YEARS_MAX ||
+          new Set(years).size !== years.length ||
+          !years.every((y) => Number.isInteger(y) && y >= 2008 && y <= current)) break;
+      const declarations = [];
+      const fields = [];
+      const variables = {};
+      for (const y of years) {
+        declarations.push(`$f${y}: DateTime!, $t${y}: DateTime!`);
+        fields.push(`y${y}: contributionsCollection(from: $f${y}, to: $t${y}) { ${HISTORY_FIELDS} }`);
+        variables[`f${y}`] = `${y}-01-01T00:00:00Z`;
+        variables[`t${y}`] = y === current ? new Date().toISOString() : `${y}-12-31T23:59:59Z`;
+      }
+      return { route: "/graphql", body: { query: `query (${declarations.join(", ")}) { viewer { ${fields.join("\n")} } }`, variables } };
+    }
     case "ownedRepos": return { route: "/user/repos?affiliation=owner&sort=pushed&per_page=100" };
     case "traffic": {
       const { repo, kind } = args || {};

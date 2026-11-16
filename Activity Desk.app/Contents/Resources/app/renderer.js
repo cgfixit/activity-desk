@@ -11,7 +11,8 @@ const PR_LOOKUP_LIMIT = 40;
 const AUTHORED_PAGES = 3; // 100 pull requests per page
 const AUTHORED_DAYS = 90; // matches the authored search window in main.js
 const FOOTPRINT_REPOS = 10; // most recently pushed repositories you own
-const STAR_DATES_MAX = 100; // star dates are read for repositories with at most one page of stars
+const STAR_DATES_MAX = 100;
+const HISTORY_YEARS = 20; // matches the batched year limit in main.js // star dates are read for repositories with at most one page of stars
 const TRAFFIC_CONCURRENCY = 4;
 const GLYPHS = { PushEvent: "↑", PullRequestEvent: "⇄", IssuesEvent: "◉", IssueCommentEvent: "✎", CreateEvent: "+", DeleteEvent: "−", PullRequestReviewEvent: "✓", ReleaseEvent: "◆", WatchEvent: "★", ForkEvent: "⑂" };
 const CHIPS = [["all", "All"], ["push", "Pushes"], ["pr", "Pull requests"], ["issue", "Issues"], ["comment", "Comments"], ["branch", "Branches"], ["agent", "Agents"]];
@@ -30,6 +31,7 @@ const initialState = {
   tokenMeta: null,
   footprint: null,
   savedHistory: null,
+  contributionHistory: null,
   contributions: null,
   notifications: null,
   errors: {},
@@ -283,13 +285,22 @@ async function refresh() {
       pendingRefs = refs.filter((r) => !found?.info[I.prKey(r.repo, r.number)]);
       return lookupPullRequests(account, pendingRefs);
     });
-    const [notes, year, prs, talk, authored, footprint] = await Promise.allSettled([
+    // Every calendar year GitHub lists, read in one batched request once the year query returns them.
+    const yearTask = api(account, "year");
+    const historyTask = yearTask.then(({ data }) => {
+      const listed = data?.data?.viewer?.contributionsCollection?.contributionYears;
+      const years = (Array.isArray(listed) ? listed : []).filter(Number.isInteger).sort((a, b) => b - a).slice(0, HISTORY_YEARS);
+      if (!years.length) throw new Error("GitHub listed no contribution years.");
+      return api(account, "contributionHistory", { years }).then((result) => ({ ...result, years, listed: listed.length }));
+    });
+    const [notes, year, prs, talk, authored, footprint, yearsResult] = await Promise.allSettled([
       fineGrained ? null : api(account, "notifications"),
-      api(account, "year"),
+      yearTask,
       lookupTask,
       api(account, "conversations", { login: user.login }),
       authoredTask,
       loadFootprint(account),
+      historyTask,
     ]);
     if (account !== state) return;
     // Read last so the budget reflects this refresh. GitHub does not count this call against the limit.
@@ -342,6 +353,21 @@ async function refresh() {
       else if (fpLoad.saved.note) errors.history = fpLoad.saved.note;
     }
     const footprintData = fpLoad ? fpLoad.fp : null;
+
+    const yearsData = yearsResult.value?.data;
+    let contributionHistory = null;
+    if (yearsData?.data?.viewer) {
+      const byYear = {};
+      for (const y of yearsResult.value.years) {
+        const c = yearsData.data.viewer[`y${y}`];
+        if (Array.isArray(c?.contributionCalendar?.weeks)) byYear[y] = c;
+      }
+      const missing = yearsResult.value.years.filter((y) => !byYear[y]);
+      if (Object.keys(byYear).length) contributionHistory = { byYear, missing, listed: yearsResult.value.listed };
+      if (missing.length) errors.years = `GitHub did not return ${missing.length === 1 ? "the year" : "the years"} ${missing.sort().join(", ")}.`;
+      if (yearsResult.value.listed > HISTORY_YEARS) errors.years = `${errors.years ? `${errors.years} ` : ""}Showing the latest ${HISTORY_YEARS} of ${yearsResult.value.listed} years.`;
+    }
+    if (!contributionHistory) errors.years = `Contribution history did not load. ${yearsResult.reason?.message || ""}`.trim();
     const savedHistory = fpLoad?.saved?.ok ? fpLoad.saved : null;
 
     const talkData = talk.value?.data;
@@ -354,7 +380,7 @@ async function refresh() {
     } else if (!conversations) errors.conversations = `Conversations did not load. ${talkProblem}`;
     else if (talkData.errors?.length) errors.conversations = "Some conversations could not be read with this token.";
 
-    Object.assign(account, { user, viewer, contributions, events, notifications, prLookup, prInfo, rateLimit, footprint: footprintData, savedHistory, conversations, errors, refreshedAt: new Date() });
+    Object.assign(account, { user, viewer, contributions, events, notifications, prLookup, prInfo, rateLimit, footprint: footprintData, savedHistory, contributionHistory, conversations, errors, refreshedAt: new Date() });
     if (!events.some((e) => I.repoName(e) === account.repo)) account.repo = "";
     account.lastSeen = localStorage.getItem(seenKey());
     if (!account.lastSeen && newestActivity(account)) {
@@ -402,7 +428,9 @@ function computed() {
   const review = I.summarizeReviewFlow(state.prInfo, state.user && state.user.login);
   const observations = I.deriveObservations({ rhythm, sessions, prs: prPatterns, trajectory, follow, review });
   const footprint = state.footprint ? I.summarizeFootprint(state.footprint, state.savedHistory, state.refreshedAt) : null;
-  return { ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, observations, footprint };
+  const years = state.contributionHistory
+    ? I.summarizeContributionHistory(state.contributionHistory.byYear, localDayKey(new Date()), state.viewer?.createdAt) : null;
+  return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, observations, footprint };
 }
 
 function renderOverview(c) {
@@ -416,6 +444,8 @@ function renderOverview(c) {
     parts.push(`${fmt(year.last30)} contributions in the last 30 days${trend}.`);
   }
   if (ev.agentEvents) parts.push(`${pct(ev.agentShare)} of loaded events matched a known agent app or branch prefix.`);
+  const pace = c.years?.pace;
+  if (pace?.change != null) parts.push(`${fmt(pace.ytd)} contributions so far this year, ${pct(Math.abs(pace.change))} ${pace.change >= 0 ? "ahead of" : "behind"} the same date last year.`);
   const fpt = c.footprint?.totals;
   if (fpt?.views != null) parts.push(`${fmt(fpt.views)} page views across ${fmt(fpt.withTraffic)} of your repositories in the last 14 days.`);
   $("summary").innerHTML = parts.join(" ");
@@ -906,6 +936,45 @@ function authoredCoverage() {
   return ` (${window}${older ? `, plus ${fmt(older)} older ${older === 1 ? "one" : "ones"} referenced in recent events` : ""})`;
 }
 
+function historyInsights(h) {
+  const notice = state.errors.years ? `<p class="insight-notice">${esc(state.errors.years)}</p>` : "";
+  if (!h || !h.years.length) return insightSection("insight-history", "All years", "Unavailable", notice || '<p class="card muted">Contribution history did not load.</p>');
+  const first = h.years[0].year;
+  const last = h.years.at(-1).year;
+  const caption = `${fmt(h.total)} contributions · ${first === last ? first : `${first}–${last}`} · calendar years`;
+  const findings = h.findings.length
+    ? `<ul class="attention">${h.findings.map((o) => `<li class="${esc(o.tone)}"><span class="dot"></span><div><div class="t">${esc(o.title)}</div><div class="d">${esc(o.detail)}</div>${sourceTag(o.source)}</div></li>`).join("")}</ul>`
+    : '<p class="note">Nothing crossed a reporting threshold. Year comparisons need two full years with at least 50 contributions each.</p>';
+  const yearLabel = (y) => `${y.year}${y.partial ? " (so far)" : !y.complete ? " (partial)" : ""}`;
+  const table = `<table class="compare"><caption class="note">Calendar years, oldest first</caption>
+    <thead><tr><th scope="col">Year</th><th scope="col">Total</th><th scope="col">Active days</th><th scope="col">Longest streak</th><th scope="col">Commits</th><th scope="col">PRs</th><th scope="col">Reviews</th><th scope="col">Issues</th><th scope="col">Weekends</th></tr></thead>
+    <tbody>${h.years.map((y) => `<tr><th scope="row">${esc(yearLabel(y))}</th><td>${fmt(y.total)}</td><td>${fmt(y.activeDays)}</td><td>${fmt(y.longestStreak)} d</td><td>${fmt(y.commits)}</td><td>${fmt(y.prs)}</td><td>${fmt(y.reviews)}</td><td>${fmt(y.issues)}</td><td>${pct(y.weekendShare)}</td></tr>`).join("")}</tbody></table>`;
+  const seasons = h.seasons
+    ? `${bars(h.seasons.share.map((x, m) => [MONTHS[m], Math.round(x * 100)]), { suffix: "%" })}
+       <p class="note">Each full year's share of contributions by month, averaged across ${fmt(h.seasons.years)} years so one busy year does not dominate. An even spread is about 8% a month.</p>`
+    : '<p class="note">Seasonality needs two full calendar years with at least 50 contributions each. The year the account was created and the current year are not full years.</p>';
+  const range = (r) => r.start ? `${esc(r.start)} to ${esc(r.end)}` : "";
+  return insightSection("insight-history", "All years", caption, `
+    ${notice}
+    ${h.restricted ? `<p class="insight-notice">${fmt(h.restricted)} restricted contributions are counted without details across these years.</p>` : ""}
+    <div class="grid insights">
+      <article class="card insight-wide"><h4>What stands out</h4>${findings}</article>
+      <article class="card"><h4>Contributions by year</h4>${sourceTag("Contribution history")}
+        ${bars(h.years.map((y) => [yearLabel(y), y.total]))}
+        ${h.pace ? `<p class="note">${fmt(h.pace.ytd)} so far this year against ${fmt(h.pace.lastYtd)} by the same date last year.</p>` : ""}
+      </article>
+      <article class="card"><h4>Records</h4>${sourceTag("Contribution history")}
+        ${stats([["Longest streak", h.bestRun.days ? `${fmt(h.bestRun.days)} d` : "—"], ["Longest break", h.bestGap.days ? `${fmt(h.bestGap.days)} d` : "—"], ["Busiest day", h.busiestDay?.contributionCount ? fmt(h.busiestDay.contributionCount) : "—"]])}
+        <p class="note">${h.bestRun.days ? `Streak ${range(h.bestRun)}. ` : ""}${h.bestGap.days ? `Break ${range(h.bestGap)}, between two active days. ` : ""}${h.busiestDay?.contributionCount ? `Busiest day ${esc(h.busiestDay.date)}. ` : ""}Streaks continue across New Year.</p>
+      </article>
+      <article class="card"><h4>Seasonality</h4>${sourceTag("Contribution history")}${seasons}</article>
+      <article class="card insight-wide"><h4>Year by year</h4>${sourceTag("Contribution history")}
+        ${table}
+        <p class="note">Calendar years from January 1 to December 31, read from GitHub's contribution calendar. The current year runs to today. The Contribution year tab uses GitHub's rolling 12 months instead, so its totals differ.</p>
+      </article>
+    </div>`);
+}
+
 function footprintInsights(f) {
   const fp = state.footprint;
   const notice = [state.errors.footprint, state.errors.history].filter(Boolean).join(" ");
@@ -966,7 +1035,8 @@ function renderInsights(c) {
   const panel = state.insight === "events" ? eventInsights(ev)
     : state.insight === "prs" ? pullRequestInsights(pr)
     : state.insight === "patterns" ? patternInsights(c)
-    : state.insight === "footprint" ? footprintInsights(c.footprint) : annualInsights(year);
+    : state.insight === "footprint" ? footprintInsights(c.footprint)
+    : state.insight === "history" ? historyInsights(c.years) : annualInsights(year);
   $("insights").innerHTML = `${state.errors.refresh ? `<p class="insight-notice">${esc(state.errors.refresh)}</p>` : ""}${panel}`;
 }
 
@@ -1006,6 +1076,9 @@ function renderMeta(c) {
       ? ["part", "Private contributions", `${fmt(year.totals.restricted)} contributions are counted but hidden from this token.`]
       : ["ok", "Restricted contributions", "GitHub reported no restricted contribution count."]);
   }
+  const ch = state.contributionHistory;
+  caps.push(ch ? [state.errors.years ? "part" : "ok", "Contribution history", `${fmt(Object.keys(ch.byYear).length)} calendar years in one request. ${esc(state.errors.years || "")}`]
+    : ["no", "Contribution history", esc(state.errors.years || "Not available.")]);
   const fp = state.footprint;
   caps.push(!fp ? ["no", "Repository traffic", esc(state.errors.footprint || "Not available.")]
     : fp.denied ? ["no", "Repository traffic", esc(state.errors.footprint)]
