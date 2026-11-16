@@ -5,7 +5,7 @@ Activity Desk gives you one place to review GitHub activity across the repositor
 ## Views
 
 - **Overview** highlights recent contribution trends, new comments from others, open pull requests in the loaded sample, and unread notifications when available.
-- **Stream** has two sources. **Your events** filters your loaded events by type, repository, and search text. Clear **Hide routine changes** to include events such as PR label changes. **Conversations** lists comments, reviews, and review comments on issues and pull requests that involve you, open or closed, including replies from other people. **Mark all seen** updates a timestamp for your account on this Mac, and both sources mark newer items as **New**.
+- **Stream** has three sources. **Your events** filters your loaded events by type, repository, and search text. Clear **Hide routine changes** to include events such as PR label changes. Comment, review, and agent rows show what was written. See [Reading comment text](#reading-comment-text). **Conversations** lists comments, reviews, and review comments on issues and pull requests that involve you, open or closed, including replies from other people. **Mark all seen** updates a timestamp for your account on this Mac, and both sources mark newer items as **New**. **Notes** holds sticky notes you write. See [Using Notes](#using-notes).
 - **Insights** shows your contribution calendar, an event heatmap, and merge timing, recorded reviews, and change sizes for loaded pull requests. In **Recent events**, select a repository to open its events in Stream. **Patterns** derives findings the other views do not state: how concentrated your output is, where the last four weeks rank in the year, how events group into work sessions, how agent-branch merges compare with the rest, whether weekly output shifted, how often branches reach a merge, how long your pull requests wait for a person to review them, and who you review with in each direction. **Footprint** shows traffic to the repositories you own. See [Reading Footprint](#reading-footprint). **All years** compares calendar years. See [Reading All years](#reading-all-years).
 - **Data & access** shows which sources loaded and flags limits, missing data, and permission errors. **Token check** and **Rate-limit budget** describe the token itself. See [Checking your token](#checking-your-token).
 
@@ -55,16 +55,38 @@ Traffic needs a token with read access to **Administration** on your repositorie
 
 ![Footprint for fictional repositories with saved history](screenshots/footprint.png)
 
+### Reading comment text
+
+In **Your events**, rows for comments, review comments, commit comments, and reviews show the text you wrote. Issues and pull requests you opened show their description. The **Comments** and **Agents** filters list these rows together, and an agent's comment is marked with the agent's color.
+
+- Short text appears in full. Longer text shows a two-line preview. Select **Show full comment** to read the rest in place, with its line breaks, and **Hide comment** to fold it again. Text you expanded stays open while you filter or search, and **Search** also matches comment text.
+- Text comes from GitHub's event payload. When the payload leaves the text out, Activity Desk uses your matching comment from **Conversations**, from the same thread and within two minutes of the event, and marks it **text from Conversations**. When neither has it, the row says the text is unavailable.
+- Hidden HTML comments that bots and agents leave in their text are removed, and text over 20,000 characters is cut short with a count of what was left out.
+
+![Expanded comment text in Your events, using fictional activity](screenshots/comment-text.png)
+
 ### Reading Conversations
 
 Your events come from GitHub's Events feed, which lists only your own actions and can lag by minutes or hours. Conversations reads the threads directly, so each **Refresh** shows the latest comments as of that moment, including replies from other people.
 
-- Threads come from a GitHub search for issues and pull requests that involve you, meaning you authored, were assigned, were mentioned, or commented. The search covers threads updated in the last 30 days, open or closed, with the 25 most recently updated loaded. Search can take a short time to notice a thread that just changed. Comments on threads it already lists are read live.
+- Threads come from two GitHub searches, one for issues and one for pull requests, that involve you, meaning you authored, were assigned, were mentioned, or commented. GitHub's issue search requires one of `is:issue` or `is:pr`, so the two kinds are searched separately in one request. The searches cover threads updated in the last 30 days, open or closed, with the 25 most recently updated issues and the 25 most recently updated pull requests loaded. Search can take a short time to notice a thread that just changed. Comments on threads it already lists are read live.
 - Each thread shows its latest 10 comments and its latest 10 reviews, with up to 5 review comments per review. The caption says when a thread or the thread list was cut short.
 - **From others** hides your own comments. **Bots** shows comments from GitHub Apps and accounts whose names end in `[bot]`. The **New** tag and the Stream badge count only comments from other people.
-- If a refresh cannot read conversations, Stream keeps the previous load and says so in the caption.
+- If a refresh cannot read conversations, Stream keeps the previous load and says so in the caption. If only one of the two searches returns, the caption names the kind that did not load.
 
-![Conversations with a new reply after refresh, using fictional activity](screenshots/conversations.png)
+![Conversations from issues and pull requests, using fictional activity](screenshots/conversations.png)
+
+### Using Notes
+
+**Stream → Notes** keeps sticky notes next to your activity, with a list on the left and the selected note on the right.
+
+- Select **New note**, or press ⌘N while Notes is showing, and start typing. The first line becomes the title in the list, and the next lines become its preview. Notes save as you type. The status under the note shows **Saved** once a change is stored.
+- Pick a color for each note, **Pin** notes to keep them at the top, and use **Search notes** to filter by text. **Delete** asks before it removes a note. A note left empty is removed when you move to another note.
+- A note holds up to 20,000 characters, and each account can keep up to 300 notes.
+
+Notes are stored only on this Mac. See [Local data and privacy](#local-data-and-privacy).
+
+![Notes with a pinned checklist, using fictional notes](screenshots/notes.png)
 
 ## What the numbers cover
 
@@ -79,7 +101,7 @@ Your events come from GitHub's Events feed, which lists only your own actions an
 | Saved history | Off by default. When turned on, daily views and clones, star and fork counts, and referring-site sightings saved on this Mac from each refresh, for up to 400 days. |
 | [Rate-limit budget](https://docs.github.com/en/rest/rate-limit/rate-limit) | REST and GraphQL limits read after each refresh. GitHub does not count this read against the limit. |
 | [Contribution year](https://docs.github.com/en/graphql/reference/users#contributionscollection) | GitHub's rolling contribution calendar and up to 10 repository totals for commit contributions. The 30-day comparison includes today. |
-| [Conversations](https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests#search-by-a-user-thats-involved-in-an-issue-or-pull-request) | Up to 25 issues and pull requests that involve you and were updated in the last 30 days. Each shows its latest 10 comments, latest 10 reviews, and up to 5 review comments per review. |
+| [Conversations](https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests#search-by-a-user-thats-involved-in-an-issue-or-pull-request) | Up to 25 issues and 25 pull requests that involve you and were updated in the last 30 days. Each shows its latest 10 comments, latest 10 reviews, and up to 5 review comments per review. |
 | [Unread notifications](https://docs.github.com/en/rest/activity/notifications) | The first page of up to 50 unread notifications with a supported token. |
 
 Push counts describe the reported refs, including branches named `main` or `master`, other branches, and tags. A branch name alone cannot establish default-branch status or whether a push bypassed review. Agent signals are estimates based on known app slugs and branch prefixes.
@@ -100,6 +122,8 @@ Push counts describe the reported refs, including branches named `main` or `mast
 
 The main process sends the token to `api.github.com` for allowlisted reads. macOS Keychain backs encryption of the token in the local Electron profile. Activity Desk encrypts a legacy plaintext token on first use.
 
-**Sign out** clears the dashboard and removes the saved token. The account's seen timestamp and saved history remain in the local profile.
+**Sign out** clears the dashboard and removes the saved token. The account's seen timestamp, saved history, and notes remain in the local profile.
+
+**Notes** are kept in the app's data folder (`~/Library/Application Support/Activity Desk`), not inside the app itself, so updating or replacing the app keeps them. Only the main process reads or writes them. They are encrypted with the same macOS Keychain-backed key as the token, and each account has its own notes. They are never sent to GitHub. If the notes file cannot be decrypted, for example after a Keychain change, Activity Desk keeps the unreadable file beside it as `notes-unreadable-….enc`, starts a new notebook, and says so in Notes and in **Data & access → Notes on this Mac**.
 
 **Saved history** is off until you turn it on with **Save history on this Mac** in Footprint or **Turn on saved history** in **Data & access**. It is the only GitHub data Activity Desk keeps, and turning it on refreshes so today's traffic is saved straight away. The main process writes it from traffic and repository-list responses for repositories the signed-in account owns. Each account is stored separately. It is encrypted with the same macOS Keychain-backed key as the token and kept for 400 days, up to 50 repositories per account. **Data & access → Saved history** shows what is stored, deletes it for the current account, or turns it off. Turning it off deletes it for every account on this Mac and stops saving until you turn it on again. If the file cannot be decrypted, for example after a Keychain change, Activity Desk starts a new history and says so. The dashboard can display private repository names and activity. Use a separate profile and synthetic data for screenshots you plan to share.

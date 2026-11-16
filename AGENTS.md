@@ -4,8 +4,8 @@ The workspace copy of `Activity Desk.app` is the starting point. Its unpacked ap
 
 ## Code map
 
-- `main.js` owns the window, tray, token storage, authenticated GitHub requests, and the encrypted saved history it records from those responses. `preload.js` exposes the `window.desk` IPC bridge.
-- `renderer.js` loads GitHub REST and GraphQL data and renders Overview, Stream, Insights, and Data & access. `insights.js` computes the summaries and can be required from Node.
+- `main.js` owns the window, tray, token storage, authenticated GitHub requests, the encrypted saved history it records from those responses, and the encrypted per-account notes behind Stream → Notes. `preload.js` exposes the `window.desk` IPC bridge.
+- `renderer.js` loads GitHub REST and GraphQL data and renders Overview, Stream, Insights, and Data & access. `insights.js` computes the summaries and comment text and can be required from Node. `notes.js` formats notes for display and can be required from Node.
 - `index.html` defines the views and Content Security Policy. `styles.css` controls their layout. `Activity Desk.app/Contents/Info.plist` holds the macOS bundle metadata.
 
 ## Working on the app
