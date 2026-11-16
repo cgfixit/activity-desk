@@ -148,7 +148,7 @@ function resetSession() {
 // GitHub's 14-day traffic window. Only the main process writes it, and only from GitHub responses it
 // fetched itself for the signed-in account's own repositories. It is encrypted like the token.
 const HISTORY_FILE = "history.enc";
-const HISTORY_OFF = "history-off"; // present when the user turned saved history off
+const HISTORY_ON = "history-on"; // present only after the user turned saved history on
 const HISTORY_VERSION = 1;
 const HISTORY_DAYS = 400;
 const HISTORY_REPOS = 50;
@@ -231,7 +231,8 @@ function scheduleHistorySave() {
   historyTimer = setTimeout(() => withHistory(saveHistory).catch(() => {}), 400);
 }
 
-const historyEnabled = () => readIfPresent(path.join(app.getPath("userData"), HISTORY_OFF)) === null;
+// Saved history is opt-in. Nothing is recorded until the user turns it on.
+const historyEnabled = () => readIfPresent(path.join(app.getPath("userData"), HISTORY_ON)) !== null;
 
 // Records a traffic or repository-list response for the account that requested it.
 function recordHistory(user, operation, args, data) {
@@ -280,15 +281,15 @@ handle("history", () => withHistory(async () => {
   }
 }));
 
-// Turning saved history off deletes it for every account on this Mac and stops recording.
+// Turning saved history on starts recording. Turning it off deletes it for every account on this Mac.
 handle("history-setting", (enabled) => withHistory(async () => {
   if (typeof enabled !== "boolean") return { ok: false, error: "Invalid setting." };
   const profile = app.getPath("userData");
   try {
     if (enabled) {
-      fs.rmSync(path.join(profile, HISTORY_OFF), { force: true });
+      fs.writeFileSync(path.join(profile, HISTORY_ON), "", { mode: 0o600 });
     } else {
-      fs.writeFileSync(path.join(profile, HISTORY_OFF), "", { mode: 0o600 });
+      fs.rmSync(path.join(profile, HISTORY_ON), { force: true });
       clearTimeout(historyTimer);
       historyDirty = false;
       history = { version: HISTORY_VERSION, accounts: {} };

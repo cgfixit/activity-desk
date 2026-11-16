@@ -935,8 +935,11 @@ function footprintInsights(f) {
     <thead><tr><th scope="col">Repository</th><th scope="col">Views</th><th scope="col">Unique</th><th scope="col">Clones</th><th scope="col">Stars</th><th scope="col">Stars, 30 d</th><th scope="col">Forks</th></tr></thead>
     <tbody>${f.rows.map((r) => `<tr><th scope="row">${esc(shortRepo(r.repo))}${r.private ? ' <span class="src">private</span>' : ""}</th><td>${fmt(r.views)}</td><td>${fmt(r.uniques)}</td><td>${fmt(r.clones)}</td><td>${fmt(r.stars)}</td><td>${stars30(r)}</td><td>${fmt(r.forks)}</td></tr>`).join("")}</tbody></table>`;
 
+  const optIn = saved?.enabled === false ? `<div class="callout">GitHub keeps only 14 days of traffic. To see trends over months, Activity Desk can save daily traffic, star and fork counts, and referring sites for your repositories on this Mac, encrypted, for up to 400 days.
+      <div class="actions"><button class="btn ghost" type="button" data-action="history-on">Save history on this Mac</button></div></div>` : "";
   return insightSection("insight-footprint", "Footprint", caption, `
     ${noticeHtml}
+    ${optIn}
     <div class="grid insights">
       <article class="card insight-wide"><h4>What stands out</h4>${findings}</article>
       <article class="card"><h4>Views by week</h4>${sourceTag("Traffic and saved history")}
@@ -1106,7 +1109,7 @@ function historyCard() {
   if (!h) return `${head}<p class="note">${esc(state.errors.history || "Saved history loads with repository traffic.")}</p></article>`;
   if (h.enabled === false) {
     return `${head}<p class="big">Off. Nothing is saved on this Mac.</p>
-      <p class="note">Footprint shows only the 14 days GitHub keeps.</p>
+      <p class="note">Footprint shows only the 14 days GitHub keeps. Turning this on saves daily traffic, star and fork counts, and referring sites for repositories you own, encrypted, for up to 400 days. Turning it on refreshes so today's traffic is saved.</p>
       <button class="btn ghost" type="button" data-action="history-on">Turn on saved history</button></article>`;
   }
   const repos = Object.values(h.repos || {});
@@ -1254,8 +1257,8 @@ async function signOut() {
 $("signout").addEventListener("click", signOut);
 $("forget-token").addEventListener("click", signOut);
 $("refresh").addEventListener("click", refresh);
-$("meta").addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-action]");
+async function historyAction(event) {
+  const button = event.target.closest("[data-action^=\"history-\"]");
   if (!button || state.busy) return;
   const action = button.dataset.action;
   const prompts = {
@@ -1276,9 +1279,15 @@ $("meta").addEventListener("click", async (event) => {
   } catch (error) {
     if (account !== state) return;
     state.errors.history = error.message;
+    renderAll();
+    return;
   }
   renderAll();
-});
+  // Turning history on records today's traffic straight away.
+  if (action === "history-on") refresh();
+}
+$("meta").addEventListener("click", historyAction);
+$("insights").addEventListener("click", historyAction);
 document.querySelectorAll(".nav").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
 $("insight-nav").addEventListener("click", (event) => {
   const button = event.target.closest("[data-source]");
