@@ -1,6 +1,7 @@
 "use strict";
 
 const { app, BrowserWindow, ipcMain, safeStorage, shell, Tray, Menu, nativeImage } = require("electron");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL, URL: NodeURL } = require("node:url");
@@ -321,6 +322,155 @@ handle("clear-history", () => withHistory(async () => {
   }
 }));
 
+// ---------- Notes ----------
+// Sticky notes written in Stream → Notes, kept per account in the app's data folder (userData), not in
+// the signed app bundle, which updates replace. Encrypted like the token. Only the main process reads or
+// writes the file. A file that cannot be read is set aside for recovery instead of being overwritten.
+const NOTES_FILE = "notes.enc";
+const NOTES_VERSION = 1;
+const NOTES_MAX = 300;
+const NOTE_CHARS = 20000;
+const NOTE_COLORS = ["yellow", "green", "blue", "pink", "purple"];
+const NOTE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$/;
+
+let notesStore = null;
+let notesNote = "";
+let notesQueue = Promise.resolve();
+
+function withNotes(operation) {
+  const pending = notesQueue.then(operation);
+  notesQueue = pending.catch(() => {});
+  return pending;
+}
+
+function cleanNote(n) {
+  if (!n || typeof n.id !== "string" || !NOTE_ID.test(n.id) || typeof n.text !== "string") return null;
+  const created = typeof n.created === "string" && ISO_TIME.test(n.created) ? n.created : new Date(0).toISOString();
+  return {
+    id: n.id,
+    text: n.text.slice(0, NOTE_CHARS),
+    color: NOTE_COLORS.includes(n.color) ? n.color : NOTE_COLORS[0],
+    pinned: n.pinned === true,
+    created,
+    updated: typeof n.updated === "string" && ISO_TIME.test(n.updated) ? n.updated : created,
+  };
+}
+
+async function loadNotes() {
+  if (notesStore) return notesStore;
+  const profile = app.getPath("userData");
+  const file = path.join(profile, NOTES_FILE);
+  const encrypted = readIfPresent(file);
+  const store = { version: NOTES_VERSION, accounts: {} };
+  if (encrypted) {
+    let parsed = null;
+    let reEncrypt = false;
+    try {
+      const { result, shouldReEncrypt } = await safeStorage.decryptStringAsync(encrypted);
+      parsed = JSON.parse(result);
+      reEncrypt = shouldReEncrypt;
+    } catch {
+      parsed = null;
+    }
+    if (parsed?.version === NOTES_VERSION && parsed.accounts && typeof parsed.accounts === "object") {
+      for (const [key, account] of Object.entries(parsed.accounts)) {
+        if (!/^\d+$/.test(key) || !Array.isArray(account?.notes)) continue;
+        store.accounts[key] = {
+          login: typeof account.login === "string" ? account.login : "",
+          notes: account.notes.map(cleanNote).filter(Boolean).slice(0, NOTES_MAX),
+        };
+      }
+      if (reEncrypt) await writeEncrypted(NOTES_FILE, JSON.stringify(store));
+    } else {
+      const aside = `notes-unreadable-${Date.now()}.enc`;
+      fs.renameSync(file, path.join(profile, aside));
+      notesNote = `Saved notes could not be read, so a new notebook started. The unreadable file was kept as ${aside} in the app's data folder.`;
+    }
+  }
+  notesStore = store;
+  return store;
+}
+
+const noteCopy = (n) => ({ id: n.id, text: n.text, color: n.color, pinned: n.pinned, created: n.created, updated: n.updated });
+
+handle("notes", () => withNotes(async () => {
+  if (!sessionUser) return { ok: false, error: "Sign in first." };
+  try {
+    const store = await loadNotes();
+    const account = store.accounts[String(sessionUser.id)];
+    return {
+      ok: true, notes: account ? account.notes.map(noteCopy) : [],
+      note: notesNote, colors: NOTE_COLORS, limits: { notes: NOTES_MAX, chars: NOTE_CHARS },
+    };
+  } catch {
+    return { ok: false, error: "Saved notes could not be opened." };
+  }
+}));
+
+// Without an id this creates a note. Text, color, and pinned are each optional. Only a text change
+// moves the edited time, so pinning or recoloring does not reorder the list.
+handle("note-save", (input) => withNotes(async () => {
+  if (!sessionUser) return { ok: false, error: "Sign in first." };
+  if (!input || typeof input !== "object" || Array.isArray(input)) return { ok: false, error: "Invalid note." };
+  const { id, text, color, pinned } = input;
+  if ((id !== undefined && (typeof id !== "string" || !NOTE_ID.test(id))) ||
+      (text !== undefined && (typeof text !== "string" || text.length > NOTE_CHARS)) ||
+      (color !== undefined && !NOTE_COLORS.includes(color)) ||
+      (pinned !== undefined && typeof pinned !== "boolean")) {
+    return { ok: false, error: "Invalid note." };
+  }
+  let store;
+  try {
+    store = await loadNotes();
+  } catch {
+    return { ok: false, error: "Saved notes could not be opened." };
+  }
+  const key = String(sessionUser.id);
+  const account = store.accounts[key] || (store.accounts[key] = { login: sessionUser.login, notes: [] });
+  account.login = sessionUser.login;
+  let note = id ? account.notes.find((n) => n.id === id) : null;
+  if (id && !note) return { ok: false, error: "That note was deleted." };
+  const before = account.notes.map(noteCopy);
+  const now = new Date().toISOString();
+  if (!note) {
+    if (account.notes.length >= NOTES_MAX) return { ok: false, error: `You can keep up to ${NOTES_MAX} notes. Delete one to add another.` };
+    note = { id: crypto.randomUUID(), text: "", color: NOTE_COLORS[0], pinned: false, created: now, updated: now };
+    account.notes.push(note);
+  }
+  if (text !== undefined && text !== note.text) { note.text = text; note.updated = now; }
+  if (color !== undefined) note.color = color;
+  if (pinned !== undefined) note.pinned = pinned;
+  try {
+    await writeEncrypted(NOTES_FILE, JSON.stringify(store));
+  } catch {
+    account.notes = before;
+    return { ok: false, error: "The note could not be saved. Your text is still in the editor." };
+  }
+  return { ok: true, note: noteCopy(note) };
+}));
+
+handle("note-delete", (id) => withNotes(async () => {
+  if (!sessionUser) return { ok: false, error: "Sign in first." };
+  if (typeof id !== "string" || !NOTE_ID.test(id)) return { ok: false, error: "Invalid note." };
+  try {
+    const store = await loadNotes();
+    const account = store.accounts[String(sessionUser.id)];
+    const at = account ? account.notes.findIndex((n) => n.id === id) : -1;
+    if (at < 0) return { ok: true };
+    const [removed] = account.notes.splice(at, 1);
+    try {
+      await writeEncrypted(NOTES_FILE, JSON.stringify(store));
+    } catch (error) {
+      account.notes.splice(at, 0, removed);
+      throw error;
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: "The note could not be deleted. Try again." };
+  }
+}));
+
 handle("status", () => withCredentials(async () => {
   try {
     const token = await readToken();
@@ -405,20 +555,20 @@ const PR_FIELDS = `title state merged isDraft createdAt mergedAt additions delet
 
 // Recent comments on issues and pull requests that involve the user, open or closed.
 // Search finds the threads; each thread's latest comments, reviews, and review comments are read live.
+// GitHub's issue search rejects a query without is:issue or is:pr, so issues and pull requests are
+// two aliased searches in one request, each returning its most recently updated threads.
 const COMMENT_FIELDS = "author { __typename login } bodyText createdAt";
-const CONVERSATIONS_QUERY = `query ($q: String!) {
-  search(query: $q, type: ISSUE, first: 25) {
-    issueCount
-    nodes {
-      __typename
+const THREAD_FIELDS = `__typename
       ... on Issue { number title issueState: state updatedAt author { login } repository { nameWithOwner }
         comments(last: 10) { totalCount nodes { ${COMMENT_FIELDS} } } }
       ... on PullRequest { number title prState: state merged updatedAt author { login } repository { nameWithOwner }
         comments(last: 10) { totalCount nodes { ${COMMENT_FIELDS} } }
         reviews(last: 10) { totalCount nodes { ${COMMENT_FIELDS} state
-          comments(first: 5) { totalCount nodes { ${COMMENT_FIELDS} path } } } } }
-    }
-  }
+          comments(first: 5) { totalCount nodes { ${COMMENT_FIELDS} path } } } } }`;
+const CONVERSATION_THREADS = 25;
+const CONVERSATIONS_QUERY = `query ($issues: String!, $pullRequests: String!) {
+  issues: search(query: $issues, type: ISSUE, first: ${CONVERSATION_THREADS}) { issueCount nodes { ${THREAD_FIELDS} } }
+  pullRequests: search(query: $pullRequests, type: ISSUE, first: ${CONVERSATION_THREADS}) { issueCount nodes { ${THREAD_FIELDS} } }
 }`;
 const CONVERSATION_DAYS = 30;
 
@@ -466,7 +616,8 @@ function githubRequest(operation, args) {
       const login = args?.login;
       if (typeof login !== "string" || !/^[A-Za-z0-9-]{1,39}$/.test(login)) break;
       const since = new Date(Date.now() - CONVERSATION_DAYS * 864e5).toISOString().slice(0, 10);
-      return { route: "/graphql", body: { query: CONVERSATIONS_QUERY, variables: { q: `involves:${login} updated:>=${since} sort:updated-desc` } } };
+      const q = (type) => `involves:${login} ${type} updated:>=${since} sort:updated-desc`;
+      return { route: "/graphql", body: { query: CONVERSATIONS_QUERY, variables: { issues: q("is:issue"), pullRequests: q("is:pr") } } };
     }
     case "authoredPullRequests": {
       const { login, after } = args || {};
@@ -639,6 +790,22 @@ app.whenReady().then(() => {
       tray = null;
     }
   }
+});
+
+// Note saves the window sent while closing, and a pending history save, finish before the app exits.
+let drained = false;
+app.on("will-quit", (event) => {
+  if (drained) return;
+  drained = true;
+  event.preventDefault();
+  (async () => {
+    for (let pass = 0; pass < 20; pass += 1) {
+      const pending = notesQueue;
+      await Promise.allSettled([pending, withHistory(saveHistory)]);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      if (pending === notesQueue) break;
+    }
+  })().finally(() => app.quit());
 });
 
 app.on("window-all-closed", () => {

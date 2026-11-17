@@ -1392,10 +1392,25 @@ const CONVERSATION_FILTERS = {
   bots: (c) => c.bot,
 };
 
+// The conversation request runs one search for issues and one for pull requests. Each kind reports
+// its own counts, and null when GitHub did not return that search.
+const CONVERSATION_SEARCHES = ["issues", "pullRequests"];
+
 function flattenConversations(data, login) {
   const me = String(login || "").toLowerCase();
-  const search = data && data.search;
-  const nodes = Array.isArray(search?.nodes) ? search.nodes.filter((n) => n && n.repository && Number.isInteger(n.number)) : [];
+  const searches = {};
+  const seen = new Set();
+  const nodes = [];
+  for (const key of CONVERSATION_SEARCHES) {
+    const search = data && data[key];
+    if (!Array.isArray(search?.nodes)) { searches[key] = null; continue; }
+    const usable = search.nodes.filter((n) => n && n.repository && Number.isInteger(n.number));
+    for (const n of usable) {
+      const id = `${n.repository.nameWithOwner}#${n.number}`;
+      if (!seen.has(id)) { seen.add(id); nodes.push(n); }
+    }
+    searches[key] = { loaded: usable.length, matched: Number.isInteger(search.issueCount) ? search.issueCount : usable.length };
+  }
   const items = [];
   const truncated = { comments: 0, reviews: 0, reviewComments: 0, threads: 0 };
   const person = (author) => {
@@ -1434,10 +1449,13 @@ function flattenConversations(data, login) {
   }
   const valid = items.filter((c) => Number.isFinite(Date.parse(c.at)));
   valid.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  const found = CONVERSATION_SEARCHES.map((key) => searches[key]).filter(Boolean);
   return {
     items: valid,
     threads: nodes.length,
-    matched: Number.isInteger(search?.issueCount) ? search.issueCount : nodes.length,
+    matched: found.reduce((sum, s) => sum + s.matched, 0),
+    searches,
+    usable: found.length > 0,
     truncated,
   };
 }
@@ -1449,17 +1467,96 @@ function filterConversations(items, filter, repo, query) {
     (!q || `${c.thread.repo} ${c.thread.title} ${c.author} ${c.body} ${c.path || ""}`.toLowerCase().includes(q)));
 }
 
+// ---------- Written text behind an event ----------
+// A comment, a review, or the description of an issue or pull request the event opened. It comes from
+// the event payload when GitHub includes it. A comment event without one is matched to your comment in
+// the loaded conversations: same kind, thread, and author, created within two minutes of the event.
+const TEXT_LIMIT = 20000;
+const TEXT_MATCH_MS = 120000;
+const COMMENT_EVENTS = {
+  IssueCommentEvent: { kind: "comment", label: "Comment", always: true },
+  PullRequestReviewCommentEvent: { kind: "inline", label: "Review comment", always: true },
+  CommitCommentEvent: { kind: null, label: "Commit comment", always: true },
+  PullRequestReviewEvent: { kind: "review", label: "Review", always: false },
+};
+
+// Hidden HTML comments, often left by bots, removed until none remain. One pass is not enough: removing
+// a comment can join the text around it into a new "<!--". An unterminated comment runs to the end.
+// The result is display text and is always HTML-escaped where it is shown.
+function stripHtmlComments(text) {
+  let previous;
+  do {
+    previous = text;
+    text = text.replace(/<!--[\s\S]*?(?:-->|$)/g, "");
+  } while (text !== previous);
+  return text;
+}
+
+// Line endings normalized, hidden HTML comments and runs of blank lines removed.
+function cleanText(value) {
+  return stripHtmlComments(String(value).replace(/\r\n?/g, "\n")).replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// Cleaned text, cut at TEXT_LIMIT characters with the remainder counted, or null when nothing is left.
+function textInfo(label, raw, source) {
+  const text = cleanText(raw ?? "");
+  if (!text) return null;
+  const clipped = Math.max(0, text.length - TEXT_LIMIT);
+  return { label, text: clipped ? text.slice(0, TEXT_LIMIT) : text, clipped, source };
+}
+
+// Your own comments in the loaded conversations, keyed by kind and thread.
+function conversationIndex(items, login) {
+  const me = String(login || "").toLowerCase();
+  const index = new Map();
+  for (const c of items || []) {
+    if (!c || !c.body || String(c.author).toLowerCase() !== me) continue;
+    const key = `${c.kind}|${c.thread.repo}#${c.thread.number}`;
+    if (!index.has(key)) index.set(key, []);
+    index.get(key).push(c);
+  }
+  return index;
+}
+
+// { label, text, clipped, source: "event" | "conversation" } when the text is known,
+// { label, missing: true } for a comment whose text GitHub did not send, or null when there is no text.
+function eventText(event, index) {
+  const p = (event && event.payload) || {};
+  const type = event && event.type;
+  const comment = COMMENT_EVENTS[type];
+  let holder;
+  let label;
+  if (comment) { holder = type === "PullRequestReviewEvent" ? p.review : p.comment; label = comment.label; }
+  else if (type === "IssuesEvent" && p.action === "opened") { holder = p.issue; label = "Issue description"; }
+  else if (type === "PullRequestEvent" && p.action === "opened") { holder = p.pull_request; label = "Pull request description"; }
+  else return null;
+  if (holder && typeof holder.body === "string") return textInfo(label, holder.body, "event");
+  // The object arrived with an empty body, or this is a description GitHub left out.
+  if ((holder && holder.body === null) || !comment) return null;
+  const number = type === "IssueCommentEvent" ? p.issue?.number : p.pull_request?.number;
+  const at = Date.parse(event.created_at);
+  const candidates = comment.kind && index ? index.get(`${comment.kind}|${repoName(event)}#${number}`) : null;
+  let best = null;
+  for (const c of candidates || []) {
+    const gap = Math.abs(Date.parse(c.at) - at);
+    if (gap <= TEXT_MATCH_MS && (!best || gap < best.gap)) best = { c, gap };
+  }
+  if (best) return textInfo(label, best.c.body, "conversation");
+  return comment.always ? { label, missing: true } : null;
+}
+
 const MINOR_PR_ACTIONS = new Set(["labeled", "unlabeled", "synchronize", "assigned", "unassigned", "review_requested", "review_request_removed", "edited"]);
 function isMinor(event) {
   const p = (event && event.payload) || {};
   return (event.type === "PullRequestEvent" || event.type === "IssuesEvent") && MINOR_PR_ACTIONS.has(p.action);
 }
 
-function filterEvents(events, filter, repo, query, hideMinor, prInfo) {
+// Search text covers the repository, the description, the branch, and any comment text.
+function filterEvents(events, filter, repo, query, hideMinor, prInfo, index) {
   const f = FILTERS[filter] || FILTERS.all;
   const q = String(query || "").trim().toLowerCase();
   return (events || []).filter((e) => f(e) && (!hideMinor || !isMinor(e)) && (!repo || repoName(e) === repo) &&
-    (!q || `${repoName(e)} ${describeEvent(e, prInfo)} ${branchOf(e)}`.toLowerCase().includes(q)));
+    (!q || `${repoName(e)} ${describeEvent(e, prInfo)} ${branchOf(e)} ${eventText(e, index)?.text || ""}`.toLowerCase().includes(q)));
 }
 
 // ---------- Pull request details, token metadata, and rate limits ----------
@@ -1857,6 +1954,10 @@ const api = {
   isBotLogin,
   flattenConversations,
   filterConversations,
+  conversationIndex,
+  eventText,
+  textInfo,
+  cleanText,
   CONVERSATION_FILTERS,
   deriveObservations,
   deriveSuggestions,

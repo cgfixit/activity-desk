@@ -200,7 +200,7 @@ test("follows branches to pull requests and measures first human review", () => 
 
 test("flattens issue and pull request conversations and filters them", () => {
   const who = (login, type = "User") => ({ __typename: type, login });
-  const data = { search: { issueCount: 5, nodes: [
+  const data = { pullRequests: { issueCount: 4, nodes: [
     { __typename: "PullRequest", number: 4, title: "Add cache", prState: "MERGED", merged: true, repository: { nameWithOwner: "me/app" },
       comments: { totalCount: 3, nodes: [
         { author: who("ana"), createdAt: "2026-03-02T10:00:00Z", bodyText: "Looks keyed by login" },
@@ -211,6 +211,7 @@ test("flattens issue and pull request conversations and filters them", () => {
         { author: who("me"), createdAt: "2026-03-02T08:00:00Z", bodyText: "", state: "COMMENTED",
           comments: { totalCount: 6, nodes: [{ author: who("me"), createdAt: "2026-03-02T08:00:00Z", bodyText: "note", path: "a.js" }] } },
       ] } },
+  ] }, issues: { issueCount: 1, nodes: [
     { __typename: "Issue", number: 9, title: "Crash", issueState: "CLOSED", repository: { nameWithOwner: "org/lib" },
       comments: { totalCount: 1, nodes: [{ author: who("helper", "Bot"), createdAt: "2026-03-01T00:00:00Z", bodyText: "Triaged" }, { author: null, createdAt: "bad", bodyText: "x" }] } },
     null,
@@ -218,6 +219,7 @@ test("flattens issue and pull request conversations and filters them", () => {
   const conv = insights.flattenConversations(data, "me");
   assert.equal(conv.threads, 2);
   assert.equal(conv.matched, 5);
+  assert.deepEqual(conv.searches, { issues: { loaded: 1, matched: 1 }, pullRequests: { loaded: 1, matched: 4 } });
   assert.deepEqual(conv.truncated, { comments: 1, reviews: 0, reviewComments: 1, threads: 1 }, "one thread, cut short two ways");
   // The empty COMMENTED review only wraps its inline comment; the unparseable date is dropped.
   assert.deepEqual(conv.items.map((c) => `${c.kind}:${c.author}`), ["comment:Me", "comment:ana", "review:ana", "inline:me", "comment:helper"]);
@@ -231,4 +233,41 @@ test("flattens issue and pull request conversations and filters them", () => {
   assert.equal(count("all", "", "KEYED"), 1);
   assert.equal(count("all", "", "a.js"), 1);
   assert.deepEqual(insights.flattenConversations(null, "me").items, []);
+  assert.equal(insights.flattenConversations(null, "me").usable, false);
+  // One search missing still leaves the other usable, and it is reported as missing.
+  const half = insights.flattenConversations({ issues: data.issues, pullRequests: null }, "me");
+  assert.deepEqual([half.usable, half.threads, half.searches.pullRequests], [true, 1, null]);
+  // A thread returned by both searches is listed once.
+  const twice = insights.flattenConversations({ issues: data.issues, pullRequests: data.issues }, "me");
+  assert.equal(twice.threads, 1);
+});
+
+test("finds the text behind comment events in the payload or the loaded conversations", () => {
+  const event = (type, payload, at = "2026-03-02T10:00:00Z") => ({ id: "1", type, repo: { name: "me/app" }, created_at: at, payload });
+  const thread = { repo: "me/app", number: 9 };
+  const index = insights.conversationIndex([
+    { kind: "comment", thread, author: "Me", at: "2026-03-02T10:00:40Z", body: "From the thread" },
+    { kind: "comment", thread, author: "ana", at: "2026-03-02T10:00:00Z", body: "Someone else" },
+  ], "me");
+  const text = (e) => insights.eventText(e, index);
+  assert.deepEqual(text(event("IssueCommentEvent", { issue: { number: 9 }, comment: { body: "Line one\r\n<!-- bot marker -->\r\n\r\n\r\nLine two" } })),
+    { label: "Comment", text: "Line one\n\nLine two", clipped: 0, source: "event" });
+  assert.equal(text(event("IssueCommentEvent", { issue: { number: 9 }, comment: { id: 5 } })).source, "conversation");
+  assert.equal(text(event("IssueCommentEvent", { issue: { number: 9 }, comment: { id: 5 } })).text, "From the thread");
+  assert.deepEqual(text(event("IssueCommentEvent", { issue: { number: 9 } }, "2026-03-02T10:05:00Z")), { label: "Comment", missing: true });
+  assert.equal(text(event("IssueCommentEvent", { issue: { number: 9 }, comment: { body: null } })), null);
+  assert.equal(text(event("PullRequestReviewEvent", { pull_request: { number: 9 } })), null, "reviews without text are common");
+  assert.equal(text(event("PullRequestReviewEvent", { review: { state: "approved", body: "Ship it" } })).label, "Review");
+  assert.equal(text(event("IssuesEvent", { action: "opened", issue: { body: "Description" } })).label, "Issue description");
+  assert.equal(text(event("IssuesEvent", { action: "closed", issue: { body: "Description" } })), null);
+  assert.equal(text(event("PushEvent", {})), null);
+  // Removing one comment can rejoin "<!--" from what surrounds it; nothing hidden may survive.
+  assert.equal(insights.cleanText("visible <!<!-- x -->-- hidden marker -->text"), "visible text");
+  assert.equal(insights.cleanText("keep this <!-- unterminated"), "keep this");
+  assert.equal(insights.cleanText("step one --> step two"), "step one --> step two");
+  const long = text(event("CommitCommentEvent", { comment: { body: "x".repeat(20010) } }));
+  assert.deepEqual([long.text.length, long.clipped], [20000, 10]);
+  const events = [event("IssueCommentEvent", { issue: { number: 9 }, comment: { body: "Mentions the retry loop" } })];
+  assert.equal(insights.filterEvents(events, "comment", "", "RETRY LOOP", false, {}, index).length, 1);
+  assert.equal(insights.filterEvents(events, "comment", "", "absent", false, {}, index).length, 0);
 });

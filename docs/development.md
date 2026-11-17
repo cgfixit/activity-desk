@@ -16,7 +16,7 @@ The script verifies the pinned Electron archive's SHA-256, assembles the app fro
 
 Run `actionlint` for GitHub Actions and `shellcheck scripts/*.sh` for packaging scripts. The Verify workflow checks JavaScript syntax, runs the Node test fixtures, lints workflows and scripts, and scans for dotenv files and secrets. The macOS package check builds and validates the ZIP on relevant pull requests. The app manifest has no npm dependencies. Dependabot monitors GitHub Actions pins. Electron and the workflow's lint and scan tools use versioned downloads and checksum pins that maintainers update when reviewing their upstream releases.
 
-For a native fixture run, use a scratch bundle identity. Set Electron's `userData` and `sessionData` to temporary directories before loading `main.js`, then use synthetic credentials and GitHub responses. Authenticated views require the preload bridge.
+For a native fixture run, use a scratch bundle identity. Set Electron's `userData` and `sessionData` to temporary directories before loading `main.js`, then use synthetic credentials and GitHub responses. Authenticated views require the preload bridge. On Linux, the same scratch bundle can run under `xvfb-run` with the Electron version pinned in the packaging script, driven by Playwright's `_electron` API. Root containers need `--no-sandbox`, and `--password-store=basic` replaces the Keychain, so on-disk checks there show that notes and tokens are not plaintext, not that they are Keychain-protected.
 
 ## Automated releases
 

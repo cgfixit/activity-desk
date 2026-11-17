@@ -10,4 +10,7 @@ contextBridge.exposeInMainWorld("desk", {
   history: () => ipcRenderer.invoke("desk:history"),
   clearHistory: () => ipcRenderer.invoke("desk:clear-history"),
   setHistory: (enabled) => ipcRenderer.invoke("desk:history-setting", enabled),
+  notes: () => ipcRenderer.invoke("desk:notes"),
+  saveNote: (note) => ipcRenderer.invoke("desk:note-save", note),
+  deleteNote: (id) => ipcRenderer.invoke("desk:note-delete", id),
 });

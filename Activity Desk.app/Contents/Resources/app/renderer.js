@@ -2,6 +2,7 @@
 "use strict";
 
 const I = window.DeskInsights;
+const N = window.DeskNotes;
 const $ = (id) => document.getElementById(id);
 const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -18,7 +19,8 @@ const GLYPHS = { PushEvent: "↑", PullRequestEvent: "⇄", IssuesEvent: "◉", 
 const CHIPS = [["all", "All"], ["push", "Pushes"], ["pr", "Pull requests"], ["issue", "Issues"], ["comment", "Comments"], ["branch", "Branches"], ["agent", "Agents"]];
 const CONVERSATION_CHIPS = [["all", "All"], ["others", "From others"], ["mine", "Yours"], ["reviews", "Reviews"], ["bots", "Bots"]];
 const CONVERSATION_GLYPHS = { comment: "✎", review: "✓", inline: "‹›" };
-const BODY_PREVIEW = 280;
+const CONVERSATION_LABELS = { comment: "Comment", review: "Review", inline: "Review comment" };
+const TEXT_PREVIEW = 180;
 
 const initialState = {
   tokenKind: null,
@@ -41,6 +43,7 @@ const initialState = {
   lastSeen: null,
   filter: "all",
   conversations: null,
+  notes: null,
   streamSource: "events",
   conversationFilter: "all",
   repo: "",
@@ -51,6 +54,9 @@ const initialState = {
 };
 let state = { ...initialState };
 let signingOut = false;
+// Comment texts the reader expanded, kept open when the stream re-renders.
+const openTexts = new Set();
+let indexCache = { items: null, login: null, index: null };
 const seenKey = () => `${LAST_SEEN_KEY}.${state.user.id}`;
 
 // ---------- helpers ----------
@@ -98,6 +104,36 @@ function bars(rows, opts) {
   }).join("")}</ul>`;
 }
 const shortRepo = (repo) => (state.user && repo.startsWith(`${state.user.login}/`) ? repo.slice(state.user.login.length + 1) : repo);
+
+// Your comments in the loaded conversations, used for event comments that arrive without text.
+function commentIndex() {
+  const items = state.conversations?.items || null;
+  const login = state.user?.login || null;
+  if (indexCache.items !== items || indexCache.login !== login) {
+    indexCache = { items, login, index: I.conversationIndex(items, login) };
+  }
+  return indexCache.index;
+}
+
+// Written text under a stream row. Short text shows in full; longer text shows a preview that expands.
+function textBlock(key, t, agent) {
+  if (!t) return "";
+  const tone = agent ? " agent" : "";
+  if (t.missing) return `<p class="body-missing">${esc(t.label)} text was not in GitHub's event payload or the loaded conversations.</p>`;
+  const from = t.source === "conversation" ? '<span class="src">text from Conversations</span>' : "";
+  const flat = t.text.replace(/\s+/g, " ");
+  if (t.text.length <= TEXT_PREVIEW && t.text.split("\n").length <= 3 && !t.clipped) {
+    return `<p class="body-short${tone}">${esc(t.text)}${from ? ` ${from}` : ""}</p>`;
+  }
+  const preview = flat.length > TEXT_PREVIEW ? `${flat.slice(0, TEXT_PREVIEW).trimEnd()}…` : flat;
+  const what = t.label.toLowerCase();
+  const rest = t.clipped ? `\n\n… ${fmt(t.clipped)} more characters not shown.` : "";
+  return `<details class="body${tone}" data-text-key="${esc(key)}"${openTexts.has(key) ? " open" : ""}>
+    <summary><span class="body-preview">${esc(preview)}</span>
+      <span class="body-toggle"><span class="when-closed">Show full ${esc(what)} · ${fmt(t.text.length + t.clipped)} characters</span><span class="when-open">Hide ${esc(what)}</span></span>${from}</summary>
+    <div class="body-full">${esc(t.text + rest)}</div>
+  </details>`;
+}
 
 function setBusy(text) {
   state.busy = Boolean(text);
@@ -301,7 +337,9 @@ async function refresh() {
       if (!years.length) throw new Error("GitHub listed no contribution years.");
       return api(account, "contributionHistory", { years }).then((result) => ({ ...result, years, listed: listed.length }));
     });
-    const [notes, year, prs, talk, authored, footprint, yearsResult, reviewedResult] = await Promise.allSettled([
+    // Notes load once per account. Later refreshes keep the notes in memory, including unsaved edits.
+    const notesTask = account.notes?.userId === user.id && !account.notes.failed ? null : window.desk.notes();
+    const [notes, year, prs, talk, authored, footprint, yearsResult, reviewedResult, notebook] = await Promise.allSettled([
       fineGrained ? null : api(account, "notifications"),
       yearTask,
       lookupTask,
@@ -310,8 +348,10 @@ async function refresh() {
       loadFootprint(account),
       historyTask,
       reviewedTask,
+      notesTask,
     ]);
     if (account !== state) return;
+    if (notesTask) account.notes = notesFrom(notebook.value, user.id);
     // Read last so the budget reflects this refresh. GitHub does not count this call against the limit.
     const rate = await api(account, "rateLimit").catch(() => null);
     if (account !== state) return;
@@ -391,14 +431,20 @@ async function refresh() {
     const savedHistory = fpLoad?.saved?.ok ? fpLoad.saved : null;
 
     const talkData = talk.value?.data;
-    let conversations = Array.isArray(talkData?.data?.search?.nodes)
-      ? { ...I.flattenConversations(talkData.data, user.login), loadedAt: new Date() } : null;
-    const talkProblem = talk.reason?.message || "GitHub did not return a usable conversation search.";
+    const flat = talkData?.data ? I.flattenConversations(talkData.data, user.login) : null;
+    let conversations = flat?.usable ? { ...flat, loadedAt: new Date() } : null;
+    const talkProblem = talk.reason?.message || talkData?.errors?.[0]?.message || "GitHub did not return a usable conversation search.";
     if (!conversations && account.conversations && account.user?.id === user.id) {
       conversations = account.conversations;
       errors.conversations = `Conversations did not refresh. ${talkProblem} Showing the previous load.`;
     } else if (!conversations) errors.conversations = `Conversations did not load. ${talkProblem}`;
-    else if (talkData.errors?.length) errors.conversations = "Some conversations could not be read with this token.";
+    else {
+      const parts = [];
+      const lost = [["issues", "Issue"], ["pullRequests", "Pull request"]].filter(([key]) => !conversations.searches[key]);
+      if (lost.length) parts.push(`${lost.map(([, name]) => name).join(" and ")} threads did not load.`);
+      if (talkData.errors?.length) parts.push("Some conversations could not be read with this token.");
+      if (parts.length) errors.conversations = parts.join(" ");
+    }
 
     Object.assign(account, { user, viewer, contributions, events, notifications, prLookup, prInfo, reviewed, rateLimit, footprint: footprintData, savedHistory, contributionHistory, conversations, errors, refreshedAt: new Date() });
     if (!events.some((e) => I.repoName(e) === account.repo)) account.repo = "";
@@ -566,7 +612,9 @@ function renderConversations() {
     return;
   }
   const notes = [];
-  if (conv.matched > conv.threads) notes.push(`Showing the ${fmt(conv.threads)} most recently updated of ${fmt(conv.matched)} matching threads.`);
+  const capped = [["issues", "issues"], ["pullRequests", "pull requests"]]
+    .map(([key, name]) => [conv.searches?.[key], name]).filter(([s]) => s && s.matched > s.loaded);
+  if (capped.length) notes.push(`Showing the most recently updated ${capped.map(([s, name]) => `${fmt(s.loaded)} of ${fmt(s.matched)} ${name}`).join(" and ")}.`);
   const t = conv.truncated;
   if (t.threads) notes.push(`Older comments are omitted on ${fmt(t.threads)} busy ${t.threads === 1 ? "thread" : "threads"}; each thread shows its latest 10 comments and reviews.`);
   if (state.errors.conversations) notes.push(state.errors.conversations);
@@ -604,12 +652,12 @@ function renderConversations() {
       if (c.bot) tags.push('<span class="tag agent">bot</span>');
       if (c.mine) tags.push('<span class="tag">you</span>');
       tags.push(`<span class="tag ${th.state}">${th.isPr ? "PR" : "issue"} ${th.state}</span>`);
-      const body = c.body.length > BODY_PREVIEW ? `${c.body.slice(0, BODY_PREVIEW).trimEnd()}…` : c.body;
+      const key = `c:${th.repo}#${th.number}:${c.kind}:${c.at}:${c.author}`;
       return `<div class="row${fresh ? " fresh" : ""}">
         <span class="time">${esc(when.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}</span>
-        <span class="glyph" title="${esc(c.kind === "comment" ? "Comment" : c.kind === "review" ? "Review" : "Review comment")}">${esc(CONVERSATION_GLYPHS[c.kind])}</span>
+        <span class="glyph" title="${esc(CONVERSATION_LABELS[c.kind])}">${esc(CONVERSATION_GLYPHS[c.kind])}</span>
         <div class="what"><div class="title">${esc(`${c.author} ${action} #${th.number} ${th.title}`)}</div>
-          ${body ? `<p class="excerpt">${esc(body)}</p>` : ""}
+          ${textBlock(key, I.textInfo(CONVERSATION_LABELS[c.kind], c.body), c.bot)}
           <div class="meta"><span>${esc(shortRepo(th.repo))}</span>${c.path ? `<span>${esc(c.path)}</span>` : ""}</div></div>
         <div class="tags">${tags.join("")}</div>
       </div>`;
@@ -625,6 +673,16 @@ function renderStream(c) {
   const freshTotal = ev.fresh + others;
   badge.textContent = freshTotal > 99 ? "99+" : String(freshTotal);
   badge.classList.toggle("hidden", !freshTotal);
+  const notesView = state.streamSource === "notes";
+  $("stream-toolbar").classList.toggle("hidden", notesView);
+  $("stream").classList.toggle("hidden", notesView);
+  $("notes-pane").classList.toggle("hidden", !notesView);
+  notesCaption();
+  if (notesView) {
+    // A refresh that reloaded notes, for example after a failed first load, redraws the pane.
+    if (renderedNotes !== state.notes) renderNotes();
+    return;
+  }
   if (state.streamSource === "conversations") return renderConversations();
   $("hide-minor-label").classList.remove("hidden");
   $("search").setAttribute("aria-label", "Search events");
@@ -644,7 +702,8 @@ function renderStream(c) {
   const repos = ev.byRepo.map(([r]) => r);
   $("repo-filter").innerHTML = `<option value="">All repositories</option>${repos.map((r) => `<option value="${esc(r)}"${r === state.repo ? " selected" : ""}>${esc(shortRepo(r))}</option>`).join("")}`;
 
-  const list = I.filterEvents(state.events, state.filter, state.repo, state.query, state.hideMinor, state.prInfo);
+  const index = commentIndex();
+  const list = I.filterEvents(state.events, state.filter, state.repo, state.query, state.hideMinor, state.prInfo, index);
   const lastSeen = state.lastSeen ? new Date(state.lastSeen).getTime() : null;
   const groups = new Map();
   for (const e of list) {
@@ -677,6 +736,7 @@ function renderStream(c) {
           <span class="time">${esc(when.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}</span>
           <span class="glyph" title="${esc(I.eventLabel(e.type))}">${esc(GLYPHS[e.type] || "•")}</span>
           <div class="what"><div class="title">${esc(I.describeEvent(e, state.prInfo))}</div>
+            ${textBlock(`e:${e.id}`, I.eventText(e, index), agent)}
             <div class="meta"><span>${esc(shortRepo(I.repoName(e)))}</span>${branch && e.type !== "PushEvent" && e.type !== "CreateEvent" && e.type !== "DeleteEvent" ? `<span>${esc(branch)}</span>` : ""}${e.public === false ? "<span>private</span>" : ""}</div></div>
           <div class="tags">${tags.join("")}</div>
         </div>`;
@@ -1225,6 +1285,7 @@ function renderMeta(c) {
   cards.push(tokenCard());
   cards.push(rateCard());
   cards.push(historyCard());
+  cards.push(notesCard());
 
   cards.push(`<article class="card"><h3>This session</h3>
     <dl class="kv">
@@ -1358,6 +1419,274 @@ function showApp(on) {
   $("app").classList.toggle("hidden", !on);
 }
 
+// ---------- notes ----------
+// The main process stores notes. Edits update the list straight away and save after a short pause,
+// and every pending save is sent before the window closes or the account signs out.
+const NOTE_SAVE_DELAY = 450;
+const noteTimers = new Map();
+let noteInflight = 0;
+let noteSheetFor = null; // id of the note whose text the editor holds
+let noteCreating = false;
+let renderedNotes = null; // the notes object the pane last drew
+
+function notesFrom(result, userId) {
+  if (!result?.ok) return { userId, failed: result?.error || "Saved notes could not be opened.", list: [] };
+  return {
+    userId, list: result.notes, selected: N.sortNotes(result.notes)[0]?.id || null, query: "", status: "",
+    fileNote: result.note || "", colors: result.colors, limits: result.limits,
+  };
+}
+
+const currentNote = () => state.notes?.list.find((n) => n.id === state.notes.selected) || null;
+const editedLabel = (note) => `Edited ${new Date(note.updated).toLocaleString([], { dateStyle: "long", timeStyle: "short" })}`;
+const lengthLabel = (note) => `${fmt(note.text.length)} of ${fmt(state.notes.limits.chars)} characters`;
+
+function noteStatus(text, isError) {
+  if (state.notes) state.notes.status = text;
+  $("note-status").textContent = text;
+  $("note-status").classList.toggle("error", Boolean(isError));
+}
+
+function noteAlert(text) {
+  $("notes-alert").textContent = text || "";
+  $("notes-alert").classList.toggle("hidden", !text);
+}
+
+function renderNotes() {
+  const notes = state.notes;
+  renderedNotes = notes;
+  notesCaption();
+  if (!notes) return;
+  renderNoteList();
+  renderNoteSheet();
+}
+
+function notesCaption() {
+  const n = state.notes;
+  $("notes-count").textContent = n?.list.length ? String(n.list.length) : "";
+  if (state.streamSource !== "notes") return;
+  $("stream-caption").textContent = !n ? "Notes have not loaded."
+    : n.failed ? n.failed
+    : `${fmt(n.list.length)} ${n.list.length === 1 ? "note" : "notes"} for @${state.user.login}, kept on this Mac and encrypted. Notes save as you type and stay after you sign out.${n.fileNote ? ` ${n.fileNote}` : ""}`;
+}
+
+function renderNoteList() {
+  const notes = state.notes;
+  notesCaption();
+  const shown = N.filterNotes(N.sortNotes(notes.list), notes.query);
+  const now = new Date();
+  const item = (n) => {
+    const title = N.noteTitle(n.text);
+    const preview = N.notePreview(n.text) || (title ? "No additional text" : "");
+    return `<button type="button" class="note-item c-${esc(n.color)}" data-note="${esc(n.id)}" aria-current="${n.id === notes.selected}">
+      <span class="note-title">${esc(title || "New note")}</span>
+      <span class="note-sub"><span class="note-date">${esc(N.noteDateLabel(n.updated, now))}</span>${esc(preview)}</span>
+    </button>`;
+  };
+  const pinned = shown.filter((n) => n.pinned);
+  const others = shown.filter((n) => !n.pinned);
+  $("notes-list").innerHTML = !shown.length
+    ? `<p class="note notes-none">${notes.failed ? "" : notes.list.length ? "No notes match your search." : "No notes yet."}</p>`
+    : `${pinned.length ? `<div class="notes-group">Pinned</div>${pinned.map(item).join("")}` : ""}${others.length
+      ? `${pinned.length ? '<div class="notes-group">Notes</div>' : ""}${others.map(item).join("")}` : ""}`;
+}
+
+function renderNoteSheet() {
+  const notes = state.notes;
+  const note = currentNote();
+  $("note-new").disabled = Boolean(notes.failed) || noteCreating;
+  $("notes-search").disabled = Boolean(notes.failed);
+  if (notes.failed || !note) {
+    noteSheetFor = null;
+    $("note-sheet").classList.add("hidden");
+    $("note-empty").classList.remove("hidden");
+    $("note-empty").innerHTML = notes.failed
+      ? `<div><p>${esc(notes.failed)}</p><button class="btn" type="button" data-note-action="retry">Try again</button></div>`
+      : `<div><h3>${notes.list.length ? "No note selected" : "No notes yet"}</h3><p>Select <strong>New note</strong> to start one. Notes save as you type.</p></div>`;
+    return;
+  }
+  $("note-empty").classList.add("hidden");
+  $("note-sheet").className = `note-sheet c-${note.color}`;
+  const text = $("note-text");
+  if (noteSheetFor !== note.id) {
+    text.value = note.text;
+    text.maxLength = notes.limits.chars;
+    noteSheetFor = note.id;
+  }
+  $("note-when").textContent = editedLabel(note);
+  $("note-length").textContent = lengthLabel(note);
+  $("note-pin").textContent = note.pinned ? "Unpin" : "Pin";
+  $("note-pin").setAttribute("aria-pressed", String(note.pinned));
+  $("note-colors").innerHTML = (notes.colors || []).map((c) => {
+    const name = N.COLOR_NAMES[c] || c;
+    return `<button type="button" class="swatch c-${esc(c)}" data-note-color="${esc(c)}" aria-pressed="${c === note.color}" aria-label="${esc(name)}" title="${esc(name)}"></button>`;
+  }).join("");
+  $("note-status").textContent = notes.status || "";
+}
+
+function focusNoteEditor() {
+  const text = $("note-text");
+  text.focus();
+  text.setSelectionRange(text.value.length, text.value.length);
+}
+
+async function saveNoteText(id) {
+  clearTimeout(noteTimers.get(id));
+  noteTimers.delete(id);
+  const notes = state.notes;
+  const note = notes?.list.find((n) => n.id === id);
+  if (!note) return;
+  const text = note.text;
+  noteInflight += 1;
+  noteStatus("Saving…");
+  let result;
+  try {
+    result = await window.desk.saveNote({ id, text });
+  } catch {
+    result = { ok: false, error: "The note could not be saved." };
+  }
+  noteInflight -= 1;
+  if (state.notes !== notes) return;
+  if (!result.ok) {
+    noteStatus(`Not saved. ${result.error} Keep typing to try again.`, true);
+    return;
+  }
+  if (note.text === text) note.updated = result.note.updated;
+  if (!noteInflight && !noteTimers.size) noteStatus("Saved");
+}
+
+function scheduleNoteSave(id) {
+  clearTimeout(noteTimers.get(id));
+  noteTimers.set(id, setTimeout(() => saveNoteText(id), NOTE_SAVE_DELAY));
+  noteStatus("Editing…");
+}
+
+function flushNotes() {
+  return Promise.all([...noteTimers.keys()].map((id) => saveNoteText(id)));
+}
+
+// An empty note is dropped when you move away from it, as in Apple Notes.
+function discardIfEmpty(note) {
+  if (!note || note.text.trim()) return;
+  clearTimeout(noteTimers.get(note.id));
+  noteTimers.delete(note.id);
+  state.notes.list = state.notes.list.filter((n) => n.id !== note.id);
+  window.desk.deleteNote(note.id).catch(() => {});
+}
+
+function selectNote(id) {
+  const notes = state.notes;
+  if (!notes || notes.failed) return;
+  const previous = currentNote();
+  if (previous && previous.id !== id) discardIfEmpty(previous);
+  notes.selected = id;
+  noteAlert("");
+  renderNotes();
+  focusNoteEditor();
+}
+
+async function newNote() {
+  const notes = state.notes;
+  if (!notes || notes.failed || noteCreating) return;
+  const current = currentNote();
+  notes.query = "";
+  $("notes-search").value = "";
+  if (current && !current.text.trim()) {
+    renderNotes();
+    focusNoteEditor();
+    return;
+  }
+  noteCreating = true;
+  $("note-new").disabled = true;
+  let result;
+  try {
+    result = await window.desk.saveNote({});
+  } catch {
+    result = { ok: false, error: "The note could not be created." };
+  }
+  noteCreating = false;
+  if (state.notes !== notes) return;
+  if (!result.ok) {
+    noteAlert(result.error);
+    renderNotes();
+    return;
+  }
+  notes.list.push(result.note);
+  notes.selected = result.note.id;
+  noteAlert("");
+  renderNotes();
+  focusNoteEditor();
+}
+
+async function updateNote(patch) {
+  const notes = state.notes;
+  const note = currentNote();
+  if (!note) return;
+  let result;
+  try {
+    result = await window.desk.saveNote({ id: note.id, ...patch });
+  } catch {
+    result = { ok: false, error: "The note could not be saved." };
+  }
+  if (state.notes !== notes) return;
+  if (!result.ok) return noteAlert(result.error);
+  note.color = result.note.color;
+  note.pinned = result.note.pinned;
+  noteAlert("");
+  renderNotes();
+}
+
+async function removeNote() {
+  const notes = state.notes;
+  const note = currentNote();
+  if (!note || !window.confirm(`Delete “${N.noteTitle(note.text) || "New note"}”? This cannot be undone.`)) return;
+  const pending = noteTimers.has(note.id);
+  clearTimeout(noteTimers.get(note.id));
+  noteTimers.delete(note.id);
+  let result;
+  try {
+    result = await window.desk.deleteNote(note.id);
+  } catch {
+    result = { ok: false, error: "The note could not be deleted. Try again." };
+  }
+  if (state.notes !== notes) return;
+  if (!result.ok) {
+    if (pending) scheduleNoteSave(note.id);
+    return noteAlert(result.error);
+  }
+  const order = N.filterNotes(N.sortNotes(notes.list), notes.query);
+  const at = order.findIndex((n) => n.id === note.id);
+  const next = order[at + 1] || order[at - 1] || null;
+  notes.list = notes.list.filter((n) => n.id !== note.id);
+  notes.selected = next ? next.id : null;
+  noteAlert("");
+  noteStatus("");
+  renderNotes();
+}
+
+async function reloadNotes() {
+  const account = state;
+  if (!account.user) return;
+  const result = await window.desk.notes().catch(() => null);
+  if (account !== state) return;
+  account.notes = notesFrom(result, account.user.id);
+  renderAll();
+  renderNotes();
+}
+
+function notesCard() {
+  const n = state.notes;
+  if (!n) return "";
+  return `<article class="card"><h3>Notes on this Mac</h3>
+    ${n.failed ? `<div class="callout">${esc(n.failed)}</div>` : `<dl class="kv">
+      <dt>Notes for this account</dt><dd>${fmt(n.list.length)} of ${fmt(n.limits.notes)}</dd>
+      <dt>Pinned</dt><dd>${fmt(n.list.filter((x) => x.pinned).length)}</dd>
+    </dl>`}
+    ${n.fileNote ? `<p class="insight-notice">${esc(n.fileNote)}</p>` : ""}
+    <p class="note">Written in <strong>Stream → Notes</strong> and kept in the app's data folder, encrypted with the same Keychain-backed key as the token. Each account has its own notes. Signing out keeps them.</p>
+  </article>`;
+}
+
 // ---------- events ----------
 async function boot() {
   const button = $("signin-btn");
@@ -1421,11 +1750,18 @@ $("token-form").addEventListener("submit", async (event) => {
 async function signOut() {
   if (signingOut) return;
   signingOut = true;
+  // Pending note edits are saved while this account is still signed in.
+  await flushNotes().catch(() => {});
   showApp(false);
   state = { ...initialState };
+  openTexts.clear();
+  noteSheetFor = null;
+  $("note-text").value = "";
+  $("notes-search").value = "";
+  noteAlert("");
   for (const id of ["me-name", "me-login", "initials", "summary", "kpis", "attention", "notes", "year-caption",
     "year-heat", "stream-caption", "chips", "repo-filter", "minor-count", "stream", "insights", "meta",
-    "fresh-badge", "refreshed", "conversation-count", "suggestions", "suggestions-caption", "suggestion-count"]) $(id).textContent = "";
+    "fresh-badge", "refreshed", "conversation-count", "notes-count", "notes-list", "note-empty", "note-status", "suggestions", "suggestions-caption", "suggestion-count"]) $(id).textContent = "";
   $("search").value = "";
   $("hide-minor").checked = true;
   setBusy("");
@@ -1519,10 +1855,52 @@ $("chips").addEventListener("click", (event) => {
 $("stream-source").addEventListener("click", (event) => {
   const button = event.target.closest("[data-stream]");
   if (!button || state.streamSource === button.dataset.stream) return;
+  if (state.streamSource === "notes") flushNotes();
   state.streamSource = button.dataset.stream;
   renderStream(computed());
+  if (state.streamSource === "notes") renderNotes();
   $("content").scrollTop = 0;
 });
+$("notes-list").addEventListener("click", (event) => {
+  const item = event.target.closest("[data-note]");
+  if (item) selectNote(item.dataset.note);
+});
+$("note-new").addEventListener("click", newNote);
+$("note-pin").addEventListener("click", () => {
+  const note = currentNote();
+  if (note) updateNote({ pinned: !note.pinned });
+});
+$("note-colors").addEventListener("click", (event) => {
+  const swatch = event.target.closest("[data-note-color]");
+  if (swatch) updateNote({ color: swatch.dataset.noteColor });
+});
+$("note-delete").addEventListener("click", removeNote);
+$("note-empty").addEventListener("click", (event) => {
+  if (event.target.closest("[data-note-action=\"retry\"]")) reloadNotes();
+});
+$("notes-search").addEventListener("input", (event) => {
+  if (!state.notes) return;
+  state.notes.query = event.target.value;
+  renderNoteList();
+});
+$("note-text").addEventListener("input", (event) => {
+  const note = currentNote();
+  if (!note) return;
+  note.text = event.target.value;
+  note.updated = new Date().toISOString();
+  $("note-when").textContent = editedLabel(note);
+  $("note-length").textContent = lengthLabel(note);
+  renderNoteList();
+  scheduleNoteSave(note.id);
+});
+$("note-text").addEventListener("blur", () => { flushNotes(); });
+window.addEventListener("beforeunload", () => { flushNotes(); });
+// toggle does not bubble, so it is caught on the way down.
+$("stream").addEventListener("toggle", (event) => {
+  const key = event.target.dataset?.textKey;
+  if (!key) return;
+  if (event.target.open) openTexts.add(key); else openTexts.delete(key);
+}, true);
 $("repo-filter").addEventListener("change", (event) => {
   state.repo = event.target.value;
   renderStream(computed());
@@ -1546,6 +1924,11 @@ document.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key === "r") {
     event.preventDefault();
     if (!state.busy && !$("app").classList.contains("hidden")) $("refresh").click();
+  }
+  // New note while Stream → Notes is showing.
+  if ((event.metaKey || event.ctrlKey) && event.key === "n" && !$("notes-pane").closest(".hidden")) {
+    event.preventDefault();
+    newNote();
   }
   const tabs = ["overview", "stream", "insights", "suggestions", "meta"];
   if ((event.metaKey || event.ctrlKey) && /^[1-5]$/.test(event.key)) showTab(tabs[Number(event.key) - 1]);
