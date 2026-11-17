@@ -54,7 +54,12 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           tag="main-$COMMIT"
-          gh release create "$tag" --repo "$REPOSITORY" --target "$COMMIT" \
-            --title "Activity Desk $COMMIT" --notes "Automated arm64 build for commit $COMMIT. The app is ad-hoc signed and is not notarized." \
-            "$RUNNER_TEMP/release/Activity-Desk-macos-arm64.zip" \
-            "$RUNNER_TEMP/release/Activity-Desk-macos-arm64.zip.sha256"
+          assets=("$RUNNER_TEMP/release/Activity-Desk-macos-arm64.zip" "$RUNNER_TEMP/release/Activity-Desk-macos-arm64.zip.sha256")
+          if gh release view "$tag" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            # A re-run finds the release from the earlier attempt; refresh its assets instead of failing.
+            gh release upload "$tag" --repo "$REPOSITORY" --clobber "${assets[@]}"
+          else
+            gh release create "$tag" --repo "$REPOSITORY" --target "$COMMIT" \
+              --title "Activity Desk $COMMIT" --notes "Automated arm64 build for commit $COMMIT. The app is ad-hoc signed and is not notarized." \
+              "${assets[@]}"
+          fi
