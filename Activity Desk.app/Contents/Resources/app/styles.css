@@ -254,6 +254,17 @@ input[type="search"] { width: 180px; }
 .weekly span { flex: 1 1 0; min-width: 2px; border-radius: 2px 2px 0 0; background: color-mix(in srgb, var(--muted) 40%, transparent); }
 .weekly span.after { background: var(--accent); }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.tokens-card { margin-bottom: 16px; }
+.token-slots { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin-top: 10px; }
+.token-slot { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+.token-slot h4 { margin: 0; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+.token-slot .kv dd { overflow-wrap: anywhere; }
+.tag.saved { color: var(--good); }
+.token-form { margin-top: 14px; }
+.token-form label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.token-row { display: flex; gap: 8px; }
+.token-row input { flex: 1; min-width: 0; height: 36px; padding: 0 12px; border-radius: 9px; border: 1px solid var(--line); background: var(--surface-2); }
+.tokens-card .msg:empty { min-height: 0; margin: 0; }
 .plain { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 4px; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .stream-source { border-bottom: 0; padding-bottom: 12px; }
 .stream-source .n { margin-left: 4px; color: var(--accent); font-weight: 600; }

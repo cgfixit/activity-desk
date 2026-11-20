@@ -6,7 +6,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL, URL: NodeURL } = require("node:url");
 
-const TOKEN_PAGE = "https://github.com/settings/personal-access-tokens/new?name=Activity%20Desk";
+const TOKEN_PAGES = {
+  "fine-grained": "https://github.com/settings/personal-access-tokens/new?name=Activity%20Desk",
+  classic: "https://github.com/settings/tokens/new?description=Activity%20Desk&scopes=notifications",
+};
 const API = "https://api.github.com";
 // Suggestions cite sources from this catalogue. The renderer asks for a link by id only.
 const { READING } = require(path.join(__dirname, "insights.js"));
@@ -50,25 +53,55 @@ async function writeEncrypted(name, text) {
   }
 }
 
-function writeToken(token) {
-  return writeEncrypted("github-token.enc", token);
+// ---------- Saved tokens ----------
+// Up to two tokens for one GitHub account, one per slot: a fine-grained personal access token and a
+// classic (scope-based) token. They are kept together in one encrypted file, and a token is only saved
+// after GitHub confirms it and, when the other slot is in use, that both belong to the same account.
+const TOKENS_FILE = "github-tokens.enc";
+const TOKENS_VERSION = 1;
+const SLOTS = ["fine-grained", "classic"];
+const TOKEN = /^[!-~]{20,512}$/;
+const slotOf = (token) => (token.startsWith("github_pat_") ? "fine-grained" : "classic");
+
+function cleanTokens(parsed) {
+  const tokens = {};
+  if (parsed?.version !== TOKENS_VERSION || !parsed.tokens || typeof parsed.tokens !== "object") return tokens;
+  for (const slot of SLOTS) {
+    const token = parsed.tokens[slot];
+    if (typeof token === "string" && TOKEN.test(token) && slotOf(token) === slot) tokens[slot] = token;
+  }
+  return tokens;
 }
 
-async function readToken() {
+function writeTokens(tokens) {
+  return writeEncrypted(TOKENS_FILE, JSON.stringify({ version: TOKENS_VERSION, tokens }));
+}
+
+// Earlier versions kept a single token, first in a plaintext file and then in github-token.enc.
+const LEGACY_TOKEN_FILES = ["github-token", "github-token.enc"];
+function removeLegacyTokens() {
+  for (const name of LEGACY_TOKEN_FILES) fs.rmSync(path.join(app.getPath("userData"), name), { force: true });
+}
+
+async function readTokens() {
   const profile = app.getPath("userData");
-  const legacy = path.join(profile, "github-token");
-  const encrypted = readIfPresent(path.join(profile, "github-token.enc"));
+  const encrypted = readIfPresent(path.join(profile, TOKENS_FILE));
   if (encrypted) {
     const { result, shouldReEncrypt } = await safeStorage.decryptStringAsync(encrypted);
-    if (shouldReEncrypt) await writeToken(result);
-    fs.rmSync(legacy, { force: true });
-    return result;
+    const tokens = cleanTokens(JSON.parse(result));
+    if (shouldReEncrypt) await writeTokens(tokens);
+    removeLegacyTokens();
+    return tokens;
   }
-  const token = readIfPresent(legacy)?.toString("utf8").trim();
-  if (!token) return "";
-  await writeToken(token);
-  fs.rmSync(legacy, { force: true });
-  return token;
+  let single = "";
+  const earlier = readIfPresent(path.join(profile, "github-token.enc"));
+  if (earlier) single = (await safeStorage.decryptStringAsync(earlier)).result;
+  else single = readIfPresent(path.join(profile, "github-token"))?.toString("utf8").trim() || "";
+  if (!TOKEN.test(single)) return {};
+  const tokens = { [slotOf(single)]: single };
+  await writeTokens(tokens);
+  removeLegacyTokens();
+  return tokens;
 }
 
 function createWindow() {
@@ -130,6 +163,14 @@ function tokenKind(token) {
   return "GitHub";
 }
 
+// What the renderer learns about the saved tokens: which slots are in use and each token's kind.
+function tokenSummary(tokens) {
+  const saved = {};
+  for (const slot of SLOTS) saved[slot] = tokenKind(tokens[slot]);
+  const first = SLOTS.find((slot) => tokens[slot]);
+  return { signedIn: Boolean(first), kind: first ? saved[first] : null, tokens: saved };
+}
+
 function handle(channel, operation) {
   ipcMain.handle(`desk:${channel}`, (event, ...args) => {
     const frame = event.senderFrame;
@@ -145,6 +186,7 @@ function resetSession() {
   session.abort();
   session = new AbortController();
   sessionUser = null;
+  preferred.clear();
 }
 
 // ---------- Saved history ----------
@@ -473,43 +515,117 @@ handle("note-delete", (id) => withNotes(async () => {
 
 handle("status", () => withCredentials(async () => {
   try {
-    const token = await readToken();
-    return { ok: true, signedIn: Boolean(token), kind: tokenKind(token) };
+    return { ok: true, ...tokenSummary(await readTokens()) };
   } catch {
     return { ok: false, error: "Could not open the saved credential or finish its migration." };
   }
 }));
 
+// Asks GitHub whose token this is. Used before a token is saved, never with a renderer-chosen route.
+async function tokenOwner(token) {
+  try {
+    const response = await fetch(`${API}/user`, {
+      headers: githubHeaders(token),
+      redirect: "error",
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      return { ok: false, status: response.status };
+    }
+    const { id, login } = await response.json();
+    if (!Number.isSafeInteger(id) || typeof login !== "string" || !LOGIN.test(login)) return { ok: false, status: 0 };
+    return { ok: true, id, login };
+  } catch {
+    return { ok: false, status: 0 };
+  }
+}
+
+// Saves a token in its slot. A token for the slot already in use replaces it. A token for the other
+// slot is added beside it, but only when GitHub reports the same account for both.
 handle("sign-in", (token) => withCredentials(async () => {
   const value = typeof token === "string" ? token.trim() : "";
-  if (value.length < 20 || !/^[!-~]+$/.test(value)) {
-    return { ok: false, error: "That does not look like a GitHub token." };
-  }
+  if (!TOKEN.test(value)) return { ok: false, error: "That does not look like a GitHub token." };
+  const slot = slotOf(value);
+  let tokens;
   try {
     fs.mkdirSync(app.getPath("userData"), { recursive: true });
-    await writeToken(value);
-    resetSession();
-    fs.rmSync(path.join(app.getPath("userData"), "github-token"), { force: true });
-    return { ok: true, kind: tokenKind(value) };
+    tokens = await readTokens();
+  } catch {
+    return { ok: false, error: "Could not open the saved credential or finish its migration." };
+  }
+  const owner = await tokenOwner(value);
+  if (!owner.ok) {
+    return owner.status === 401
+      ? { ok: false, status: 401, error: "GitHub rejected that token. Nothing was saved." }
+      : { ok: false, status: owner.status, error: "Could not check that token with GitHub. Nothing was saved. Try again." };
+  }
+  // While an account is loaded, its tokens can be added or replaced, not swapped for another account's.
+  if (sessionUser && sessionUser.id !== owner.id) {
+    return { ok: false, status: 409, error: `That token belongs to @${owner.login}, not @${sessionUser.login}. Sign out to switch accounts.` };
+  }
+  const other = SLOTS.find((s) => s !== slot && tokens[s]);
+  let dropped = null;
+  if (other) {
+    const saved = await tokenOwner(tokens[other]);
+    if (saved.ok && saved.id !== owner.id) {
+      return {
+        ok: false, status: 409,
+        error: `That token belongs to @${owner.login}, and the saved ${other} token belongs to @${saved.login}. Both tokens must be for the same account. Remove the saved token first to switch accounts.`,
+      };
+    }
+    // A saved token GitHub no longer accepts cannot vouch for an account, so it is removed.
+    if (!saved.ok && saved.status === 401) { delete tokens[other]; dropped = other; }
+    else if (!saved.ok) return { ok: false, status: saved.status, error: `Could not check the saved ${other} token with GitHub. Nothing was saved. Try again.` };
+  }
+  const replaced = Boolean(tokens[slot]);
+  tokens[slot] = value;
+  try {
+    await writeTokens(tokens);
+    removeLegacyTokens();
   } catch {
     return { ok: false, error: "Could not save the credential securely or remove the legacy copy." };
+  }
+  // An account that is already loaded keeps its session. Otherwise requests in flight are dropped.
+  if (sessionUser) preferred.clear();
+  else resetSession();
+  return { ok: true, slot, replaced, dropped, login: owner.login, ...tokenSummary(tokens) };
+}));
+
+// Removes one saved token. Removing the last one signs out.
+handle("remove-token", (slot) => withCredentials(async () => {
+  if (typeof slot !== "string" || !SLOTS.includes(slot)) return { ok: false, status: 400, error: "Unknown token." };
+  try {
+    const tokens = await readTokens();
+    delete tokens[slot];
+    preferred.clear();
+    if (SLOTS.some((s) => tokens[s])) await writeTokens(tokens);
+    else {
+      resetSession();
+      fs.rmSync(path.join(app.getPath("userData"), TOKENS_FILE), { force: true });
+    }
+    return { ok: true, ...tokenSummary(tokens) };
+  } catch {
+    return { ok: false, error: "Could not remove the saved token. Try again." };
   }
 }));
 
 handle("sign-out", () => withCredentials(() => {
   resetSession();
   try {
-    const profile = app.getPath("userData");
-    fs.rmSync(path.join(profile, "github-token"), { force: true });
-    fs.rmSync(path.join(profile, "github-token.enc"), { force: true });
+    removeLegacyTokens();
+    fs.rmSync(path.join(app.getPath("userData"), TOKENS_FILE), { force: true });
     return { ok: true };
   } catch {
     return { ok: false, error: "Could not remove the saved credential. Try signing out again." };
   }
 }));
 
-handle("open-token-page", async () => {
-  await shell.openExternal(TOKEN_PAGE);
+// Opens GitHub's form for a new token of the given kind. The classic form starts with only the
+// notifications scope selected.
+handle("open-token-page", async (kind = "fine-grained") => {
+  if (typeof kind !== "string" || !Object.hasOwn(TOKEN_PAGES, kind)) return { ok: false, status: 400, error: "Unknown token type." };
+  await shell.openExternal(TOKEN_PAGES[kind]);
   return { ok: true };
 });
 
@@ -692,44 +808,86 @@ function githubRequest(operation, args) {
   return null;
 }
 
-handle("github", async (operation, args) => {
-  const request = githubRequest(operation, args);
-  if (!request) return { ok: false, status: 400, error: "Unsupported GitHub read operation." };
-
-  let credential;
-  try {
-    credential = await withCredentials(async () => ({ token: await readToken(), signal: session.signal }));
-  } catch {
-    return { ok: false, status: 0, error: "Could not open the saved credential." };
-  }
-  if (!credential.token) return { ok: false, status: 401, error: "Sign in first." };
-
+function githubHeaders(token, request) {
   const headers = {
-    Accept: request.accept || "application/vnd.github+json",
-    Authorization: `Bearer ${credential.token}`,
+    Accept: request?.accept || "application/vnd.github+json",
+    Authorization: `Bearer ${token}`,
     "User-Agent": "ActivityDesk",
     "X-GitHub-Api-Version": "2022-11-28",
   };
-  if (request.body) headers["Content-Type"] = "application/json";
+  if (request?.body) headers["Content-Type"] = "application/json";
+  return headers;
+}
+
+// ---------- Which saved token answers a read ----------
+// GitHub's notification endpoints accept classic tokens only. Every other read starts with the
+// fine-grained token and moves to the classic one when GitHub denies the first: 401, or a 403 or 404
+// that is not a rate limit. Both tokens share the account's rate limit, so a rate-limited request is
+// not retried. The slot that answered after a denial goes first for that operation until the session
+// or the saved tokens change. The renderer may name a slot to read a source with each token in turn.
+const CLASSIC_ONLY = new Set(["notifications"]);
+const preferred = new Map();
+
+function tokenOrder(operation, tokens, slot) {
+  if (slot !== undefined) return tokens[slot] ? [slot] : [];
+  if (CLASSIC_ONLY.has(operation)) return tokens.classic ? ["classic"] : [];
+  const first = preferred.get(operation);
+  return SLOTS.filter((s) => tokens[s]).sort((a, b) => (b === first) - (a === first));
+}
+
+const rateLimited = (response) => response.headers.get("x-ratelimit-remaining") === "0" || response.headers.has("retry-after");
+const denied = (response) => response.status === 401 || ((response.status === 403 || response.status === 404) && !rateLimited(response));
+
+// Token metadata GitHub reports on responses: the permissions an endpoint accepts for
+// fine-grained tokens, the granted scopes of a classic token, and the token's expiry when sent.
+const tokenInfo = (response) => ({
+  accepted: response.headers.get("x-accepted-github-permissions"),
+  scopes: response.headers.get("x-oauth-scopes"),
+  expires: response.headers.get("github-authentication-token-expiration"),
+});
+
+handle("github", async (operation, args, slot) => {
+  const request = githubRequest(operation, args);
+  if (!request || (slot !== undefined && !SLOTS.includes(slot))) return { ok: false, status: 400, error: "Unsupported GitHub read operation." };
+
+  let credential;
   try {
-    const response = await fetch(API + request.route, {
-      method: request.body ? "POST" : "GET",
-      headers,
-      body: request.body ? JSON.stringify(request.body) : undefined,
-      redirect: "error",
-      signal: AbortSignal.any([credential.signal, AbortSignal.timeout(30000)]),
-    });
-    // Token metadata GitHub reports on responses: the permissions an endpoint accepts for
-    // fine-grained tokens, the granted scopes of a classic token, and the token's expiry when sent.
-    const tokenInfo = {
-      accepted: response.headers.get("x-accepted-github-permissions"),
-      scopes: response.headers.get("x-oauth-scopes"),
-      expires: response.headers.get("github-authentication-token-expiration"),
-    };
+    credential = await withCredentials(async () => ({ tokens: await readTokens(), signal: session.signal }));
+  } catch {
+    return { ok: false, status: 0, error: "Could not open the saved credential." };
+  }
+  if (!SLOTS.some((s) => credential.tokens[s])) return { ok: false, status: 401, error: "Sign in first." };
+  const order = tokenOrder(operation, credential.tokens, slot);
+  if (!order.length) {
+    return slot === undefined
+      ? { ok: false, status: 403, error: "GitHub accepts only a classic token for this request, and none is saved." }
+      : { ok: false, status: 400, error: `No ${slot} token is saved.` };
+  }
+
+  try {
+    // Tokens GitHub denied before another one answered, with what GitHub said about each.
+    const skipped = [];
+    let response;
+    let via;
+    for (const [i, candidate] of order.entries()) {
+      via = candidate;
+      response = await fetch(API + request.route, {
+        method: request.body ? "POST" : "GET",
+        headers: githubHeaders(credential.tokens[candidate], request),
+        body: request.body ? JSON.stringify(request.body) : undefined,
+        redirect: "error",
+        signal: AbortSignal.any([credential.signal, AbortSignal.timeout(30000)]),
+      });
+      if (response.ok || i === order.length - 1 || !denied(response)) break;
+      skipped.push({ slot: candidate, status: response.status, token: tokenInfo(response) });
+      await response.body?.cancel();
+    }
+    const token = tokenInfo(response);
     if (!response.ok) {
       await response.body?.cancel();
-      return { ok: false, status: response.status, remaining: response.headers.get("x-ratelimit-remaining"), token: tokenInfo };
+      return { ok: false, status: response.status, remaining: response.headers.get("x-ratelimit-remaining"), token, via, skipped };
     }
+    if (skipped.length) preferred.set(operation, via);
     let body = await response.text();
     if (operation === "profile") {
       const { id, login, name } = JSON.parse(body);
@@ -770,7 +928,9 @@ handle("github", async (operation, args) => {
       body,
       link: response.headers.get("link"),
       remaining: response.headers.get("x-ratelimit-remaining"),
-      token: tokenInfo,
+      token,
+      via,
+      skipped,
     };
   } catch {
     return { ok: false, status: 0, error: "GitHub request did not complete." };

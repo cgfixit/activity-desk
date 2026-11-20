@@ -25,15 +25,19 @@
         <button class="btn primary wide" type="submit" id="signin-btn">Sign in</button>
       </form>
       <p class="msg" id="signin-error" role="alert"></p>
-      <button class="btn ghost hidden" id="forget-token" type="button">Remove saved token</button>
+      <button class="btn ghost hidden" id="forget-token" type="button">Remove saved tokens</button>
       <details class="help">
         <summary>Which token should I use?</summary>
         <ul>
           <li><strong>Fine-grained</strong> (recommended) works for the stream and insights. Set the resource owner to your account and grant read-only access only. For private events, add the account permission <strong>Events: read</strong>. For private pull request details, give it access to those repositories with <strong>Pull requests: read</strong>. For private issue conversations, add <strong>Issues: read</strong>. For repository traffic in Footprint, add <strong>Administration: read</strong>. A fine-grained token covers one account or organization.</li>
-          <li><strong>Classic</strong> with <code>notifications</code> enables the unread inbox. GitHub's classic <code>repo</code> scope also grants write access to private repositories.</li>
-          <li>Activity Desk encrypts the saved token using macOS Keychain and sends it only to api.github.com.</li>
+          <li><strong>Classic</strong> with <code>notifications</code> enables the unread inbox, which GitHub serves only to classic tokens. GitHub's classic <code>repo</code> scope also grants write access to private repositories.</li>
+          <li><strong>Both</strong> work together. Sign in with either one, then add the other for the same account in <strong>Data &amp; access</strong>. Activity Desk reads notifications with the classic token and joins what each token can see.</li>
+          <li>Activity Desk encrypts saved tokens using macOS Keychain and sends them only to api.github.com.</li>
         </ul>
-        <button class="btn ghost" id="create-token" type="button">Create a fine-grained token</button>
+        <div class="actions">
+          <button class="btn ghost" id="create-token" type="button">Create a fine-grained token</button>
+          <button class="btn ghost" id="create-classic-token" type="button">Create a classic token</button>
+        </div>
       </details>
     </div>
   </main>
@@ -163,6 +167,22 @@
           <h2>Data &amp; access</h2>
           <p class="lede">What this view can and cannot see, and why the numbers differ from your profile page.</p>
         </header>
+        <article class="card tokens-card">
+          <h3>Token check</h3>
+          <div id="token-check"></div>
+          <form id="add-token-form" class="token-form">
+            <label for="add-token">Add a second token for this account, or replace a saved one</label>
+            <div class="token-row">
+              <input id="add-token" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_… or ghp_…" required>
+              <button class="btn primary" type="submit" id="add-token-btn">Save token</button>
+            </div>
+          </form>
+          <p class="msg" id="add-token-msg" role="status"></p>
+          <div class="actions">
+            <button class="btn ghost" id="add-fine-grained" type="button">Create a fine-grained token</button>
+            <button class="btn ghost" id="add-classic" type="button">Create a classic token</button>
+          </div>
+        </article>
         <div class="grid two" id="meta"></div>
       </section>
     </main>

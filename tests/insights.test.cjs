@@ -271,3 +271,41 @@ test("finds the text behind comment events in the payload or the loaded conversa
   assert.equal(insights.filterEvents(events, "comment", "", "RETRY LOOP", false, {}, index).length, 1);
   assert.equal(insights.filterEvents(events, "comment", "", "absent", false, {}, index).length, 0);
 });
+
+test("joins what a fine-grained and a classic token each returned for one account", () => {
+  const events = insights.mergeTokenEvents([
+    { slot: "fine-grained", events: [{ id: "1" }, { id: "2" }] },
+    { slot: "classic", events: [{ id: "2" }, { id: "3" }, { id: "4" }, null] },
+  ]);
+  assert.deepEqual([events.events.map((e) => e.id), events.only], [["1", "2", "3", "4"], { "fine-grained": 1, classic: 2 }]);
+
+  const load = (info, extra = {}) => ({ info, loaded: Object.keys(info).length, total: Object.keys(info).length, capped: false, partial: false, issue: "", days: 90, ...extra });
+  const prs = insights.mergePullRequestLoads([
+    { slot: "fine-grained", load: load({ "a/b#1": { title: "one" } }, { partial: true }) },
+    { slot: "classic", load: load({ "a/b#1": { title: "one" }, "org/c#2": { title: "two" } }, { total: 5, capped: true, issue: "Page 2 did not load." }) },
+  ]);
+  assert.deepEqual(Object.keys(prs.info), ["a/b#1", "org/c#2"]);
+  assert.deepEqual([prs.loaded, prs.total, prs.capped, prs.partial, prs.partialSlots, prs.only, prs.days],
+    [2, 5, true, true, ["fine-grained"], { "fine-grained": 0, classic: 1 }, 90]);
+  assert.equal(prs.issue, "With the classic token: Page 2 did not load.");
+
+  const thread = (repo, number, comments) => ({ repository: { nameWithOwner: repo }, number, comments: { nodes: Array(comments).fill({}) } });
+  const talk = insights.mergeConversationData([
+    { slot: "fine-grained", data: { issues: { issueCount: 1, nodes: [thread("a/b", 1, 1)] }, pullRequests: null } },
+    { slot: "classic", data: { issues: { issueCount: 2, nodes: [thread("a/b", 1, 3), thread("org/c", 2, 1)] }, pullRequests: { issueCount: 1, nodes: [thread("org/c", 9, 0)] } } },
+  ]);
+  assert.deepEqual(talk.only, { "fine-grained": 0, classic: 2 });
+  assert.deepEqual(talk.data.issues.nodes.map((n) => [n.number, n.comments.nodes.length]), [[1, 3], [2, 1]], "the fuller copy of a shared thread is kept");
+  assert.deepEqual([talk.data.issues.issueCount, talk.data.pullRequests.nodes.length], [2, 1]);
+
+  const year = (restricted, errors) => ({ errors, data: { viewer: { contributionsCollection: { restrictedContributionsCount: restricted, contributionCalendar: { weeks: [] } } } } });
+  const pick = (reads) => insights.pickContributionYear(reads)?.slot;
+  assert.equal(pick([{ slot: "fine-grained", data: year(40) }, { slot: "classic", data: year(0) }]), "classic", "fewer hidden contributions wins");
+  assert.equal(pick([{ slot: "fine-grained", data: year(0) }, { slot: "classic", data: year(0) }]), "fine-grained", "a tie keeps the fine-grained token");
+  assert.equal(pick([{ slot: "fine-grained", data: year(0, [{ message: "partial" }]) }, { slot: "classic", data: year(9) }]), "classic", "a complete read beats a partial one");
+  assert.equal(pick([{ slot: "fine-grained", data: { data: null } }]), undefined);
+
+  const paired = insights.deriveSuggestions({ token: { kind: "classic", write: ["repo"], paired: true } }).items.find((s) => s.id === "fine-grained-token");
+  assert.match(paired.title, /Narrow the classic token/);
+  assert.equal(insights.deriveSuggestions({ token: { kind: "classic", write: [], paired: true } }).items.some((s) => s.id === "fine-grained-token"), false);
+});

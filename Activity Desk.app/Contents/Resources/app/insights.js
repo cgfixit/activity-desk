@@ -1325,11 +1325,23 @@ const SUGGESTION_RULES = [
       if (token.kind !== "classic") return null;
       if (!token.write) return { unavailable: "GitHub has not reported this token's scopes." };
       if (!token.write.length) return null;
+      const scopes = `${token.write.length === 1 ? "a scope that allows" : "scopes that allow"} writes: ${token.write.join(", ")}`;
+      // With a fine-grained token saved beside it, the classic token is only needed for what the
+      // fine-grained one cannot read.
+      if (token.paired) {
+        return {
+          tone: "warn",
+          title: "Narrow the classic token",
+          seen: `The classic token saved beside your fine-grained token has ${scopes}. Activity Desk only reads.`,
+          why: [["GitHub recommends fine-grained tokens over classic ones whenever possible.", "gh-pat"]],
+          act: [["If you keep the classic token only for the unread inbox, replace it with one that has just the notifications scope, then revoke the old one. Keep a wider scope only for organization or private data the fine-grained token cannot reach."]],
+        };
+      }
       return {
         tone: "warn",
-        seen: `This classic token has ${token.write.length === 1 ? "a scope that allows" : "scopes that allow"} writes: ${token.write.join(", ")}. Activity Desk only reads.`,
+        seen: `This classic token has ${scopes}. Activity Desk only reads.`,
         why: [["GitHub recommends fine-grained tokens over classic ones whenever possible.", "gh-pat"]],
-        act: [["Create a fine-grained token with only the read permissions in Quick start, sign in with it, and revoke the classic token."]],
+        act: [["Create a fine-grained token with only the read permissions in Quick start and sign in with it. Keep a classic token with just the notifications scope beside it if you want the unread inbox, and revoke this one."]],
       };
     },
   },
@@ -1353,7 +1365,7 @@ function deriveSuggestions(input) {
       // Number the sources in the order the text cites them, then any further reading.
       const cited = [...(result.why || []), ...(result.act || [])].flatMap((segment) => segment.slice(1));
       const reading = [...new Set([...cited, ...(result.more || [])])].filter((id) => Object.hasOwn(READING, id));
-      items.push({ ...base, tone: result.tone, seen: result.seen, why: result.why || [], act: result.act || [], reading });
+      items.push({ ...base, title: result.title || rule.title, tone: result.tone, seen: result.seen, why: result.why || [], act: result.act || [], reading });
       checked.push({ ...base, status: "shown" });
     }
   }
@@ -1617,6 +1629,93 @@ function classicScopes(header) {
   if (header == null) return null;
   const scopes = String(header).split(",").map((s) => s.trim()).filter(Boolean);
   return { scopes, write: scopes.filter((s) => WRITE_SCOPES.has(s)) };
+}
+
+// ---------- Two tokens, one account ----------
+// A fine-grained token and a classic token for the same account can see different parts of it: the
+// fine-grained token reaches one resource owner, and the classic one reaches what its scopes allow.
+// These helpers merge what each token returned for one source and count what only one of them saw.
+const TOKEN_SLOTS = ["fine-grained", "classic"];
+
+// loads: [{ slot, value }]. entries(value) lists [key, item] pairs. A later item replaces an earlier
+// one for the same key only when better(later, earlier) says so.
+function unionBySlot(loads, entries, better) {
+  const merged = new Map();
+  const seenBy = new Map();
+  for (const { slot, value } of loads) {
+    for (const [key, item] of entries(value)) {
+      if (!merged.has(key) || (better && better(item, merged.get(key)))) merged.set(key, item);
+      if (!seenBy.has(key)) seenBy.set(key, new Set());
+      seenBy.get(key).add(slot);
+    }
+  }
+  const only = {};
+  for (const { slot } of loads) only[slot] = 0;
+  for (const slots of seenBy.values()) if (slots.size === 1) only[[...slots][0]] += 1;
+  return { merged, only };
+}
+
+// Events from each token's read of the same feed, joined by event id.
+function mergeTokenEvents(loads) {
+  const { merged, only } = unionBySlot(loads.map((l) => ({ slot: l.slot, value: l.events })),
+    (events) => (events || []).filter((e) => e && e.id != null).map((e) => [String(e.id), e]));
+  return { events: [...merged.values()], only };
+}
+
+// Pull request searches from each token, joined by repository and number. loads: [{ slot, load }]
+// with the load shape of one search. The total is the larger match count, since each search counts
+// only what its token can read.
+function mergePullRequestLoads(loads) {
+  const { merged, only } = unionBySlot(loads.map((l) => ({ slot: l.slot, value: l.load.info })), (info) => Object.entries(info || {}));
+  const all = loads.map((l) => l.load);
+  const loaded = merged.size;
+  return {
+    info: Object.fromEntries(merged),
+    loaded,
+    total: Math.max(loaded, ...all.map((l) => l.total || 0)),
+    capped: all.some((l) => l.capped),
+    partial: all.some((l) => l.partial),
+    partialSlots: loads.filter((l) => l.load.partial).map((l) => l.slot),
+    issue: loads.filter((l) => l.load.issue).map((l) => `With the ${l.slot} token: ${l.load.issue}`).join(" "),
+    days: all[0]?.days,
+    only,
+  };
+}
+
+// Conversation searches from each token, joined per search by thread. The copy of a thread that
+// carries more comments and reviews is kept. Returns the shape flattenConversations reads.
+function mergeConversationData(loads) {
+  const size = (n) => (n.comments?.nodes?.length || 0) + (n.reviews?.nodes?.length || 0);
+  const data = {};
+  const only = {};
+  for (const { slot } of loads) only[slot] = 0;
+  for (const key of CONVERSATION_SEARCHES) {
+    const found = loads.filter((l) => Array.isArray(l.data?.[key]?.nodes));
+    if (!found.length) continue;
+    const { merged, only: seen } = unionBySlot(found.map((l) => ({ slot: l.slot, value: l.data[key].nodes })),
+      (nodes) => nodes.filter((n) => n && n.repository && Number.isInteger(n.number)).map((n) => [`${n.repository.nameWithOwner}#${n.number}`, n]),
+      (a, b) => size(a) > size(b));
+    for (const [slot, n] of Object.entries(seen)) only[slot] += n;
+    const counts = found.map((l) => l.data[key].issueCount).filter(Number.isInteger);
+    data[key] = { nodes: [...merged.values()], issueCount: Math.max(merged.size, ...counts) };
+  }
+  return { data, only };
+}
+
+// Of two reads of the contribution year, the one that hides fewer contributions from its token.
+// reads: [{ slot, data }] where data is the GraphQL response body. Returns the chosen read or null.
+function pickContributionYear(reads) {
+  const rank = (r) => {
+    const c = r.data?.data?.viewer?.contributionsCollection;
+    if (!Array.isArray(c?.contributionCalendar?.weeks)) return null;
+    return [r.data.errors?.length ? 1 : 0, Number.isInteger(c.restrictedContributionsCount) ? c.restrictedContributionsCount : Infinity];
+  };
+  let best = null;
+  for (const r of reads) {
+    const score = rank(r);
+    if (score && (!best || score[0] < best.score[0] || (score[0] === best.score[0] && score[1] < best.score[1]))) best = { ...r, score };
+  }
+  return best;
 }
 
 const RATE_LABELS = { core: "REST", graphql: "GraphQL" };
@@ -1970,6 +2069,11 @@ const api = {
   parseTokenExpiry,
   tokenExpiryStatus,
   classicScopes,
+  TOKEN_SLOTS,
+  mergeTokenEvents,
+  mergePullRequestLoads,
+  mergeConversationData,
+  pickContributionYear,
   summarizeRateLimit,
   summarizeFootprint,
   summarizeContributionHistory,

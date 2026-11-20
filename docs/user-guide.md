@@ -1,6 +1,6 @@
 # User guide
 
-Activity Desk gives you one place to review GitHub activity across the repositories visible to your token. See [Quick start](quick-start.md) to install the app and sign in.
+Activity Desk gives you one place to review GitHub activity across the repositories visible to your token, or to the two tokens you save for one account. See [Quick start](quick-start.md) to install the app and sign in.
 
 ## Views
 
@@ -8,7 +8,7 @@ Activity Desk gives you one place to review GitHub activity across the repositor
 - **Stream** has three sources. **Your events** filters your loaded events by type, repository, and search text. Clear **Hide routine changes** to include events such as PR label changes. Comment, review, and agent rows show what was written. See [Reading comment text](#reading-comment-text). **Conversations** lists comments, reviews, and review comments on issues and pull requests that involve you, open or closed, including replies from other people. **Mark all seen** updates a timestamp for your account on this Mac, and both sources mark newer items as **New**. **Notes** holds sticky notes you write. See [Using Notes](#using-notes).
 - **Insights** shows your contribution calendar, an event heatmap, and merge timing, recorded reviews, and change sizes for loaded pull requests. In **Recent events**, select a repository to open its events in Stream. **Patterns** derives findings the other views do not state: how concentrated your output is, where the last four weeks rank in the year, how events group into work sessions, how agent-branch merges compare with the rest, whether weekly output shifted, how often branches reach a merge, how long your pull requests wait for a person to review them, and who you review with in each direction. **Footprint** shows traffic to the repositories you own. See [Reading Footprint](#reading-footprint). **All years** compares calendar years. See [Reading All years](#reading-all-years).
 - **Suggestions** turns patterns in the loaded data into specific changes to try, each with its evidence and sources. See [Reading Suggestions](#reading-suggestions).
-- **Data & access** shows which sources loaded and flags limits, missing data, and permission errors. **Token check** and **Rate-limit budget** describe the token itself. See [Checking your token](#checking-your-token).
+- **Data & access** shows which sources loaded and flags limits, missing data, and permission errors. **Token check** and **Rate-limit budget** describe each saved token. See [Checking your tokens](#checking-your-tokens) and [Using two tokens](#using-two-tokens).
 
 ![Recent events and repository filters using fictional activity](screenshots/recent-events.png)
 
@@ -140,27 +140,49 @@ Pull request suggestions use the pull requests you opened in the last 90 days pl
 | [Rate-limit budget](https://docs.github.com/en/rest/rate-limit/rate-limit) | REST and GraphQL limits read after each refresh. GitHub does not count this read against the limit. |
 | [Contribution year](https://docs.github.com/en/graphql/reference/users#contributionscollection) | GitHub's rolling contribution calendar and up to 10 repository totals for commit contributions. The 30-day comparison includes today. |
 | [Conversations](https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests#search-by-a-user-thats-involved-in-an-issue-or-pull-request) | Up to 25 issues and 25 pull requests that involve you and were updated in the last 30 days. Each shows its latest 10 comments, latest 10 reviews, and up to 5 review comments per review. |
-| [Unread notifications](https://docs.github.com/en/rest/activity/notifications) | The first page of up to 50 unread notifications with a supported token. |
+| [Unread notifications](https://docs.github.com/en/rest/activity/notifications) | The first page of up to 50 unread notifications. GitHub serves them only to a classic token. |
 
 Push counts describe the reported refs, including branches named `main` or `master`, other branches, and tags. A branch name alone cannot establish default-branch status or whether a push bypassed review. Agent signals are estimates based on known app slugs and branch prefixes.
 
-## Checking your token
+## Using two tokens
 
-**Data & access → Token check** reads what GitHub reports about the token on each response.
+You can save one fine-grained token and one classic token for the same GitHub account. Sign in with either, then paste the other into **Data & access → Token check → Add a second token for this account**. Pasting a token of a type that is already saved replaces it.
 
-- **Expires** shows the expiry date when GitHub sends one. Overview warns 14 days before it.
-- **Classic scopes** lists a classic token's scopes. Overview warns when a scope such as `repo` allows writes. Activity Desk only sends allowlisted reads, but a read-only fine-grained token limits what a leaked copy could do.
-- When a REST request is denied, the card names the permission GitHub lists for it in the `X-Accepted-GitHub-Permissions` header. GraphQL sources report missing access as partial results under **What this token can see** instead.
+Before saving, Activity Desk asks GitHub who owns the new token and who owns the saved one. It saves the new token only when both belong to the same account, so one dashboard never mixes two accounts. A token GitHub rejects is not saved. If GitHub rejects the token that was already saved, for example because it expired, Activity Desk removes it and tells you.
+
+| Source | Which token reads it |
+| --- | --- |
+| Unread notifications | The classic token. GitHub does not serve notifications to fine-grained tokens. |
+| Recent events, pull requests you opened, pull requests you reviewed, conversations | Both. The results are joined, and **Data & access** says how many items only one token returned. A fine-grained token sees one account or organization, and a classic token sees what its scopes allow, so the joined list can include organization or private work the fine-grained token cannot reach. |
+| Contribution year and contribution history | Both read the year. Activity Desk keeps the read that hides fewer contributions and uses the same token for the history. |
+| Other pull requests in events | The fine-grained token first. Pull requests it cannot read are asked for again with the classic token. |
+| Profile, repository list, repository traffic, star dates, rate limit | The fine-grained token first. When GitHub denies it, the classic token answers and goes first for that source until you sign out or change tokens. A rate-limited request is not repeated, because both tokens share the account's limit. |
+
+Reading with both tokens roughly doubles the requests for the joined sources. **Rate-limit budget** shows what a refresh used.
+
+With one token saved, the dashboard works as before: a fine-grained token reads everything except notifications, and a classic token reads what its scopes allow.
+
+To remove one token, select **Remove this token** under it. The token stays valid on GitHub until you revoke it there. **Sign out** removes both.
+
+## Checking your tokens
+
+**Data & access → Token check** reads what GitHub reports about each saved token on each response.
+
+- **Expires** shows the expiry date when GitHub sends one. Overview warns 14 days before it and names the token.
+- **Scopes** lists a classic token's scopes. Overview warns when a scope such as `repo` allows writes. Activity Desk only sends allowlisted reads, but a narrower token limits what a leaked copy could do: a read-only fine-grained token, or beside one, a classic token with only `notifications`.
+- **Answered this refresh** lists the sources each token returned, so you can see which token a number came from.
+- When a REST request is denied, the card names the permission GitHub lists for it in the `X-Accepted-GitHub-Permissions` header, under the token that was denied. GraphQL sources report missing access as partial results under **What this token can see** instead.
+- Overview warns when GitHub rejects a saved token while the other one still works.
 
 **Rate-limit budget** shows how much of the REST and GraphQL limits remain and when each resets. Overview warns when less than 10% of either remains. GraphQL charges points by query size, so one request can use more than one point.
 
-![Token check and rate-limit budget for a fictional classic token](screenshots/token-and-rate-limit.png)
+![Token check for a fictional account with a fine-grained and a classic token](screenshots/token-and-rate-limit.png)
 
 ## Local data and privacy
 
-The main process sends the token to `api.github.com` for allowlisted reads. macOS Keychain backs encryption of the token in the local Electron profile. Activity Desk encrypts a legacy plaintext token on first use.
+The main process sends each token to `api.github.com` for allowlisted reads, and the window never receives a token back. macOS Keychain backs encryption of the saved tokens, which are kept together in one file in the local Electron profile. A token saved by an earlier version, encrypted or plaintext, moves into that file on first use.
 
-**Sign out** clears the dashboard and removes the saved token. The account's seen timestamp, saved history, and notes remain in the local profile.
+**Sign out** clears the dashboard and removes the saved tokens. The account's seen timestamp, saved history, and notes remain in the local profile.
 
 **Notes** are kept in the app's data folder (`~/Library/Application Support/Activity Desk`), not inside the app itself, so updating or replacing the app keeps them. Only the main process reads or writes them. They are encrypted with the same macOS Keychain-backed key as the token, and each account has its own notes. They are never sent to GitHub. If the notes file cannot be decrypted, for example after a Keychain change, Activity Desk keeps the unreadable file beside it as `notes-unreadable-….enc`, starts a new notebook, and says so in Notes and in **Data & access → Notes on this Mac**.
 
