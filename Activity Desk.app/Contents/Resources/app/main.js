@@ -621,8 +621,9 @@ handle("sign-out", () => withCredentials(() => {
   }
 }));
 
-// Opens GitHub's form for a new token of the given kind. The classic form starts with only the
-// notifications scope selected.
+// Opens GitHub's form for a new token of the given kind. The classic link asks for only the
+// notifications scope. GitHub documents URL parameters for the fine-grained form alone, so the app
+// tells the user to check the selected scopes instead of relying on the preselection.
 handle("open-token-page", async (kind = "fine-grained") => {
   if (typeof kind !== "string" || !Object.hasOwn(TOKEN_PAGES, kind)) return { ok: false, status: 400, error: "Unknown token type." };
   await shell.openExternal(TOKEN_PAGES[kind]);

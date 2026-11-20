@@ -1445,7 +1445,7 @@ function tokenWarnings() {
 const SLOT_TITLES = { "fine-grained": "Fine-grained token", classic: "Classic token" };
 const SLOT_MISSING = {
   "fine-grained": "Not saved. A read-only fine-grained token limits what a leaked copy could do, and it can read everything here except unread notifications.",
-  classic: "Not saved. Add one to read unread notifications, which GitHub serves only to classic tokens, and to reach organization or private data outside the fine-grained token's resource owner.",
+  classic: "Not saved. Add one to read unread notifications, which GitHub serves only to classic tokens, and to reach organization or private data outside the fine-grained token's resource owner. For the inbox alone, select only the notifications scope when you create it.",
 };
 
 // One saved token: what GitHub reported about it and which sources it answered in this refresh.
