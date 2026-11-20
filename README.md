@@ -8,7 +8,10 @@ Activity Desk is a read-only GitHub dashboard for Apple silicon Macs. Use it to 
 - **Insights → All years** compares every calendar year on your account: this year's pace against the same date last year, your busiest full year, your strongest month across years, how weekend work changed, and your longest streak.
 - **Insights → Footprint** shows who finds your repositories: page views, unique visitors, clones, referring sites, and new stars. GitHub keeps only 14 days of traffic. To show trends over months, you can turn on saved history, which keeps daily traffic on your Mac, encrypted. It is off until you turn it on.
 - **Suggestions** turns patterns in the loaded data into specific changes to try, such as splitting large pull requests, asking for a reviewer up front, or reviewing agent branches before merging. Each card says what it saw and what to try. Where it gives a reason, each claim links to its source, and further reading opens in your browser. A list shows every check, including those without enough data.
-- **Data & access** checks the token itself: when it expires, whether a classic token's scopes allow writes, which permission GitHub says a denied request needs, and how much of the REST and GraphQL rate limits remain.
+- **Data & access** checks each saved token: when it expires, whether a classic token's scopes allow writes, which permission GitHub says a denied request needs, which sources it answered, and how much of the REST and GraphQL rate limits remain.
+- **Two tokens, one account.** Save a fine-grained token and a classic token for the same GitHub account and Activity Desk reads with both. The classic token supplies the unread inbox, which GitHub serves only to classic tokens. Events, pull requests, and conversations are read with each token and joined, so the dashboard also covers organization or private work the fine-grained token cannot reach. Every other read starts with the fine-grained token.
+
+- **Public view, without a token.** Enter a GitHub username instead of a token to see what GitHub serves to anyone: public events, public repositories, and stars. The contribution calendar, pull request details, conversations, notifications, repository traffic, and notes need a token, and each view says so. GitHub allows 60 requests an hour without one.
 
 - [Quick start](docs/quick-start.md) for installation and GitHub token setup
 - [User guide](docs/user-guide.md) for the dashboard, data limits, and privacy
@@ -16,4 +19,4 @@ Activity Desk is a read-only GitHub dashboard for Apple silicon Macs. Use it to 
 
 ![Activity Desk showing contribution trends for a fictional account](docs/screenshots/contribution-year.png)
 
-Activity Desk reads GitHub data using a token you provide. A read-only fine-grained token is recommended. macOS Keychain backs encryption of the saved token. See the [security policy](SECURITY.md) for private vulnerability reporting.
+Activity Desk reads GitHub data using the tokens you provide, or public data alone when you give only a username. A read-only fine-grained token is recommended, with a classic token limited to `notifications` beside it if you want the unread inbox. A second token is saved only after GitHub confirms it belongs to the same account as the first. macOS Keychain backs encryption of the saved tokens. See the [security policy](SECURITY.md) for private vulnerability reporting.

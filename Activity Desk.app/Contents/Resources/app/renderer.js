@@ -21,9 +21,27 @@ const CONVERSATION_CHIPS = [["all", "All"], ["others", "From others"], ["mine", 
 const CONVERSATION_GLYPHS = { comment: "✎", review: "✓", inline: "‹›" };
 const CONVERSATION_LABELS = { comment: "Comment", review: "Review", inline: "Review comment" };
 const TEXT_PREVIEW = 180;
+const PUBLIC_STAR_REPOS = 3; // star dates read without a token, to stay inside 60 requests an hour
+// What the public view cannot load, by the key each view reads its explanation from.
+const NEEDS_TOKEN = {
+  year: "The contribution calendar needs a token.",
+  years: "Contribution history needs a token.",
+  authored: "Pull request details need a token.",
+  reviewed: "Pull requests you reviewed need a token.",
+  conversations: "Conversations need a token.",
+  notifications: "Unread notifications need a classic token.",
+  footprint: "Repository traffic needs a token. Stars and forks are public.",
+  history: "Saved history needs a token.",
+};
+const PUBLIC_NOTES = "Notes need a token. A username alone does not show whose notes to open.";
+const PUBLIC_LIMIT = "GitHub's hourly limit for requests without a token was reached. Try again later, or add a token in Data & access.";
 
 const initialState = {
-  tokenKind: null,
+  public: false, // true in the public view: a username and no token
+  locked: null, // in the public view: the sources that need a token
+  tokens: {}, // slot → kind for each saved token
+  tokenUse: null, // with two tokens: what each one added to the merged sources
+  answered: {}, // operation → slots that answered it in this refresh
   user: null,
   viewer: null,
   events: [],
@@ -57,7 +75,11 @@ let signingOut = false;
 // Comment texts the reader expanded, kept open when the stream re-renders.
 const openTexts = new Set();
 let indexCache = { items: null, login: null, index: null };
-const seenKey = () => `${LAST_SEEN_KEY}.${state.user.id}`;
+const seenKey = () => `${LAST_SEEN_KEY}.${state.public ? "public." : ""}${state.user.id}`;
+const SLOTS = I.TOKEN_SLOTS;
+// True when both a fine-grained and a classic token are saved, so sources can be read with each.
+const dual = (account) => SLOTS.every((slot) => account.tokens[slot]);
+const savedSlots = (account) => SLOTS.filter((slot) => account.tokens[slot]);
 
 // ---------- helpers ----------
 function esc(value) {
@@ -147,43 +169,53 @@ function signinMessage(text, isError) {
 }
 
 // ---------- GitHub ----------
-async function api(account, operation, args) {
+// Without a slot the main process picks the token: fine-grained first, classic when GitHub denies it,
+// and classic alone for notifications. With a slot, only that saved token is used.
+async function api(account, operation, args, slot) {
   if (account !== state) throw new Error("Session changed.");
-  const result = await window.desk.github(operation, args);
+  const result = await window.desk.github(operation, args, slot);
   if (account !== state) throw new Error("Session changed.");
   if (result.remaining != null) account.remaining = result.remaining;
   const accepted = recordToken(account, operation, result);
+  if (result.ok && SLOTS.includes(result.via)) (account.answered[operation] || (account.answered[operation] = new Set())).add(result.via);
   if (!result.ok) {
     const need = accepted.length && (result.status === 403 || result.status === 404)
       ? ` GitHub accepts ${accepted.map((set) => set.join(" with ")).join(", or ")} for this request.` : "";
-    const detail = (result.error || ({
+    const detail = (result.error || (account.public ? { 403: PUBLIC_LIMIT, 429: PUBLIC_LIMIT } : {
       401: "GitHub rejected the saved token.",
       403: "GitHub denied the request. Check token permissions and rate limits.",
       429: "GitHub rate limit reached.",
     })[result.status] || `GitHub returned HTTP ${result.status}.`) + need;
     throw Object.assign(new Error(detail), { status: result.status });
   }
-  return { data: JSON.parse(result.body || "null"), more: /rel="next"/.test(result.link || "") };
+  return { data: JSON.parse(result.body || "null"), more: /rel="next"/.test(result.link || ""), via: result.via };
 }
 
-// Token metadata from response headers: expiry, classic scopes, and the permissions a denied request needs.
+// Token metadata from response headers, kept per saved token: expiry, classic scopes, the permissions
+// a denied request needs, and whether GitHub rejected the token outright.
 function recordToken(account, operation, result) {
-  const t = result.token;
-  if (!t) return [];
-  const meta = account.tokenMeta || (account.tokenMeta = { expires: null, scopes: null, denied: {} });
-  if (t.expires) meta.expires = t.expires;
-  if (t.scopes != null) meta.scopes = t.scopes;
-  const accepted = I.parseAcceptedPermissions(t.accepted);
-  if (!result.ok && accepted.length) meta.denied[operation] = accepted;
-  return accepted;
+  const meta = account.tokenMeta || (account.tokenMeta = {});
+  const note = (slot, t, failed, status) => {
+    if (!SLOTS.includes(slot) || !t) return [];
+    const m = meta[slot] || (meta[slot] = { expires: null, scopes: null, denied: {}, rejected: false });
+    if (t.expires) m.expires = t.expires;
+    if (t.scopes != null) m.scopes = t.scopes;
+    if (status === 401) m.rejected = true;
+    const accepted = I.parseAcceptedPermissions(t.accepted);
+    if (failed && accepted.length) m.denied[operation] = accepted;
+    return accepted;
+  };
+  // Tokens GitHub denied before another saved token answered.
+  for (const s of result.skipped || []) note(s.slot, s.token, true, s.status);
+  return note(result.via, result.token, !result.ok, result.status);
 }
 
-async function loadEvents(account, login) {
+async function loadEvents(account, login, slot) {
   const events = [];
   let more = false;
   for (let page = 1; page <= EVENT_PAGES; page += 1) {
     try {
-      const result = await api(account, "events", { login, page });
+      const result = await api(account, "events", { login, page }, slot);
       if (!Array.isArray(result.data)) throw new Error("Unexpected events response.");
       events.push(...result.data);
       more = result.more;
@@ -195,19 +227,41 @@ async function loadEvents(account, login) {
   return { events, issue: more || events.length >= 300 ? "The feed reached the 300-event limit." : "" };
 }
 
+// With two tokens, each reads the feed and the pages are joined by event id, since a token only
+// returns the private events it is allowed to see.
+async function loadAllEvents(account, login) {
+  if (!dual(account)) return loadEvents(account, login);
+  const loads = await Promise.all(SLOTS.map(async (slot) => ({ slot, ...(await loadEvents(account, login, slot)) })));
+  const { events, only } = I.mergeTokenEvents(loads);
+  const same = loads.every((l) => l.issue === loads[0].issue);
+  const issue = same ? loads[0].issue : loads.filter((l) => l.issue).map((l) => `With the ${l.slot} token: ${l.issue}`).join(" ");
+  return { events, issue, only };
+}
+
+// Details for pull requests referenced in events. With two tokens, those the first token could not
+// read are asked for again with the other one.
 async function lookupPullRequests(account, refs) {
   const usable = refs.slice(0, PR_LOOKUP_LIMIT);
   if (!usable.length) return { info: {}, total: 0, asked: 0, found: 0 };
-  const { data: result } = await api(account, "pullRequests", usable);
   const info = {};
-  const errors = result?.errors || [];
-  const failed = new Set(errors.map((error) => error.path?.[0]));
-  usable.forEach((r, i) => {
-    const alias = `p${i}`;
-    const pr = failed.has(undefined) || failed.has(alias) ? null
-      : I.normalizePullRequest(result?.data?.[alias]?.pullRequest, r.repo, r.number, "events");
-    if (pr) info[I.prKey(r.repo, r.number)] = pr;
-  });
+  const read = async (list, slot) => {
+    const { data: result, via } = await api(account, "pullRequests", list, slot);
+    const errors = result?.errors || [];
+    const failed = new Set(errors.map((error) => error.path?.[0]));
+    list.forEach((r, i) => {
+      const alias = `p${i}`;
+      const pr = failed.has(undefined) || failed.has(alias) ? null
+        : I.normalizePullRequest(result?.data?.[alias]?.pullRequest, r.repo, r.number, "events");
+      if (pr) info[I.prKey(r.repo, r.number)] = pr;
+    });
+    return via;
+  };
+  const via = await read(usable);
+  const missing = usable.filter((r) => !info[I.prKey(r.repo, r.number)]);
+  const other = SLOTS.find((slot) => slot !== via);
+  if (missing.length && dual(account) && via) {
+    await read(missing, other).catch((error) => { if (error.message === "Session changed.") throw error; });
+  }
   return {
     info, total: refs.length, asked: usable.length, found: Object.keys(info).length,
   };
@@ -234,7 +288,9 @@ async function loadFootprint(account) {
     for (const kind of ["views", "clones", "referrers"]) t[kind] = (await api(account, "traffic", { repo: repo.full_name, kind })).data;
     fp.traffic[repo.full_name] = t;
   };
-  if (repos.length) {
+  // Traffic is never public. The public view reads the repository list and a few star dates only.
+  if (account.public) fp.denied = NEEDS_TOKEN.footprint;
+  else if (repos.length) {
     try {
       await read(repos[0]);
     } catch (error) {
@@ -249,7 +305,8 @@ async function loadFootprint(account) {
     }
   }
   for (const r of repos) if (r.stargazers_count === 0) fp.stars[r.full_name] = [];
-  const small = repos.filter((r) => r.stargazers_count > 0 && r.stargazers_count <= STAR_DATES_MAX);
+  const small = repos.filter((r) => r.stargazers_count > 0 && r.stargazers_count <= STAR_DATES_MAX)
+    .slice(0, account.public ? PUBLIC_STAR_REPOS : FOOTPRINT_REPOS);
   await mapLimit(small, TRAFFIC_CONCURRENCY, async (r) => {
     try {
       const { data: dates } = await api(account, "stargazers", { repo: r.full_name });
@@ -259,13 +316,13 @@ async function loadFootprint(account) {
       fp.issues.push(`${r.full_name} stars: ${error.message}`);
     }
   });
-  const saved = await window.desk.history().catch(() => null);
+  const saved = account.public ? null : await window.desk.history().catch(() => null);
   return { fp, saved };
 }
 
 // Pull requests from a search over the last AUTHORED_DAYS days: those you opened, or those by others you reviewed.
 // Up to AUTHORED_PAGES pages of 100, newest first. A failure after the first page keeps what loaded.
-async function loadAuthoredPullRequests(account, login, operation = "authoredPullRequests") {
+async function loadAuthoredPullRequests(account, login, operation = "authoredPullRequests", slot) {
   const what = operation === "reviewedPullRequests" ? "Reviewed" : "Authored";
   const info = {};
   let total = null;
@@ -276,7 +333,7 @@ async function loadAuthoredPullRequests(account, login, operation = "authoredPul
   for (let page = 1; page <= AUTHORED_PAGES; page += 1) {
     let search;
     try {
-      const { data } = await api(account, operation, after ? { login, after } : { login });
+      const { data } = await api(account, operation, after ? { login, after } : { login }, slot);
       search = data?.data?.search;
       if (!search || !Array.isArray(search.nodes)) throw new Error("GitHub did not return a usable pull request search.");
       if (data.errors?.length) partial = true;
@@ -305,45 +362,158 @@ async function loadAuthoredPullRequests(account, login, operation = "authoredPul
   return { info, loaded, total: total ?? loaded, capped: more || Boolean(issue), partial, issue, days: AUTHORED_DAYS };
 }
 
-async function refresh() {
+// With two tokens, each runs the search and the results are joined by pull request, since a search
+// returns only what its token can read. One token's failure keeps the other's results.
+async function loadPullRequestSearch(account, login, operation = "authoredPullRequests") {
+  if (!dual(account)) return loadAuthoredPullRequests(account, login, operation);
+  const settled = await Promise.allSettled(SLOTS.map((slot) => loadAuthoredPullRequests(account, login, operation, slot)));
+  const loads = SLOTS.map((slot, i) => ({ slot, load: settled[i].value, reason: settled[i].reason }));
+  const good = loads.filter((l) => l.load);
+  if (!good.length) throw loads[0].reason;
+  const merged = I.mergePullRequestLoads(good);
+  const failed = loads.filter((l) => !l.load).map((l) => `The ${l.slot} token's search did not load. ${l.reason?.message || ""}`.trim());
+  if (failed.length) merged.issue = [merged.issue, ...failed].filter(Boolean).join(" ");
+  return merged;
+}
+
+// Conversations as GitHub's response body. With two tokens, each search runs with both and threads are
+// joined, keeping the copy with more comments.
+async function loadConversations(account, login) {
+  if (!dual(account)) return (await api(account, "conversations", { login })).data;
+  const settled = await Promise.allSettled(SLOTS.map((slot) => api(account, "conversations", { login }, slot)));
+  const loads = SLOTS.map((slot, i) => ({ slot, body: settled[i].value?.data, reason: settled[i].reason }));
+  const good = loads.filter((l) => l.body?.data);
+  if (!good.length) {
+    const body = loads.find((l) => l.body)?.body;
+    if (body) return body;
+    throw loads[0].reason;
+  }
+  const { data, only } = I.mergeConversationData(good.map((l) => ({ slot: l.slot, data: l.body.data })));
+  return {
+    data, only,
+    errors: good.flatMap((l) => l.body.errors || []),
+    partialSlots: good.filter((l) => l.body.errors?.length).map((l) => l.slot),
+    failed: loads.filter((l) => !l.body?.data).map((l) => `The ${l.slot} token's search did not load. ${l.reason?.message || l.body?.errors?.[0]?.message || ""}`.trim()),
+  };
+}
+
+// The contribution year. With two tokens, both read it and the one that hides fewer contributions is
+// kept, so the calendar and the per-repository breakdown come from a single token.
+async function loadYear(account) {
+  if (!dual(account)) return api(account, "year");
+  const settled = await Promise.allSettled(SLOTS.map((slot) => api(account, "year", undefined, slot)));
+  const reads = SLOTS.map((slot, i) => ({ slot, data: settled[i].value?.data })).filter((r) => r.data);
+  const best = I.pickContributionYear(reads);
+  if (best) return { data: best.data, slot: best.slot };
+  if (reads.length) return { data: reads[0].data, slot: reads[0].slot };
+  throw settled[0].reason;
+}
+
+// "with this token" for one saved token, and the tokens by name for two.
+function tokenPhrase(slots) {
+  if (!slots || !slots.length) return "with this token";
+  return slots.length > 1 ? "with either token" : `with the ${slots[0]} token`;
+}
+
+// The public view: a username and no token. It loads what GitHub serves to anyone, which is the
+// profile, public events, public repositories, and a few star dates, and marks the rest as locked.
+async function refreshPublic() {
   const account = state;
   account.tokenMeta = null;
+  account.answered = {};
+  setBusy("Loading the public profile…");
+  try {
+    const { data: user } = await api(account, "profile");
+    if (typeof user?.login !== "string" || !user.login || !Number.isSafeInteger(user.id)) throw new Error("Unexpected GitHub profile.");
+    setBusy("Loading public activity…");
+    const feed = await loadEvents(account, user.login);
+    if (account !== state) return;
+    const events = [...new Map(feed.events.map((e) => [e.id, e])).values()]
+      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+    const [footprint] = await Promise.allSettled([loadFootprint(account)]);
+    if (account !== state) return;
+    const rate = await api(account, "rateLimit").catch(() => null);
+    if (account !== state) return;
+
+    const errors = { ...NEEDS_TOKEN };
+    const locked = new Set(Object.keys(NEEDS_TOKEN));
+    if (feed.issue) errors.events = feed.issue;
+    const fp = footprint.value?.fp || null;
+    if (!fp) {
+      errors.footprint = `Public repositories did not load. ${footprint.reason?.message || ""}`.trim();
+      locked.delete("footprint");
+    } else if (fp.issues.length) {
+      errors.footprint = `${NEEDS_TOKEN.footprint} Some star dates did not load: ${fp.issues.slice(0, 3).join("; ")}${fp.issues.length > 3 ? "; …" : ""}`;
+      locked.delete("footprint");
+    }
+    const count = (n) => (Number.isFinite(n) ? { totalCount: n } : null);
+    Object.assign(account, {
+      user, events, errors, locked, footprint: fp, refreshedAt: new Date(),
+      viewer: { createdAt: user.createdAt, followers: count(user.followers), repositories: count(user.publicRepos) },
+      rateLimit: rate ? { resources: I.summarizeRateLimit(rate.data), at: new Date() } : null,
+      notes: { userId: user.id, failed: PUBLIC_NOTES, list: [] },
+    });
+    if (!events.some((e) => I.repoName(e) === account.repo)) account.repo = "";
+    account.lastSeen = localStorage.getItem(seenKey());
+    if (!account.lastSeen && newestActivity(account)) {
+      account.lastSeen = newestActivity(account);
+      localStorage.setItem(seenKey(), account.lastSeen);
+    }
+    renderIdentity();
+    renderAll();
+    showApp(true);
+  } catch (error) {
+    if (account !== state) return;
+    if (!account.user) throw error;
+    account.errors.refresh = `Refresh failed. ${error.message} Showing the last loaded data.`;
+    renderAll();
+  } finally {
+    if (account === state) setBusy("");
+  }
+}
+
+async function refresh() {
+  if (state.public) return refreshPublic();
+  const account = state;
+  account.tokenMeta = null;
+  account.answered = {};
   setBusy("Loading your profile…");
   try {
     const { data: user } = await api(account, "profile");
     if (typeof user?.login !== "string" || !user.login || !Number.isSafeInteger(user.id)) throw new Error("Unexpected GitHub profile.");
     setBusy("Loading activity…");
-    const feed = await loadEvents(account, user.login);
+    const feed = await loadAllEvents(account, user.login);
     if (account !== state) return;
     const events = [...new Map(feed.events.map((e) => [e.id, e])).values()]
       .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
 
     setBusy("Loading contribution year and notifications…");
     const refs = I.prRefsFromEvents(events);
-    const fineGrained = account.tokenKind === "fine-grained";
+    const classic = Boolean(account.tokens.classic);
     // The event-referenced lookup skips pull requests the authored search already returned.
     let pendingRefs = refs;
-    const authoredTask = loadAuthoredPullRequests(account, user.login);
-    const reviewedTask = loadAuthoredPullRequests(account, user.login, "reviewedPullRequests");
+    const authoredTask = loadPullRequestSearch(account, user.login);
+    const reviewedTask = loadPullRequestSearch(account, user.login, "reviewedPullRequests");
     const lookupTask = authoredTask.catch(() => null).then((found) => {
       pendingRefs = refs.filter((r) => !found?.info[I.prKey(r.repo, r.number)]);
       return lookupPullRequests(account, pendingRefs);
     });
     // Every calendar year GitHub lists, read in one batched request once the year query returns them.
-    const yearTask = api(account, "year");
-    const historyTask = yearTask.then(({ data }) => {
+    // The history is read with the token chosen for the year, so both describe the same visibility.
+    const yearTask = loadYear(account);
+    const historyTask = yearTask.then(({ data, slot }) => {
       const listed = data?.data?.viewer?.contributionsCollection?.contributionYears;
       const years = (Array.isArray(listed) ? listed : []).filter(Number.isInteger).sort((a, b) => b - a).slice(0, HISTORY_YEARS);
       if (!years.length) throw new Error("GitHub listed no contribution years.");
-      return api(account, "contributionHistory", { years }).then((result) => ({ ...result, years, listed: listed.length }));
+      return api(account, "contributionHistory", { years }, slot).then((result) => ({ ...result, years, listed: listed.length }));
     });
     // Notes load once per account. Later refreshes keep the notes in memory, including unsaved edits.
     const notesTask = account.notes?.userId === user.id && !account.notes.failed ? null : window.desk.notes();
     const [notes, year, prs, talk, authored, footprint, yearsResult, reviewedResult, notebook] = await Promise.allSettled([
-      fineGrained ? null : api(account, "notifications"),
+      classic ? api(account, "notifications") : null,
       yearTask,
       lookupTask,
-      api(account, "conversations", { login: user.login }),
+      loadConversations(account, user.login),
       authoredTask,
       loadFootprint(account),
       historyTask,
@@ -359,9 +529,9 @@ async function refresh() {
     const errors = {};
     if (feed.issue) errors.events = feed.issue;
     const notifications = Array.isArray(notes.value?.data) ? notes.value.data : null;
-    if (!notifications) errors.notifications = fineGrained
-      ? "Unread notifications require a classic token."
-      : notes.reason?.message || "Notifications are unavailable.";
+    if (!notifications) errors.notifications = classic
+      ? notes.reason?.message || "Notifications are unavailable."
+      : "Unread notifications require a classic token. Add one beside this token in Data & access.";
     else if (notes.value.more) errors.notifications = "Showing the first page of unread notifications.";
     const yearData = year.value?.data;
     const yearErrors = yearData?.errors || [];
@@ -381,7 +551,7 @@ async function refresh() {
       const parts = [];
       if (mine.issue) parts.push(mine.issue);
       if (mine.capped) parts.push(`Loaded the newest ${fmt(mine.loaded)} of ${fmt(mine.total)} pull requests you opened in the last ${AUTHORED_DAYS} days.`);
-      if (mine.partial) parts.push("Some pull requests you opened could not be read with this token.");
+      if (mine.partial) parts.push(`Some pull requests you opened could not be read ${tokenPhrase(mine.partialSlots)}.`);
       if (parts.length) errors.authored = parts.join(" ");
     }
     const prLookup = {
@@ -396,7 +566,7 @@ async function refresh() {
       const parts = [];
       if (theirs.issue) parts.push(theirs.issue);
       if (theirs.capped) parts.push(`Loaded the newest ${fmt(theirs.loaded)} of ${fmt(theirs.total)} pull requests by others that you reviewed in the last ${AUTHORED_DAYS} days.`);
-      if (theirs.partial) parts.push("Some pull requests you reviewed could not be read with this token.");
+      if (theirs.partial) parts.push(`Some pull requests you reviewed could not be read ${tokenPhrase(theirs.partialSlots)}.`);
       if (parts.length) errors.reviewed = parts.join(" ");
     }
     const reviewed = theirs;
@@ -430,7 +600,7 @@ async function refresh() {
     if (!contributionHistory) errors.years = `Contribution history did not load. ${yearsResult.reason?.message || ""}`.trim();
     const savedHistory = fpLoad?.saved?.ok ? fpLoad.saved : null;
 
-    const talkData = talk.value?.data;
+    const talkData = talk.value;
     const flat = talkData?.data ? I.flattenConversations(talkData.data, user.login) : null;
     let conversations = flat?.usable ? { ...flat, loadedAt: new Date() } : null;
     const talkProblem = talk.reason?.message || talkData?.errors?.[0]?.message || "GitHub did not return a usable conversation search.";
@@ -442,11 +612,16 @@ async function refresh() {
       const parts = [];
       const lost = [["issues", "Issue"], ["pullRequests", "Pull request"]].filter(([key]) => !conversations.searches[key]);
       if (lost.length) parts.push(`${lost.map(([, name]) => name).join(" and ")} threads did not load.`);
-      if (talkData.errors?.length) parts.push("Some conversations could not be read with this token.");
+      if (talkData.errors?.length) parts.push(`Some conversations could not be read ${tokenPhrase(talkData.partialSlots)}.`);
+      if (talkData.failed?.length) parts.push(...talkData.failed);
       if (parts.length) errors.conversations = parts.join(" ");
     }
+    // With two tokens: what only one of them returned for each merged source, and which read the year.
+    const tokenUse = dual(account)
+      ? { events: feed.only, authored: mine?.only, reviewed: theirs?.only, conversations: talkData?.only, year: year.value?.slot || null }
+      : null;
 
-    Object.assign(account, { user, viewer, contributions, events, notifications, prLookup, prInfo, reviewed, rateLimit, footprint: footprintData, savedHistory, contributionHistory, conversations, errors, refreshedAt: new Date() });
+    Object.assign(account, { tokenUse, user, viewer, contributions, events, notifications, prLookup, prInfo, reviewed, rateLimit, footprint: footprintData, savedHistory, contributionHistory, conversations, errors, refreshedAt: new Date() });
     if (!events.some((e) => I.repoName(e) === account.repo)) account.repo = "";
     account.lastSeen = localStorage.getItem(seenKey());
     if (!account.lastSeen && newestActivity(account)) {
@@ -478,7 +653,7 @@ function renderIdentity() {
   if (!u) return;
   const name = typeof u.name === "string" ? u.name.trim() : "";
   $("me-name").textContent = name || u.login;
-  $("me-login").textContent = `@${u.login}`;
+  $("me-login").textContent = `@${u.login}${state.public ? " · public view" : ""}`;
   $("initials").textContent = (name ? name.split(/\s+/).slice(0, 2).map((part) => Array.from(part)[0]).join("") : u.login.slice(0, 2)).toUpperCase();
 }
 
@@ -499,7 +674,9 @@ function computed() {
   const footprint = state.footprint ? I.summarizeFootprint(state.footprint, state.savedHistory, state.refreshedAt) : null;
   const years = state.contributionHistory
     ? I.summarizeContributionHistory(state.contributionHistory.byYear, localDayKey(new Date()), state.viewer?.createdAt) : null;
-  const token = state.tokenKind ? { kind: state.tokenKind, write: I.classicScopes(state.tokenMeta?.scopes)?.write ?? null } : null;
+  // The classic token is the one whose scopes can allow writes, so it is the one the access check reads.
+  const tokenKind = state.public ? "none" : state.tokens.classic || state.tokens["fine-grained"] || null;
+  const token = tokenKind ? { kind: tokenKind, write: I.classicScopes(state.tokenMeta?.classic?.scopes)?.write ?? null, paired: dual(state) } : null;
   // Summaries of a source that failed are passed as null, so its suggestions say "source unavailable"
   // instead of "nothing found". Events failed when none loaded and the feed reported an issue.
   const eventsLoaded = state.events.length > 0 || !state.errors.events;
@@ -545,7 +722,9 @@ function renderOverview(c) {
   if (pr.unreviewed.length) items.push(["warn", `${pr.unreviewed.length} of ${pr.merged} loaded merges have zero recorded reviews`, pr.unreviewed.slice(0, 3).map((p) => `${shortRepo(p.repo)} #${p.number}`).join(", ")]);
   if (pr.openMine.length) items.push(["warn", `${pr.openMine.length} of your loaded PRs are still open`, pr.openMine.slice(0, 4).map((p) => `${shortRepo(p.repo)} #${p.number}${p.isDraft ? " (draft)" : ""}`).join(", ")]);
   if (notes && notes.missed.length) items.push(["warn", `${notes.missed.length} unread notification${notes.missed.length === 1 ? "" : "s"} flagged`, "Includes review requests, mentions, and failed checks."]);
-  const coverage = Object.values(state.errors);
+  if (state.public) items.push(["warn", "Public view, without a token", `Showing what GitHub serves to anyone for @${state.user.login}: public events, public repositories, and stars. The contribution calendar, pull request details, conversations, notifications, repository traffic, and notes need a token. Add one in Data & access.`]);
+  // Sources the public view cannot load are covered by the item above, not listed one by one.
+  const coverage = Object.entries(state.errors).filter(([key]) => !state.locked?.has(key)).map(([, text]) => text);
   if (coverage.length) items.push(["warn", "Some data is missing or limited", coverage.join(" ")]);
   else if (!items.length) items.push(["good", "Nothing flagged in the loaded data", `Open PRs and review counts cover pull requests you opened in the last ${AUTHORED_DAYS} days plus those referenced in recent events.`]);
   $("attention").innerHTML = items.map(([cls, t, d]) =>
@@ -1223,36 +1402,37 @@ function renderMeta(c) {
 
   cards.push(`<article class="card"><h3>How far back the stream goes</h3>
     <p class="big"><strong>${fmt(ev.total)}</strong> events loaded${range ? ` · ${range}` : ""}.</p>
-    <div class="callout">${esc(state.errors.events || "The stream covers the events returned by GitHub for this token. GitHub limits the feed to 300 recent events.")}</div>
+    <div class="callout">${esc(state.errors.events || (state.public ? "The stream covers the public events GitHub returns without a token. GitHub limits the feed to 300 recent events." : "The stream covers the events returned by GitHub for this token. GitHub limits the feed to 300 recent events."))}</div>
     <p class="note">GitHub can delay events. Insights shows the loaded date range for each source.</p>
   </article>`);
 
-  const kind = state.tokenKind;
+  const use = state.tokenUse;
+  const both = dual(state);
   const caps = [];
-  caps.push([state.errors.events ? "part" : "ok", "Activity stream", esc(state.errors.events || `${fmt(ev.total)} recent events loaded.`)]);
+  caps.push([state.errors.events ? "part" : "ok", "Activity stream", esc((state.errors.events || `${fmt(ev.total)} recent events loaded.`) + onlyNote(use?.events, "event", "events"))]);
   caps.push(ev.privateEvents ? ["ok", "Private events", `${fmt(ev.privateEvents)} private events visible.`]
-    : ["part", "Private events", kind === "fine-grained" ? "None visible. Add the account permission Events: read to the token if you have private activity." : "None in this window."]);
+    : ["part", "Private events", state.public ? "Not visible without a token." : state.tokens["fine-grained"] ? "None visible. Add the account permission Events: read to the fine-grained token if you have private activity." : "None in this window."]);
   caps.push(state.notifications ? [state.errors.notifications ? "part" : "ok", "Notifications", `${fmt(state.notifications.length)} unread loaded. ${esc(state.errors.notifications || "")}`]
     : ["no", "Notifications", esc(state.errors.notifications || "Not available.")]);
-  caps.push(year ? ["ok", "Contribution year", `${fmt(year.total)} contributions.`] : ["no", "Contribution year", esc(state.errors.year || "")]);
+  caps.push(year ? ["ok", "Contribution year", `${fmt(year.total)} contributions.${use?.year ? ` Read with the ${esc(use.year)} token, which hides the fewest contributions.` : ""}`] : ["no", "Contribution year", esc(state.errors.year || "")]);
   const { authored, referenced } = state.prLookup;
   caps.push(authored
-    ? [state.errors.authored ? "part" : "ok", "Pull requests you opened", esc(state.errors.authored || `${fmt(authored.loaded)} from the last ${fmt(authored.days)} days, found by search.`)]
+    ? [state.errors.authored ? "part" : "ok", "Pull requests you opened", esc((state.errors.authored || `${fmt(authored.loaded)} from the last ${fmt(authored.days)} days, found by search.`) + onlyNote(use?.authored, "pull request", "pull requests"))]
     : ["no", "Pull requests you opened", esc(state.errors.authored || "Not available.")]);
   const rv = state.reviewed;
   caps.push(rv
-    ? [state.errors.reviewed ? "part" : "ok", "Pull requests you reviewed", esc(state.errors.reviewed || `${fmt(rv.loaded)} by others from the last ${fmt(rv.days)} days, found by search.`)]
+    ? [state.errors.reviewed ? "part" : "ok", "Pull requests you reviewed", esc((state.errors.reviewed || `${fmt(rv.loaded)} by others from the last ${fmt(rv.days)} days, found by search.`) + onlyNote(use?.reviewed, "pull request", "pull requests"))]
     : ["no", "Pull requests you reviewed", esc(state.errors.reviewed || "Not available.")]);
   caps.push(referenced.asked
     ? [state.errors.prs ? "part" : "ok", "Other pull requests in events", `${fmt(referenced.found)} loaded of ${fmt(referenced.asked)} requested. ${fmt(referenced.total)} referenced in events, ${fmt(referenced.covered)} already among yours. ${esc(state.errors.prs || "")}`]
     : ["ok", "Other pull requests in events", referenced.total ? `All ${fmt(referenced.total)} referenced in events were already among yours.` : "No pull requests in the loaded events."]);
   const conv = state.conversations;
   caps.push(conv
-    ? [state.errors.conversations ? "part" : "ok", "Conversations", `${fmt(conv.items.length)} comments and reviews on ${fmt(conv.threads)} threads. ${esc(state.errors.conversations || "")}`]
+    ? [state.errors.conversations ? "part" : "ok", "Conversations", `${fmt(conv.items.length)} comments and reviews on ${fmt(conv.threads)} threads. ${esc((state.errors.conversations || "") + onlyNote(use?.conversations, "thread", "threads"))}`]
     : ["no", "Conversations", esc(state.errors.conversations || "Not available.")]);
   if (year) {
     caps.push(year.totals.restricted
-      ? ["part", "Private contributions", `${fmt(year.totals.restricted)} contributions are counted but hidden from this token.`]
+      ? ["part", "Private contributions", `${fmt(year.totals.restricted)} contributions are counted but hidden from ${both ? "both tokens" : "this token"}.`]
       : ["ok", "Restricted contributions", "GitHub reported no restricted contribution count."]);
   }
   const ch = state.contributionHistory;
@@ -1263,8 +1443,9 @@ function renderMeta(c) {
     : fp.denied ? ["no", "Repository traffic", esc(state.errors.footprint)]
     : [state.errors.footprint ? "part" : "ok", "Repository traffic", `${fmt(Object.keys(fp.traffic).length)} of ${fmt(fp.repos.length)} repositories read. ${esc(state.errors.footprint || "")}`]);
   if (state.errors.account) caps.push(["part", "Account details", esc(state.errors.account)]);
-  cards.push(`<article class="card"><h3>What this token can see</h3>
-    <p class="big">Signed in with a <strong>${esc(kind || "GitHub")}</strong> token.</p>
+  const kinds = savedSlots(state).map((slot) => `a <strong>${esc(state.tokens[slot])}</strong> token`);
+  cards.push(`<article class="card"><h3>${state.public ? "What the public view can see" : both ? "What these tokens can see" : "What this token can see"}</h3>
+    <p class="big">${state.public ? `Showing <strong>@${esc(state.user?.login)}</strong> without a token. GitHub allows 60 requests an hour without one, counted for your network address, and a refresh uses up to ${5 + PUBLIC_STAR_REPOS}.` : `Signed in with ${kinds.join(" and ") || "a <strong>GitHub</strong> token"}.`}${both ? " Activity, pull requests, and conversations are read with both and joined. Other sources use the fine-grained token first." : ""}</p>
     <ul class="cap">${caps.map(([s, t, d]) => `<li><span class="${s}">${s === "ok" ? "✓" : s === "no" ? "✕" : "!"}</span><div><div>${esc(t)}</div><div class="d">${d}</div></div></li>`).join("")}</ul>
   </article>`);
 
@@ -1273,16 +1454,17 @@ function renderMeta(c) {
     cards.push(`<article class="card"><h3>Account</h3>
       <dl class="kv">
         <dt>On GitHub since</dt><dd>${created ? esc(created.toLocaleDateString(undefined, { month: "short", year: "numeric" })) : "—"}</dd>
-        <dt>Repositories you own</dt><dd>${fmt(v.repositories && v.repositories.totalCount)}</dd>
+        <dt>${state.public ? "Public repositories" : "Repositories you own"}</dt><dd>${fmt(v.repositories && v.repositories.totalCount)}</dd>
         <dt>Followers</dt><dd>${fmt(v.followers && v.followers.totalCount)}</dd>
         <dt>Repositories committed to this year</dt><dd>${fmt(year && year.totals.repos)}</dd>
         <dt>Commits / PRs / issues / reviews</dt><dd>${year ? `${fmt(year.totals.commits)} / ${fmt(year.totals.prs)} / ${fmt(year.totals.issues)} / ${fmt(year.totals.reviews)}` : "—"}</dd>
       </dl>
-      <p class="note">Your public profile can show a different yearly total. It depends on whether private contributions are shown publicly, and this view counts what your token can see.</p>
+      <p class="note">${state.public ? "Without a token these are public counts. The yearly totals come from the contribution calendar, which needs a token." : `Your public profile can show a different yearly total. It depends on whether private contributions are shown publicly, and this view counts what your ${both ? "tokens" : "token"} can see.`}</p>
     </article>`);
   }
 
-  cards.push(tokenCard());
+  $("token-check").innerHTML = tokenCard();
+  $("add-token-label").textContent = state.public ? "Add a token to load everything else" : "Add a second token for this account, or replace a saved one";
   cards.push(rateCard());
   cards.push(historyCard());
   cards.push(notesCard());
@@ -1303,23 +1485,36 @@ function renderMeta(c) {
 const OPERATION_LABELS = {
   profile: "Profile", events: "Activity stream", notifications: "Notifications", year: "Contribution year",
   pullRequests: "Pull request details", authoredPullRequests: "Pull requests you opened", reviewedPullRequests: "Pull requests you reviewed",
-  conversations: "Conversations", rateLimit: "Rate-limit budget",
+  conversations: "Conversations", rateLimit: "Rate-limit budget", contributionHistory: "Contribution history",
+  ownedRepos: "Repository list", traffic: "Repository traffic", stargazers: "Star dates",
 };
 
-// Problems with the token itself: expiry, write-capable classic scopes, and a low rate-limit budget.
+// With two tokens: how many items of a merged source only one of them returned.
+function onlyNote(only, one, many) {
+  if (!only) return "";
+  const parts = SLOTS.filter((slot) => only[slot]).map((slot) => `${fmt(only[slot])} ${only[slot] === 1 ? one : many} came only from the ${slot} token`);
+  return parts.length ? ` ${parts.join(", and ")}.` : " Both tokens returned the same set.";
+}
+
+const tokenExpiry = (slot) => I.tokenExpiryStatus(I.parseTokenExpiry(state.tokenMeta?.[slot]?.expires), new Date());
+
+// Problems with the saved tokens: rejection, expiry, write-capable classic scopes, and a low rate-limit budget.
 function tokenWarnings() {
   const out = [];
-  const meta = state.tokenMeta;
-  const expiry = I.tokenExpiryStatus(I.parseTokenExpiry(meta?.expires), new Date());
   const day = (d) => d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
-  if (expiry?.expired) out.push({ title: "The GitHub token has expired", detail: `GitHub reported ${day(expiry.at)}. Create a new token and sign in again.` });
-  else if (expiry?.soon) {
-    const days = Math.max(1, Math.ceil(expiry.days));
-    out.push({ title: `The GitHub token expires in ${days} ${days === 1 ? "day" : "days"}`, detail: `On ${day(expiry.at)}. Create a replacement and sign in with it before then.` });
+  for (const slot of savedSlots(state)) {
+    const name = `${state.tokens[slot]} token`;
+    const expiry = tokenExpiry(slot);
+    if (expiry?.expired) out.push({ title: `The ${name} has expired`, detail: `GitHub reported ${day(expiry.at)}. Create a new token and save it in Data & access.` });
+    else if (state.tokenMeta?.[slot]?.rejected) out.push({ title: `GitHub rejected the saved ${name}`, detail: `It may have expired or been revoked.${dual(state) ? " The other token answered where it could." : ""} Replace it in Data & access.` });
+    else if (expiry?.soon) {
+      const days = Math.max(1, Math.ceil(expiry.days));
+      out.push({ title: `The ${name} expires in ${days} ${days === 1 ? "day" : "days"}`, detail: `On ${day(expiry.at)}. Create a replacement and save it in Data & access before then.` });
+    }
   }
-  const scopes = I.classicScopes(meta?.scopes);
-  if (state.tokenKind === "classic" && scopes?.write.length) {
-    out.push({ title: "This classic token can make changes", detail: `Its ${scopes.write.join(", ")} ${scopes.write.length === 1 ? "scope allows" : "scopes allow"} writes. Activity Desk only reads, so a read-only fine-grained token limits what a leaked copy could do.` });
+  const scopes = I.classicScopes(state.tokenMeta?.classic?.scopes);
+  if (state.tokens.classic === "classic" && scopes?.write.length) {
+    out.push({ title: "This classic token can make changes", detail: `Its ${scopes.write.join(", ")} ${scopes.write.length === 1 ? "scope allows" : "scopes allow"} writes. Activity Desk only reads, so ${dual(state) ? "a classic token with only the notifications scope" : "a read-only fine-grained token"} limits what a leaked copy could do.` });
   }
   for (const r of state.rateLimit?.resources || []) {
     if (r.low) out.push({ title: `${r.label} rate limit is low`, detail: `${fmt(r.remaining)} of ${fmt(r.limit)} left until ${r.resetAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}.` });
@@ -1327,33 +1522,51 @@ function tokenWarnings() {
   return out;
 }
 
-function tokenCard() {
-  const meta = state.tokenMeta || {};
-  const kind = state.tokenKind;
-  const expiry = I.tokenExpiryStatus(I.parseTokenExpiry(meta.expires), new Date());
+const SLOT_TITLES = { "fine-grained": "Fine-grained token", classic: "Classic token" };
+const SLOT_MISSING = {
+  "fine-grained": "Not saved. A read-only fine-grained token limits what a leaked copy could do, and it can read everything here except unread notifications.",
+  classic: "Not saved. Add one to read unread notifications, which GitHub serves only to classic tokens, and to reach organization or private data outside the fine-grained token's resource owner. For the inbox alone, select only the notifications scope when you create it.",
+};
+
+// One saved token: what GitHub reported about it and which sources it answered in this refresh.
+function tokenSlot(slot) {
+  const kind = state.tokens[slot];
+  if (!kind) return `<section class="token-slot"><h4>${SLOT_TITLES[slot]} <span class="tag">Not saved</span></h4><p class="note">${SLOT_MISSING[slot]}</p></section>`;
+  const meta = state.tokenMeta?.[slot] || {};
+  const expiry = tokenExpiry(slot);
   const scopes = I.classicScopes(meta.scopes);
   const denied = Object.entries(meta.denied || {});
+  const answered = Object.keys(OPERATION_LABELS).filter((op) => state.answered[op]?.has(slot)).map((op) => OPERATION_LABELS[op]);
   const rows = [
-    ["Type", esc(kind || "GitHub")],
+    ["Type", esc(kind)],
     ["Expires", expiry
       ? `${esc(expiry.at.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }))}${expiry.expired ? " (expired)" : ` (in ${fmt(Math.max(1, Math.ceil(expiry.days)))} days)`}`
       : "Not reported by GitHub"],
   ];
-  if (kind === "classic" || scopes?.scopes.length) rows.push(["Classic scopes", scopes?.scopes.length ? esc(scopes.scopes.join(", ")) : "None reported"]);
+  if (slot === "classic") rows.push(["Scopes", scopes?.scopes.length ? esc(scopes.scopes.join(", ")) : "None reported"]);
+  rows.push(["Answered this refresh", answered.length ? esc(answered.join(", ")) : "Nothing yet"]);
   const deniedList = denied.length
     ? `<ul class="cap">${denied.map(([op, sets]) => `<li><span class="no">✕</span><div><div>${esc(OPERATION_LABELS[op] || op)}</div><div class="d">GitHub accepts ${esc(sets.map((set) => set.join(" with ")).join(", or "))}.</div></div></li>`).join("")}</ul>`
     : "";
-  const advice = kind === "fine-grained"
-    ? "Recommended setup: resource owner set to your account, access to all repositories you want covered, and read-only permissions only: <strong>Pull requests</strong>, <strong>Issues</strong>, and the account permission <strong>Events</strong>, plus <strong>Administration</strong> if you want repository traffic in Footprint. GitHub adds <strong>Metadata</strong> automatically."
-    : "Recommended: a fine-grained token with read-only permissions. A fine-grained token covers one resource owner and cannot read notifications, so keep a classic token only if you need the unread inbox.";
-  const warnings = tokenWarnings().filter((w) => !/rate limit/.test(w.title));
-  return `<article class="card"><h3>Token check</h3>
-    ${warnings.map((w) => `<div class="callout">${esc(w.title)}. ${esc(w.detail)}</div>`).join("")}
+  // The only saved token is removed by signing out, which also clears the dashboard.
+  const remove = savedSlots(state).length > 1 ? `<div class="actions"><button class="btn ghost danger" type="button" data-remove-token="${slot}">Remove this token</button></div>` : "";
+  return `<section class="token-slot"><h4>${SLOT_TITLES[slot]} <span class="tag saved">Saved</span></h4>
     <dl class="kv">${rows.map(([t, d]) => `<dt>${esc(t)}</dt><dd>${d}</dd>`).join("")}</dl>
-    ${deniedList}
+    ${deniedList}${remove}</section>`;
+}
+
+function tokenCard() {
+  const anyDenied = savedSlots(state).some((slot) => Object.keys(state.tokenMeta?.[slot]?.denied || {}).length);
+  const advice = state.public
+    ? "No token is saved, so this is the public view. Recommended: a fine-grained token with read-only permissions for everything except the unread inbox, and a classic token with only the notifications scope beside it for the inbox."
+    : state.tokens["fine-grained"]
+    ? "Recommended setup for the fine-grained token: resource owner set to your account, access to all repositories you want covered, and read-only permissions only: <strong>Pull requests</strong>, <strong>Issues</strong>, and the account permission <strong>Events</strong>, plus <strong>Administration</strong> if you want repository traffic in Footprint. GitHub adds <strong>Metadata</strong> automatically."
+    : "Recommended: add a fine-grained token with read-only permissions. A fine-grained token covers one resource owner and cannot read notifications, so keep the classic token beside it for the unread inbox.";
+  const warnings = tokenWarnings().filter((w) => !/rate limit/.test(w.title));
+  return `${warnings.map((w) => `<div class="callout">${esc(w.title)}. ${esc(w.detail)}</div>`).join("")}
+    <div class="token-slots">${SLOTS.map(tokenSlot).join("")}</div>
     <p class="note">${advice}</p>
-    <p class="note">${denied.length ? "Denied requests list the permissions GitHub reported for them." : "No request was denied with a permission hint."} GraphQL sources report missing access as partial results in the list above instead. Activity Desk only sends allowlisted reads, whatever the token allows.</p>
-  </article>`;
+    <p class="note">${dual(state) ? "Both tokens belong to this account, which GitHub confirmed before the second was saved. Notifications use the classic token. Activity, pull requests you opened or reviewed, and conversations are read with each token and joined. The contribution year comes from whichever token hides fewer contributions. Every other source uses the fine-grained token and moves to the classic one only when GitHub denies the request. " : ""}${anyDenied ? "Denied requests list the permissions GitHub reported for them." : "No request was denied with a permission hint."} GraphQL sources report missing access as partial results in the list below instead. Activity Desk only sends allowlisted reads, whatever a token allows.</p>`;
 }
 
 function historyCard() {
@@ -1694,9 +1907,10 @@ async function boot() {
   try {
     const status = await window.desk.status();
     if (!status.ok) throw new Error(status.error);
-    if (!status.signedIn) return;
-    state.tokenKind = status.kind;
-    signinMessage("Loading your saved account…", false);
+    if (!status.signedIn && !status.publicLogin) return;
+    state.tokens = status.tokens;
+    state.public = !status.signedIn;
+    signinMessage(state.public ? `Loading @${status.publicLogin}'s public activity…` : "Loading your saved account…", false);
     await refresh();
     signinMessage("", false);
   } catch (error) {
@@ -1707,13 +1921,15 @@ async function boot() {
   }
 }
 
-$("create-token").addEventListener("click", async () => {
+async function openTokenPage(kind, report) {
   try {
-    const result = await window.desk.openTokenPage();
+    const result = await window.desk.openTokenPage(kind);
     if (result.ok) return;
   } catch { /* The system browser could not be opened. */ }
-  signinMessage("Could not open GitHub in your browser.", true);
-});
+  report("Could not open GitHub in your browser.", true);
+}
+$("create-token").addEventListener("click", () => openTokenPage("fine-grained", signinMessage));
+$("create-classic-token").addEventListener("click", () => openTokenPage("classic", signinMessage));
 $("token-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const button = $("signin-btn");
@@ -1725,11 +1941,13 @@ $("token-form").addEventListener("submit", async (event) => {
   $("token").value = "";
   let cleanupError = "";
   try {
+    // The main process saves the token only after GitHub confirms it.
     const result = await window.desk.signIn(token);
     if (!result.ok) throw new Error(result.error);
-    state.tokenKind = result.kind;
+    state.tokens = result.tokens;
     await refresh();
     signinMessage("", false);
+    $("forget-token").classList.add("hidden");
   } catch (error) {
     if (error.status === 401) {
       try {
@@ -1739,11 +1957,105 @@ $("token-form").addEventListener("submit", async (event) => {
         cleanupError = "Could not remove the rejected credential.";
       }
     }
-    $("forget-token").classList.toggle("hidden", error.status === 401 && !cleanupError);
+    // Offer removal only while a token is still saved.
+    const saved = await window.desk.status().catch(() => null);
+    $("forget-token").classList.toggle("hidden", saved?.ok === true && !saved.signedIn);
     signinMessage(cleanupError ? `${error.message} ${cleanupError}` : error.message, true);
   } finally {
     button.disabled = Boolean(cleanupError);
     $("forget-token").disabled = false;
+  }
+});
+
+// Opens the public view for a username, with no token.
+$("public-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $("public-btn");
+  if (button.disabled || $("signin-btn").disabled) return;
+  button.disabled = true;
+  $("signin-btn").disabled = true;
+  signinMessage("Looking up the account on GitHub…", false);
+  try {
+    const result = await window.desk.browse($("public-login").value);
+    if (!result.ok) throw new Error(result.error);
+    state.public = true;
+    await refresh();
+    $("public-login").value = "";
+    signinMessage("", false);
+    $("forget-token").classList.add("hidden");
+  } catch (error) {
+    // A view that did not load is not kept for the next launch.
+    if (state.public && !state.user) {
+      state.public = false;
+      await window.desk.signOut().catch(() => {});
+    }
+    signinMessage(error.message, true);
+  } finally {
+    button.disabled = false;
+    $("signin-btn").disabled = false;
+  }
+});
+
+// ---------- tokens in Data & access ----------
+function tokenMessage(text, isError) {
+  $("add-token-msg").textContent = text || "";
+  $("add-token-msg").className = `msg${isError ? " error" : ""}`;
+}
+$("add-fine-grained").addEventListener("click", () => openTokenPage("fine-grained", tokenMessage));
+$("add-classic").addEventListener("click", () => openTokenPage("classic", tokenMessage));
+// Saves a token beside the one in use, or replaces the saved token of the same type.
+$("add-token-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const account = state;
+  const button = $("add-token-btn");
+  if (button.disabled) return;
+  if (state.busy) { tokenMessage("Wait for the refresh to finish, then save the token.", true); return; }
+  button.disabled = true;
+  const token = $("add-token").value;
+  $("add-token").value = "";
+  tokenMessage("Checking token with GitHub…", false);
+  try {
+    const result = await window.desk.signIn(token);
+    if (account !== state) return;
+    if (!result.ok) throw new Error(result.error);
+    // A token ends the public view. The dashboard starts again for the account the token belongs to.
+    if (account.public) {
+      state = { ...initialState, tokens: result.tokens };
+      openTexts.clear();
+    } else state.tokens = result.tokens;
+    tokenMessage(`${result.replaced ? "Replaced" : "Saved"} the ${result.tokens[result.slot]} token for @${result.login}.${result.dropped ? ` GitHub rejected the saved ${result.dropped} token, so it was removed.` : ""}`, false);
+    await refresh();
+  } catch (error) {
+    if (account.public && state !== account && !state.user) {
+      // The token was saved but its account did not load, so the sign-in screen takes over.
+      showApp(false);
+      $("forget-token").classList.remove("hidden");
+      signinMessage(error.message, true);
+    } else if (account === state) tokenMessage(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+$("token-check").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-remove-token]");
+  if (!button || state.busy) return;
+  const slot = button.dataset.removeToken;
+  const kind = state.tokens[slot];
+  if (!window.confirm(`Remove the saved ${kind} token from this Mac? It stays valid on GitHub until you revoke it there.`)) return;
+  const account = state;
+  button.disabled = true;
+  try {
+    const result = await window.desk.removeToken(slot);
+    if (account !== state) return;
+    if (!result.ok) throw new Error(result.error);
+    if (!result.signedIn) { signOut(); return; }
+    state.tokens = result.tokens;
+    tokenMessage(`Removed the ${kind} token from this Mac.`, false);
+    await refresh();
+  } catch (error) {
+    if (account !== state) return;
+    button.disabled = false;
+    tokenMessage(error.message, true);
   }
 });
 
@@ -1752,6 +2064,7 @@ async function signOut() {
   signingOut = true;
   // Pending note edits are saved while this account is still signed in.
   await flushNotes().catch(() => {});
+  const wasPublic = state.public;
   showApp(false);
   state = { ...initialState };
   openTexts.clear();
@@ -1761,20 +2074,21 @@ async function signOut() {
   noteAlert("");
   for (const id of ["me-name", "me-login", "initials", "summary", "kpis", "attention", "notes", "year-caption",
     "year-heat", "stream-caption", "chips", "repo-filter", "minor-count", "stream", "insights", "meta",
-    "fresh-badge", "refreshed", "conversation-count", "notes-count", "notes-list", "note-empty", "note-status", "suggestions", "suggestions-caption", "suggestion-count"]) $(id).textContent = "";
+    "fresh-badge", "refreshed", "conversation-count", "notes-count", "notes-list", "note-empty", "note-status", "suggestions", "suggestions-caption", "suggestion-count", "token-check", "add-token-msg"]) $(id).textContent = "";
+  $("add-token").value = "";
   $("search").value = "";
   $("hide-minor").checked = true;
   setBusy("");
   showTab("overview");
   $("signin-btn").disabled = true;
   $("forget-token").disabled = true;
-  signinMessage("Removing the saved credential…", false);
+  signinMessage(wasPublic ? "Closing the public view…" : "Removing the saved credential…", false);
   try {
     const result = await window.desk.signOut();
     if (!result.ok) throw new Error(result.error);
     $("forget-token").classList.add("hidden");
     $("signin-btn").disabled = false;
-    signinMessage("Signed out. The token was removed from this Mac.", false);
+    signinMessage(wasPublic ? "Closed the public view. The saved username was removed from this Mac." : "Signed out. Saved tokens were removed from this Mac.", false);
   } catch (error) {
     $("forget-token").classList.remove("hidden");
     signinMessage(error.message, true);

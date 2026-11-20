@@ -6,7 +6,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL, URL: NodeURL } = require("node:url");
 
-const TOKEN_PAGE = "https://github.com/settings/personal-access-tokens/new?name=Activity%20Desk";
+const TOKEN_PAGES = {
+  "fine-grained": "https://github.com/settings/personal-access-tokens/new?name=Activity%20Desk",
+  classic: "https://github.com/settings/tokens/new?description=Activity%20Desk&scopes=notifications",
+};
 const API = "https://api.github.com";
 // Suggestions cite sources from this catalogue. The renderer asks for a link by id only.
 const { READING } = require(path.join(__dirname, "insights.js"));
@@ -50,25 +53,55 @@ async function writeEncrypted(name, text) {
   }
 }
 
-function writeToken(token) {
-  return writeEncrypted("github-token.enc", token);
+// ---------- Saved tokens ----------
+// Up to two tokens for one GitHub account, one per slot: a fine-grained personal access token and a
+// classic (scope-based) token. They are kept together in one encrypted file, and a token is only saved
+// after GitHub confirms it and, when the other slot is in use, that both belong to the same account.
+const TOKENS_FILE = "github-tokens.enc";
+const TOKENS_VERSION = 1;
+const SLOTS = ["fine-grained", "classic"];
+const TOKEN = /^[!-~]{20,512}$/;
+const slotOf = (token) => (token.startsWith("github_pat_") ? "fine-grained" : "classic");
+
+function cleanTokens(parsed) {
+  const tokens = {};
+  if (parsed?.version !== TOKENS_VERSION || !parsed.tokens || typeof parsed.tokens !== "object") return tokens;
+  for (const slot of SLOTS) {
+    const token = parsed.tokens[slot];
+    if (typeof token === "string" && TOKEN.test(token) && slotOf(token) === slot) tokens[slot] = token;
+  }
+  return tokens;
 }
 
-async function readToken() {
+function writeTokens(tokens) {
+  return writeEncrypted(TOKENS_FILE, JSON.stringify({ version: TOKENS_VERSION, tokens }));
+}
+
+// Earlier versions kept a single token, first in a plaintext file and then in github-token.enc.
+const LEGACY_TOKEN_FILES = ["github-token", "github-token.enc"];
+function removeLegacyTokens() {
+  for (const name of LEGACY_TOKEN_FILES) fs.rmSync(path.join(app.getPath("userData"), name), { force: true });
+}
+
+async function readTokens() {
   const profile = app.getPath("userData");
-  const legacy = path.join(profile, "github-token");
-  const encrypted = readIfPresent(path.join(profile, "github-token.enc"));
+  const encrypted = readIfPresent(path.join(profile, TOKENS_FILE));
   if (encrypted) {
     const { result, shouldReEncrypt } = await safeStorage.decryptStringAsync(encrypted);
-    if (shouldReEncrypt) await writeToken(result);
-    fs.rmSync(legacy, { force: true });
-    return result;
+    const tokens = cleanTokens(JSON.parse(result));
+    if (shouldReEncrypt) await writeTokens(tokens);
+    removeLegacyTokens();
+    return tokens;
   }
-  const token = readIfPresent(legacy)?.toString("utf8").trim();
-  if (!token) return "";
-  await writeToken(token);
-  fs.rmSync(legacy, { force: true });
-  return token;
+  let single = "";
+  const earlier = readIfPresent(path.join(profile, "github-token.enc"));
+  if (earlier) single = (await safeStorage.decryptStringAsync(earlier)).result;
+  else single = readIfPresent(path.join(profile, "github-token"))?.toString("utf8").trim() || "";
+  if (!TOKEN.test(single)) return {};
+  const tokens = { [slotOf(single)]: single };
+  await writeTokens(tokens);
+  removeLegacyTokens();
+  return tokens;
 }
 
 function createWindow() {
@@ -130,6 +163,14 @@ function tokenKind(token) {
   return "GitHub";
 }
 
+// What the renderer learns about the saved tokens: which slots are in use and each token's kind.
+function tokenSummary(tokens) {
+  const saved = {};
+  for (const slot of SLOTS) saved[slot] = tokenKind(tokens[slot]);
+  const first = SLOTS.find((slot) => tokens[slot]);
+  return { signedIn: Boolean(first), kind: first ? saved[first] : null, tokens: saved };
+}
+
 function handle(channel, operation) {
   ipcMain.handle(`desk:${channel}`, (event, ...args) => {
     const frame = event.senderFrame;
@@ -145,6 +186,8 @@ function resetSession() {
   session.abort();
   session = new AbortController();
   sessionUser = null;
+  publicUser = null;
+  preferred.clear();
 }
 
 // ---------- Saved history ----------
@@ -161,6 +204,10 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const REFERRER = /^[A-Za-z0-9.-]{1,100}$/;
 
 let sessionUser = null; // { id, login } from the profile read in this session
+// The account shown in the public view. It is never a sessionUser: a username does not prove who is
+// asking, so notes and saved history stay closed until a token confirms the account.
+let publicUser = null;
+const signInFirst = () => (publicUser ? "This needs a token. A username alone does not show whose saved data to open." : "Sign in first.");
 let history = null;
 let historyNote = "";
 let historyQueue = Promise.resolve();
@@ -273,7 +320,7 @@ function recordHistory(user, operation, args, data) {
 }
 
 handle("history", () => withHistory(async () => {
-  if (!sessionUser) return { ok: false, error: "Sign in first." };
+  if (!sessionUser) return { ok: false, error: signInFirst() };
   try {
     const store = await loadHistory();
     await saveHistory();
@@ -307,7 +354,7 @@ handle("history-setting", (enabled) => withHistory(async () => {
 }));
 
 handle("clear-history", () => withHistory(async () => {
-  if (!sessionUser) return { ok: false, error: "Sign in first." };
+  if (!sessionUser) return { ok: false, error: signInFirst() };
   try {
     const store = await loadHistory();
     delete store.accounts[String(sessionUser.id)];
@@ -395,7 +442,7 @@ async function loadNotes() {
 const noteCopy = (n) => ({ id: n.id, text: n.text, color: n.color, pinned: n.pinned, created: n.created, updated: n.updated });
 
 handle("notes", () => withNotes(async () => {
-  if (!sessionUser) return { ok: false, error: "Sign in first." };
+  if (!sessionUser) return { ok: false, error: signInFirst() };
   try {
     const store = await loadNotes();
     const account = store.accounts[String(sessionUser.id)];
@@ -411,7 +458,7 @@ handle("notes", () => withNotes(async () => {
 // Without an id this creates a note. Text, color, and pinned are each optional. Only a text change
 // moves the edited time, so pinning or recoloring does not reorder the list.
 handle("note-save", (input) => withNotes(async () => {
-  if (!sessionUser) return { ok: false, error: "Sign in first." };
+  if (!sessionUser) return { ok: false, error: signInFirst() };
   if (!input || typeof input !== "object" || Array.isArray(input)) return { ok: false, error: "Invalid note." };
   const { id, text, color, pinned } = input;
   if ((id !== undefined && (typeof id !== "string" || !NOTE_ID.test(id))) ||
@@ -451,7 +498,7 @@ handle("note-save", (input) => withNotes(async () => {
 }));
 
 handle("note-delete", (id) => withNotes(async () => {
-  if (!sessionUser) return { ok: false, error: "Sign in first." };
+  if (!sessionUser) return { ok: false, error: signInFirst() };
   if (typeof id !== "string" || !NOTE_ID.test(id)) return { ok: false, error: "Invalid note." };
   try {
     const store = await loadNotes();
@@ -471,45 +518,222 @@ handle("note-delete", (id) => withNotes(async () => {
   }
 }));
 
+// ---------- Public view ----------
+// Without a token, a username shows what GitHub serves to anyone: the profile, public events, public
+// repositories, and star dates. These requests carry no credential and count against GitHub's limit
+// for the network address. Only the username is kept, in a plain file, so the view reopens.
+const PUBLIC_FILE = "public-user";
+
+function readPublicLogin() {
+  const text = readIfPresent(path.join(app.getPath("userData"), PUBLIC_FILE))?.toString("utf8").trim();
+  return text && LOGIN.test(text) ? text : null;
+}
+const forgetPublicLogin = () => fs.rmSync(path.join(app.getPath("userData"), PUBLIC_FILE), { force: true });
+
+const PUBLIC_LIMIT = "GitHub's hourly limit for requests without a token was reached. Try again later, or sign in with a token.";
+
+handle("browse", (login) => withCredentials(async () => {
+  const value = typeof login === "string" ? login.trim().replace(/^@/, "") : "";
+  if (!LOGIN.test(value)) return { ok: false, error: "That does not look like a GitHub username." };
+  try {
+    fs.mkdirSync(app.getPath("userData"), { recursive: true });
+    if (tokenSummary(await readTokens()).signedIn) {
+      return { ok: false, status: 409, error: "A token is saved. Remove it before opening the public view." };
+    }
+  } catch {
+    return { ok: false, error: "Could not open the saved credential or finish its migration." };
+  }
+  let found;
+  try {
+    const response = await fetch(`${API}/users/${value}`, { headers: githubHeaders(null), redirect: "error", signal: AbortSignal.timeout(15000) });
+    if (!response.ok) {
+      await response.body?.cancel();
+      if (response.status === 404) return { ok: false, status: 404, error: `GitHub has no account named @${value}.` };
+      if (response.status === 403 || response.status === 429) return { ok: false, status: response.status, error: PUBLIC_LIMIT };
+      return { ok: false, status: response.status, error: `GitHub returned HTTP ${response.status}.` };
+    }
+    found = await response.json();
+  } catch {
+    return { ok: false, status: 0, error: "Could not reach GitHub to look up that username." };
+  }
+  if (!Number.isSafeInteger(found?.id) || typeof found.login !== "string" || !LOGIN.test(found.login)) return { ok: false, status: 0, error: "Unexpected GitHub profile." };
+  if (found.type !== "User") return { ok: false, status: 400, error: `@${found.login} is not a user account. The public view covers people's accounts.` };
+  try {
+    fs.writeFileSync(path.join(app.getPath("userData"), PUBLIC_FILE), found.login, { mode: 0o600 });
+  } catch {
+    return { ok: false, error: "Could not save the username." };
+  }
+  resetSession();
+  publicUser = { id: found.id, login: found.login };
+  return { ok: true, id: found.id, login: found.login };
+}));
+
+// The reads the public view may make, each for the saved username only.
+function publicRequest(operation, args, login) {
+  const mine = (value) => typeof value === "string" && value.toLowerCase() === login.toLowerCase();
+  switch (operation) {
+    case "profile": return { route: `/users/${login}` };
+    case "events": {
+      const { login: asked, page } = args || {};
+      if (mine(asked) && Number.isInteger(page) && page >= 1 && page <= 3) return { route: `/users/${login}/events/public?per_page=100&page=${page}` };
+      break;
+    }
+    case "ownedRepos": return { route: `/users/${login}/repos?type=owner&sort=pushed&per_page=100` };
+    case "stargazers": {
+      if (!validRepo(args?.repo) || !mine(args.repo.split("/")[0])) break;
+      return { route: `/repos/${args.repo}/stargazers?per_page=100`, accept: "application/vnd.github.star+json" };
+    }
+    case "rateLimit": return { route: "/rate_limit" };
+  }
+  return null;
+}
+
+async function publicRead(operation, args, login, signal) {
+  const request = publicRequest(operation, args, login);
+  if (!request) return { ok: false, status: 400, error: "That read needs a token." };
+  try {
+    const response = await fetch(API + request.route, {
+      headers: githubHeaders(null, request),
+      redirect: "error",
+      signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
+    });
+    const remaining = response.headers.get("x-ratelimit-remaining");
+    if (!response.ok) {
+      await response.body?.cancel();
+      return { ok: false, status: response.status, remaining, via: "public" };
+    }
+    let body = await response.text();
+    if (operation === "profile") {
+      const { id, login: name, name: display, created_at: createdAt, followers, public_repos: publicRepos } = JSON.parse(body);
+      body = JSON.stringify({ id, login: name, name: display, createdAt, followers, publicRepos });
+      if (!signal.aborted && Number.isSafeInteger(id) && typeof name === "string" && LOGIN.test(name)) publicUser = { id, login: name };
+    } else {
+      body = shapeBody(operation, body);
+    }
+    return { ok: true, status: response.status, body, link: response.headers.get("link"), remaining, via: "public" };
+  } catch {
+    return { ok: false, status: 0, error: "GitHub request did not complete." };
+  }
+}
+
 handle("status", () => withCredentials(async () => {
   try {
-    const token = await readToken();
-    return { ok: true, signedIn: Boolean(token), kind: tokenKind(token) };
+    const summary = tokenSummary(await readTokens());
+    return { ok: true, ...summary, publicLogin: summary.signedIn ? null : readPublicLogin() };
   } catch {
     return { ok: false, error: "Could not open the saved credential or finish its migration." };
   }
 }));
 
+// Asks GitHub whose token this is. Used before a token is saved, never with a renderer-chosen route.
+async function tokenOwner(token) {
+  try {
+    const response = await fetch(`${API}/user`, {
+      headers: githubHeaders(token),
+      redirect: "error",
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      return { ok: false, status: response.status };
+    }
+    const { id, login } = await response.json();
+    if (!Number.isSafeInteger(id) || typeof login !== "string" || !LOGIN.test(login)) return { ok: false, status: 0 };
+    return { ok: true, id, login };
+  } catch {
+    return { ok: false, status: 0 };
+  }
+}
+
+// Saves a token in its slot. A token for the slot already in use replaces it. A token for the other
+// slot is added beside it, but only when GitHub reports the same account for both.
 handle("sign-in", (token) => withCredentials(async () => {
   const value = typeof token === "string" ? token.trim() : "";
-  if (value.length < 20 || !/^[!-~]+$/.test(value)) {
-    return { ok: false, error: "That does not look like a GitHub token." };
-  }
+  if (!TOKEN.test(value)) return { ok: false, error: "That does not look like a GitHub token." };
+  const slot = slotOf(value);
+  let tokens;
   try {
     fs.mkdirSync(app.getPath("userData"), { recursive: true });
-    await writeToken(value);
-    resetSession();
-    fs.rmSync(path.join(app.getPath("userData"), "github-token"), { force: true });
-    return { ok: true, kind: tokenKind(value) };
+    tokens = await readTokens();
+  } catch {
+    return { ok: false, error: "Could not open the saved credential or finish its migration." };
+  }
+  const owner = await tokenOwner(value);
+  if (!owner.ok) {
+    return owner.status === 401
+      ? { ok: false, status: 401, error: "GitHub rejected that token. Nothing was saved." }
+      : { ok: false, status: owner.status, error: "Could not check that token with GitHub. Nothing was saved. Try again." };
+  }
+  // While an account is loaded, its tokens can be added or replaced, not swapped for another account's.
+  if (sessionUser && sessionUser.id !== owner.id) {
+    return { ok: false, status: 409, error: `That token belongs to @${owner.login}, not @${sessionUser.login}. Sign out to switch accounts.` };
+  }
+  const other = SLOTS.find((s) => s !== slot && tokens[s]);
+  let dropped = null;
+  if (other) {
+    const saved = await tokenOwner(tokens[other]);
+    if (saved.ok && saved.id !== owner.id) {
+      return {
+        ok: false, status: 409,
+        error: `That token belongs to @${owner.login}, and the saved ${other} token belongs to @${saved.login}. Both tokens must be for the same account. Remove the saved token first to switch accounts.`,
+      };
+    }
+    // A saved token GitHub no longer accepts cannot vouch for an account, so it is removed.
+    if (!saved.ok && saved.status === 401) { delete tokens[other]; dropped = other; }
+    else if (!saved.ok) return { ok: false, status: saved.status, error: `Could not check the saved ${other} token with GitHub. Nothing was saved. Try again.` };
+  }
+  const replaced = Boolean(tokens[slot]);
+  tokens[slot] = value;
+  try {
+    await writeTokens(tokens);
+    removeLegacyTokens();
   } catch {
     return { ok: false, error: "Could not save the credential securely or remove the legacy copy." };
+  }
+  // An account that is already loaded keeps its session. Otherwise requests in flight are dropped,
+  // and a public view ends, since the token now says whose account this is.
+  if (sessionUser) preferred.clear();
+  else resetSession();
+  try { forgetPublicLogin(); } catch { /* The saved username is ignored while a token is saved. */ }
+  return { ok: true, slot, replaced, dropped, login: owner.login, ...tokenSummary(tokens) };
+}));
+
+// Removes one saved token. Removing the last one signs out.
+handle("remove-token", (slot) => withCredentials(async () => {
+  if (typeof slot !== "string" || !SLOTS.includes(slot)) return { ok: false, status: 400, error: "Unknown token." };
+  try {
+    const tokens = await readTokens();
+    delete tokens[slot];
+    preferred.clear();
+    if (SLOTS.some((s) => tokens[s])) await writeTokens(tokens);
+    else {
+      resetSession();
+      fs.rmSync(path.join(app.getPath("userData"), TOKENS_FILE), { force: true });
+    }
+    return { ok: true, ...tokenSummary(tokens) };
+  } catch {
+    return { ok: false, error: "Could not remove the saved token. Try again." };
   }
 }));
 
 handle("sign-out", () => withCredentials(() => {
   resetSession();
   try {
-    const profile = app.getPath("userData");
-    fs.rmSync(path.join(profile, "github-token"), { force: true });
-    fs.rmSync(path.join(profile, "github-token.enc"), { force: true });
+    removeLegacyTokens();
+    fs.rmSync(path.join(app.getPath("userData"), TOKENS_FILE), { force: true });
+    forgetPublicLogin();
     return { ok: true };
   } catch {
     return { ok: false, error: "Could not remove the saved credential. Try signing out again." };
   }
 }));
 
-handle("open-token-page", async () => {
-  await shell.openExternal(TOKEN_PAGE);
+// Opens GitHub's form for a new token of the given kind. The classic link asks for only the
+// notifications scope. GitHub documents URL parameters for the fine-grained form alone, so the app
+// tells the user to check the selected scopes instead of relying on the preselection.
+handle("open-token-page", async (kind = "fine-grained") => {
+  if (typeof kind !== "string" || !Object.hasOwn(TOKEN_PAGES, kind)) return { ok: false, status: 400, error: "Unknown token type." };
+  await shell.openExternal(TOKEN_PAGES[kind]);
   return { ok: true };
 });
 
@@ -692,77 +916,128 @@ function githubRequest(operation, args) {
   return null;
 }
 
-handle("github", async (operation, args) => {
-  const request = githubRequest(operation, args);
-  if (!request) return { ok: false, status: 400, error: "Unsupported GitHub read operation." };
-
-  let credential;
-  try {
-    credential = await withCredentials(async () => ({ token: await readToken(), signal: session.signal }));
-  } catch {
-    return { ok: false, status: 0, error: "Could not open the saved credential." };
-  }
-  if (!credential.token) return { ok: false, status: 401, error: "Sign in first." };
-
+function githubHeaders(token, request) {
   const headers = {
-    Accept: request.accept || "application/vnd.github+json",
-    Authorization: `Bearer ${credential.token}`,
+    Accept: request?.accept || "application/vnd.github+json",
     "User-Agent": "ActivityDesk",
     "X-GitHub-Api-Version": "2022-11-28",
   };
-  if (request.body) headers["Content-Type"] = "application/json";
+  // The public view sends no credential.
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (request?.body) headers["Content-Type"] = "application/json";
+  return headers;
+}
+
+// ---------- Which saved token answers a read ----------
+// GitHub's notification endpoints accept classic tokens only. Every other read starts with the
+// fine-grained token and moves to the classic one when GitHub denies the first: 401, or a 403 or 404
+// that is not a rate limit. Both tokens share the account's rate limit, so a rate-limited request is
+// not retried. The slot that answered after a denial goes first for that operation until the session
+// or the saved tokens change. The renderer may name a slot to read a source with each token in turn.
+const CLASSIC_ONLY = new Set(["notifications"]);
+const preferred = new Map();
+
+function tokenOrder(operation, tokens, slot) {
+  if (slot !== undefined) return tokens[slot] ? [slot] : [];
+  if (CLASSIC_ONLY.has(operation)) return tokens.classic ? ["classic"] : [];
+  const first = preferred.get(operation);
+  return SLOTS.filter((s) => tokens[s]).sort((a, b) => (b === first) - (a === first));
+}
+
+const rateLimited = (response) => response.headers.get("x-ratelimit-remaining") === "0" || response.headers.has("retry-after");
+const denied = (response) => response.status === 401 || ((response.status === 403 || response.status === 404) && !rateLimited(response));
+
+// Token metadata GitHub reports on responses: the permissions an endpoint accepts for
+// fine-grained tokens, the granted scopes of a classic token, and the token's expiry when sent.
+const tokenInfo = (response) => ({
+  accepted: response.headers.get("x-accepted-github-permissions"),
+  scopes: response.headers.get("x-oauth-scopes"),
+  expires: response.headers.get("github-authentication-token-expiration"),
+});
+
+// Reduces a response to the fields the renderer uses, the same way with or without a token.
+function shapeBody(operation, body) {
+  if (operation === "ownedRepos") {
+    const repos = JSON.parse(body);
+    return JSON.stringify((Array.isArray(repos) ? repos : []).filter((r) => validRepo(r?.full_name)).map((r) => ({
+      full_name: r.full_name, private: Boolean(r.private), fork: Boolean(r.fork), archived: Boolean(r.archived),
+      stargazers_count: r.stargazers_count, forks_count: r.forks_count, pushed_at: r.pushed_at,
+    })));
+  }
+  if (operation === "stargazers") {
+    const stars = JSON.parse(body);
+    return JSON.stringify((Array.isArray(stars) ? stars : []).map((s) => s?.starred_at).filter((t) => typeof t === "string"));
+  }
+  if (operation === "rateLimit") {
+    const resources = JSON.parse(body)?.resources || {};
+    const kept = {};
+    for (const name of RATE_RESOURCES) {
+      const r = resources[name];
+      if (r && [r.limit, r.remaining, r.used, r.reset].every(Number.isFinite)) {
+        kept[name] = { limit: r.limit, remaining: r.remaining, used: r.used, reset: r.reset };
+      }
+    }
+    return JSON.stringify({ resources: kept });
+  }
+  return body;
+}
+
+handle("github", async (operation, args, slot) => {
+  const request = githubRequest(operation, args);
+  if (!request || (slot !== undefined && !SLOTS.includes(slot))) return { ok: false, status: 400, error: "Unsupported GitHub read operation." };
+
+  let credential;
   try {
-    const response = await fetch(API + request.route, {
-      method: request.body ? "POST" : "GET",
-      headers,
-      body: request.body ? JSON.stringify(request.body) : undefined,
-      redirect: "error",
-      signal: AbortSignal.any([credential.signal, AbortSignal.timeout(30000)]),
-    });
-    // Token metadata GitHub reports on responses: the permissions an endpoint accepts for
-    // fine-grained tokens, the granted scopes of a classic token, and the token's expiry when sent.
-    const tokenInfo = {
-      accepted: response.headers.get("x-accepted-github-permissions"),
-      scopes: response.headers.get("x-oauth-scopes"),
-      expires: response.headers.get("github-authentication-token-expiration"),
-    };
+    credential = await withCredentials(async () => ({ tokens: await readTokens(), signal: session.signal }));
+  } catch {
+    return { ok: false, status: 0, error: "Could not open the saved credential." };
+  }
+  if (!SLOTS.some((s) => credential.tokens[s])) {
+    const login = slot === undefined ? readPublicLogin() : null;
+    return login ? publicRead(operation, args, login, credential.signal) : { ok: false, status: 401, error: "Sign in first." };
+  }
+  const order = tokenOrder(operation, credential.tokens, slot);
+  if (!order.length) {
+    return slot === undefined
+      ? { ok: false, status: 403, error: "GitHub accepts only a classic token for this request, and none is saved." }
+      : { ok: false, status: 400, error: `No ${slot} token is saved.` };
+  }
+
+  try {
+    // Tokens GitHub denied before another one answered, with what GitHub said about each.
+    const skipped = [];
+    let response;
+    let via;
+    for (const [i, candidate] of order.entries()) {
+      via = candidate;
+      response = await fetch(API + request.route, {
+        method: request.body ? "POST" : "GET",
+        headers: githubHeaders(credential.tokens[candidate], request),
+        body: request.body ? JSON.stringify(request.body) : undefined,
+        redirect: "error",
+        signal: AbortSignal.any([credential.signal, AbortSignal.timeout(30000)]),
+      });
+      if (response.ok || i === order.length - 1 || !denied(response)) break;
+      skipped.push({ slot: candidate, status: response.status, token: tokenInfo(response) });
+      await response.body?.cancel();
+    }
+    const token = tokenInfo(response);
     if (!response.ok) {
       await response.body?.cancel();
-      return { ok: false, status: response.status, remaining: response.headers.get("x-ratelimit-remaining"), token: tokenInfo };
+      return { ok: false, status: response.status, remaining: response.headers.get("x-ratelimit-remaining"), token, via, skipped };
     }
+    if (skipped.length) preferred.set(operation, via);
     let body = await response.text();
     if (operation === "profile") {
       const { id, login, name } = JSON.parse(body);
       body = JSON.stringify({ id, login, name });
       if (!credential.signal.aborted && Number.isSafeInteger(id) && typeof login === "string" && LOGIN.test(login)) sessionUser = { id, login };
     }
-    if (operation === "ownedRepos") {
-      const repos = JSON.parse(body);
-      const kept = (Array.isArray(repos) ? repos : []).filter((r) => validRepo(r?.full_name)).map((r) => ({
-        full_name: r.full_name, private: Boolean(r.private), fork: Boolean(r.fork), archived: Boolean(r.archived),
-        stargazers_count: r.stargazers_count, forks_count: r.forks_count, pushed_at: r.pushed_at,
-      }));
-      body = JSON.stringify(kept);
-    }
-    if (operation === "stargazers") {
-      const stars = JSON.parse(body);
-      body = JSON.stringify((Array.isArray(stars) ? stars : []).map((s) => s?.starred_at).filter((t) => typeof t === "string"));
-    }
+    body = shapeBody(operation, body);
     const user = sessionUser;
     if (user && !credential.signal.aborted && (operation === "ownedRepos" ||
         (operation === "traffic" && args.repo.toLowerCase().startsWith(`${user.login.toLowerCase()}/`)))) {
       await recordHistory(user, operation, args, JSON.parse(body)).catch(() => {});
-    }
-    if (operation === "rateLimit") {
-      const resources = JSON.parse(body)?.resources || {};
-      const kept = {};
-      for (const name of RATE_RESOURCES) {
-        const r = resources[name];
-        if (r && [r.limit, r.remaining, r.used, r.reset].every(Number.isFinite)) {
-          kept[name] = { limit: r.limit, remaining: r.remaining, used: r.used, reset: r.reset };
-        }
-      }
-      body = JSON.stringify({ resources: kept });
     }
     return {
       ok: true,
@@ -770,7 +1045,9 @@ handle("github", async (operation, args) => {
       body,
       link: response.headers.get("link"),
       remaining: response.headers.get("x-ratelimit-remaining"),
-      token: tokenInfo,
+      token,
+      via,
+      skipped,
     };
   } catch {
     return { ok: false, status: 0, error: "GitHub request did not complete." };
