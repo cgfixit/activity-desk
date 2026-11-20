@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld("desk", {
   status: () => ipcRenderer.invoke("desk:status"),
   signIn: (token) => ipcRenderer.invoke("desk:sign-in", token),
   signOut: () => ipcRenderer.invoke("desk:sign-out"),
+  browse: (login) => ipcRenderer.invoke("desk:browse", login),
   removeToken: (slot) => ipcRenderer.invoke("desk:remove-token", slot),
   github: (operation, args, slot) => ipcRenderer.invoke("desk:github", operation, args, slot),
   openTokenPage: (kind) => ipcRenderer.invoke("desk:open-token-page", kind),

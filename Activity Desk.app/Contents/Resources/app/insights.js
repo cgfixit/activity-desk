@@ -1322,6 +1322,7 @@ const SUGGESTION_RULES = [
     title: "Switch to a read-only fine-grained token",
     check: ({ token }) => {
       if (!token || !token.kind) return { unavailable: "GitHub has not reported the token type." };
+      if (token.kind === "none") return { unavailable: "No token is saved." };
       if (token.kind !== "classic") return null;
       if (!token.write) return { unavailable: "GitHub has not reported this token's scopes." };
       if (!token.write.length) return null;

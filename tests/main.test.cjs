@@ -74,7 +74,7 @@ test("only supported reads from the app frame reach the GitHub transport", async
   // Saving a token costs one read of /user, which confirms the token and names its account.
   assert.deepEqual(calls.map((c) => [c.url, c.options.method, c.options.redirect]), [["https://api.github.com/user", undefined, "error"]]);
   calls.length = 0;
-  for (const operation of ["status", "sign-in", "sign-out", "remove-token", "github", "open-token-page", "notes", "note-save", "note-delete"]) {
+  for (const operation of ["status", "sign-in", "sign-out", "remove-token", "browse", "github", "open-token-page", "notes", "note-save", "note-delete"]) {
     assert.equal((await foreign(operation)).status, 403);
   }
   assert.equal((await invoke("github", "unsupported")).status, 400);
@@ -136,7 +136,7 @@ test("migration survives restart and sign-out reports removal failure", async (t
   const encrypted = path.join(profile, "github-tokens.enc");
   fs.writeFileSync(legacy, token, { mode: 0o600 });
   const first = await start(t, profile);
-  assert.deepEqual(await first.invoke("status"), { ok: true, signedIn: true, kind: "GitHub", tokens: { "fine-grained": null, classic: "GitHub" } });
+  assert.deepEqual(await first.invoke("status"), { ok: true, signedIn: true, kind: "GitHub", tokens: { "fine-grained": null, classic: "GitHub" }, publicLogin: null });
   assert.equal(fs.existsSync(legacy), false);
   assert.match(fs.readFileSync(encrypted, "utf8"), /^mock:/);
   assert.doesNotMatch(fs.readFileSync(encrypted, "utf8"), /synthetic/);
@@ -296,4 +296,61 @@ test("a second token is saved only for the same account, and each read goes to t
   const last = await invoke("remove-token", "classic");
   assert.deepEqual([last.ok, last.signedIn], [true, false]);
   assert.equal(fs.existsSync(path.join(profile, "github-tokens.enc")), false);
+});
+
+test("the public view sends no credential, reads only public routes for one username, and keeps saved data closed", async (t) => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "activity-desk-"));
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
+  const { invoke, calls } = await start(t, profile, (url) => {
+    if (url.endsWith("/users/missing")) return new Response("", { status: 404 });
+    if (url.endsWith("/users/an-org")) return Response.json({ id: 7, login: "an-org", type: "Organization" });
+    if (url.endsWith("/users/Fixture") || url.endsWith("/users/fixture") || isUser(url)) {
+      return Response.json({ id: 1, login: "fixture", name: "Test account", type: "User", created_at: "2020-01-01T00:00:00Z", followers: 4, public_repos: 2, email: "fixture@example.invalid" });
+    }
+    if (url.includes("/repos?")) return Response.json([{ full_name: "fixture/example", private: false, stargazers_count: 1, forks_count: 0, pushed_at: "2026-01-01T00:00:00Z", owner: { login: "fixture" } }]);
+    return new Response("[]", { headers: { "x-ratelimit-remaining": "50" } });
+  });
+  const routes = () => calls.splice(0).map((c) => c.url.replace("https://api.github.com", ""));
+
+  assert.match((await invoke("browse", "not a login")).error, /does not look like/);
+  assert.equal(calls.length, 0);
+  assert.equal((await invoke("browse", "missing")).status, 404);
+  assert.match((await invoke("browse", "an-org")).error, /not a user account/);
+  assert.equal(fs.existsSync(path.join(profile, "public-user")), false);
+  calls.length = 0;
+
+  assert.deepEqual(await invoke("browse", "@Fixture"), { ok: true, id: 1, login: "fixture" });
+  assert.equal(fs.readFileSync(path.join(profile, "public-user"), "utf8"), "fixture");
+  assert.deepEqual(await invoke("status"), { ok: true, signedIn: false, kind: null, tokens: { "fine-grained": null, classic: null }, publicLogin: "fixture" });
+  routes();
+
+  const shown = await invoke("github", "profile");
+  assert.deepEqual([shown.via, JSON.parse(shown.body)], ["public", { id: 1, login: "fixture", name: "Test account", createdAt: "2020-01-01T00:00:00Z", followers: 4, publicRepos: 2 }]);
+  assert.equal((await invoke("github", "events", { login: "fixture", page: 1 })).ok, true);
+  assert.deepEqual(JSON.parse((await invoke("github", "ownedRepos")).body), [{
+    full_name: "fixture/example", private: false, fork: false, archived: false, stargazers_count: 1, forks_count: 0, pushed_at: "2026-01-01T00:00:00Z",
+  }]);
+  assert.equal((await invoke("github", "stargazers", { repo: "fixture/example" })).ok, true);
+  assert.equal((await invoke("github", "rateLimit")).ok, true);
+  assert.equal(calls.every((c) => !Object.hasOwn(c.options.headers, "Authorization") && c.options.method === undefined && c.options.redirect === "error"), true);
+  assert.deepEqual(routes(), ["/users/fixture", "/users/fixture/events/public?per_page=100&page=1",
+    "/users/fixture/repos?type=owner&sort=pushed&per_page=100", "/repos/fixture/example/stargazers?per_page=100", "/rate_limit"]);
+
+  // Anything outside the public allowlist, or about another account, stops in the main process.
+  for (const [operation, args, slot] of [["notifications"], ["year"], ["conversations", { login: "fixture" }], ["traffic", { repo: "fixture/example", kind: "views" }],
+    ["events", { login: "someone", page: 1 }], ["stargazers", { repo: "someone/example" }], ["profile", undefined, "classic"]]) {
+    assert.equal((await invoke("github", operation, args, slot)).ok, false, operation);
+  }
+  for (const channel of ["notes", "history", "clear-history"]) assert.match((await invoke(channel)).error, /needs a token/, channel);
+  assert.match((await invoke("note-save", { text: "x" })).error, /needs a token/);
+  assert.equal(calls.length, 0);
+
+  // A token ends the public view, and sign-out forgets the username.
+  assert.equal((await invoke("sign-in", token)).ok, true);
+  assert.equal(fs.existsSync(path.join(profile, "public-user")), false);
+  assert.match((await invoke("browse", "fixture")).error, /A token is saved/);
+  assert.equal((await invoke("sign-out")).ok, true);
+  assert.equal((await invoke("browse", "fixture")).ok, true);
+  assert.equal((await invoke("sign-out")).ok, true);
+  assert.deepEqual([(await invoke("status")).publicLogin, fs.existsSync(path.join(profile, "public-user"))], [null, false]);
 });

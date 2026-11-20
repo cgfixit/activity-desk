@@ -186,6 +186,7 @@ function resetSession() {
   session.abort();
   session = new AbortController();
   sessionUser = null;
+  publicUser = null;
   preferred.clear();
 }
 
@@ -203,6 +204,10 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const REFERRER = /^[A-Za-z0-9.-]{1,100}$/;
 
 let sessionUser = null; // { id, login } from the profile read in this session
+// The account shown in the public view. It is never a sessionUser: a username does not prove who is
+// asking, so notes and saved history stay closed until a token confirms the account.
+let publicUser = null;
+const signInFirst = () => (publicUser ? "This needs a token. A username alone does not show whose saved data to open." : "Sign in first.");
 let history = null;
 let historyNote = "";
 let historyQueue = Promise.resolve();
@@ -315,7 +320,7 @@ function recordHistory(user, operation, args, data) {
 }
 
 handle("history", () => withHistory(async () => {
-  if (!sessionUser) return { ok: false, error: "Sign in first." };
+  if (!sessionUser) return { ok: false, error: signInFirst() };
   try {
     const store = await loadHistory();
     await saveHistory();
@@ -349,7 +354,7 @@ handle("history-setting", (enabled) => withHistory(async () => {
 }));
 
 handle("clear-history", () => withHistory(async () => {
-  if (!sessionUser) return { ok: false, error: "Sign in first." };
+  if (!sessionUser) return { ok: false, error: signInFirst() };
   try {
     const store = await loadHistory();
     delete store.accounts[String(sessionUser.id)];
@@ -437,7 +442,7 @@ async function loadNotes() {
 const noteCopy = (n) => ({ id: n.id, text: n.text, color: n.color, pinned: n.pinned, created: n.created, updated: n.updated });
 
 handle("notes", () => withNotes(async () => {
-  if (!sessionUser) return { ok: false, error: "Sign in first." };
+  if (!sessionUser) return { ok: false, error: signInFirst() };
   try {
     const store = await loadNotes();
     const account = store.accounts[String(sessionUser.id)];
@@ -453,7 +458,7 @@ handle("notes", () => withNotes(async () => {
 // Without an id this creates a note. Text, color, and pinned are each optional. Only a text change
 // moves the edited time, so pinning or recoloring does not reorder the list.
 handle("note-save", (input) => withNotes(async () => {
-  if (!sessionUser) return { ok: false, error: "Sign in first." };
+  if (!sessionUser) return { ok: false, error: signInFirst() };
   if (!input || typeof input !== "object" || Array.isArray(input)) return { ok: false, error: "Invalid note." };
   const { id, text, color, pinned } = input;
   if ((id !== undefined && (typeof id !== "string" || !NOTE_ID.test(id))) ||
@@ -493,7 +498,7 @@ handle("note-save", (input) => withNotes(async () => {
 }));
 
 handle("note-delete", (id) => withNotes(async () => {
-  if (!sessionUser) return { ok: false, error: "Sign in first." };
+  if (!sessionUser) return { ok: false, error: signInFirst() };
   if (typeof id !== "string" || !NOTE_ID.test(id)) return { ok: false, error: "Invalid note." };
   try {
     const store = await loadNotes();
@@ -513,9 +518,108 @@ handle("note-delete", (id) => withNotes(async () => {
   }
 }));
 
+// ---------- Public view ----------
+// Without a token, a username shows what GitHub serves to anyone: the profile, public events, public
+// repositories, and star dates. These requests carry no credential and count against GitHub's limit
+// for the network address. Only the username is kept, in a plain file, so the view reopens.
+const PUBLIC_FILE = "public-user";
+
+function readPublicLogin() {
+  const text = readIfPresent(path.join(app.getPath("userData"), PUBLIC_FILE))?.toString("utf8").trim();
+  return text && LOGIN.test(text) ? text : null;
+}
+const forgetPublicLogin = () => fs.rmSync(path.join(app.getPath("userData"), PUBLIC_FILE), { force: true });
+
+const PUBLIC_LIMIT = "GitHub's hourly limit for requests without a token was reached. Try again later, or sign in with a token.";
+
+handle("browse", (login) => withCredentials(async () => {
+  const value = typeof login === "string" ? login.trim().replace(/^@/, "") : "";
+  if (!LOGIN.test(value)) return { ok: false, error: "That does not look like a GitHub username." };
+  try {
+    fs.mkdirSync(app.getPath("userData"), { recursive: true });
+    if (tokenSummary(await readTokens()).signedIn) {
+      return { ok: false, status: 409, error: "A token is saved. Remove it before opening the public view." };
+    }
+  } catch {
+    return { ok: false, error: "Could not open the saved credential or finish its migration." };
+  }
+  let found;
+  try {
+    const response = await fetch(`${API}/users/${value}`, { headers: githubHeaders(null), redirect: "error", signal: AbortSignal.timeout(15000) });
+    if (!response.ok) {
+      await response.body?.cancel();
+      if (response.status === 404) return { ok: false, status: 404, error: `GitHub has no account named @${value}.` };
+      if (response.status === 403 || response.status === 429) return { ok: false, status: response.status, error: PUBLIC_LIMIT };
+      return { ok: false, status: response.status, error: `GitHub returned HTTP ${response.status}.` };
+    }
+    found = await response.json();
+  } catch {
+    return { ok: false, status: 0, error: "Could not reach GitHub to look up that username." };
+  }
+  if (!Number.isSafeInteger(found?.id) || typeof found.login !== "string" || !LOGIN.test(found.login)) return { ok: false, status: 0, error: "Unexpected GitHub profile." };
+  if (found.type !== "User") return { ok: false, status: 400, error: `@${found.login} is not a user account. The public view covers people's accounts.` };
+  try {
+    fs.writeFileSync(path.join(app.getPath("userData"), PUBLIC_FILE), found.login, { mode: 0o600 });
+  } catch {
+    return { ok: false, error: "Could not save the username." };
+  }
+  resetSession();
+  publicUser = { id: found.id, login: found.login };
+  return { ok: true, id: found.id, login: found.login };
+}));
+
+// The reads the public view may make, each for the saved username only.
+function publicRequest(operation, args, login) {
+  const mine = (value) => typeof value === "string" && value.toLowerCase() === login.toLowerCase();
+  switch (operation) {
+    case "profile": return { route: `/users/${login}` };
+    case "events": {
+      const { login: asked, page } = args || {};
+      if (mine(asked) && Number.isInteger(page) && page >= 1 && page <= 3) return { route: `/users/${login}/events/public?per_page=100&page=${page}` };
+      break;
+    }
+    case "ownedRepos": return { route: `/users/${login}/repos?type=owner&sort=pushed&per_page=100` };
+    case "stargazers": {
+      if (!validRepo(args?.repo) || !mine(args.repo.split("/")[0])) break;
+      return { route: `/repos/${args.repo}/stargazers?per_page=100`, accept: "application/vnd.github.star+json" };
+    }
+    case "rateLimit": return { route: "/rate_limit" };
+  }
+  return null;
+}
+
+async function publicRead(operation, args, login, signal) {
+  const request = publicRequest(operation, args, login);
+  if (!request) return { ok: false, status: 400, error: "That read needs a token." };
+  try {
+    const response = await fetch(API + request.route, {
+      headers: githubHeaders(null, request),
+      redirect: "error",
+      signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
+    });
+    const remaining = response.headers.get("x-ratelimit-remaining");
+    if (!response.ok) {
+      await response.body?.cancel();
+      return { ok: false, status: response.status, remaining, via: "public" };
+    }
+    let body = await response.text();
+    if (operation === "profile") {
+      const { id, login: name, name: display, created_at: createdAt, followers, public_repos: publicRepos } = JSON.parse(body);
+      body = JSON.stringify({ id, login: name, name: display, createdAt, followers, publicRepos });
+      if (!signal.aborted && Number.isSafeInteger(id) && typeof name === "string" && LOGIN.test(name)) publicUser = { id, login: name };
+    } else {
+      body = shapeBody(operation, body);
+    }
+    return { ok: true, status: response.status, body, link: response.headers.get("link"), remaining, via: "public" };
+  } catch {
+    return { ok: false, status: 0, error: "GitHub request did not complete." };
+  }
+}
+
 handle("status", () => withCredentials(async () => {
   try {
-    return { ok: true, ...tokenSummary(await readTokens()) };
+    const summary = tokenSummary(await readTokens());
+    return { ok: true, ...summary, publicLogin: summary.signedIn ? null : readPublicLogin() };
   } catch {
     return { ok: false, error: "Could not open the saved credential or finish its migration." };
   }
@@ -586,9 +690,11 @@ handle("sign-in", (token) => withCredentials(async () => {
   } catch {
     return { ok: false, error: "Could not save the credential securely or remove the legacy copy." };
   }
-  // An account that is already loaded keeps its session. Otherwise requests in flight are dropped.
+  // An account that is already loaded keeps its session. Otherwise requests in flight are dropped,
+  // and a public view ends, since the token now says whose account this is.
   if (sessionUser) preferred.clear();
   else resetSession();
+  try { forgetPublicLogin(); } catch { /* The saved username is ignored while a token is saved. */ }
   return { ok: true, slot, replaced, dropped, login: owner.login, ...tokenSummary(tokens) };
 }));
 
@@ -615,6 +721,7 @@ handle("sign-out", () => withCredentials(() => {
   try {
     removeLegacyTokens();
     fs.rmSync(path.join(app.getPath("userData"), TOKENS_FILE), { force: true });
+    forgetPublicLogin();
     return { ok: true };
   } catch {
     return { ok: false, error: "Could not remove the saved credential. Try signing out again." };
@@ -812,10 +919,11 @@ function githubRequest(operation, args) {
 function githubHeaders(token, request) {
   const headers = {
     Accept: request?.accept || "application/vnd.github+json",
-    Authorization: `Bearer ${token}`,
     "User-Agent": "ActivityDesk",
     "X-GitHub-Api-Version": "2022-11-28",
   };
+  // The public view sends no credential.
+  if (token) headers.Authorization = `Bearer ${token}`;
   if (request?.body) headers["Content-Type"] = "application/json";
   return headers;
 }
@@ -847,6 +955,33 @@ const tokenInfo = (response) => ({
   expires: response.headers.get("github-authentication-token-expiration"),
 });
 
+// Reduces a response to the fields the renderer uses, the same way with or without a token.
+function shapeBody(operation, body) {
+  if (operation === "ownedRepos") {
+    const repos = JSON.parse(body);
+    return JSON.stringify((Array.isArray(repos) ? repos : []).filter((r) => validRepo(r?.full_name)).map((r) => ({
+      full_name: r.full_name, private: Boolean(r.private), fork: Boolean(r.fork), archived: Boolean(r.archived),
+      stargazers_count: r.stargazers_count, forks_count: r.forks_count, pushed_at: r.pushed_at,
+    })));
+  }
+  if (operation === "stargazers") {
+    const stars = JSON.parse(body);
+    return JSON.stringify((Array.isArray(stars) ? stars : []).map((s) => s?.starred_at).filter((t) => typeof t === "string"));
+  }
+  if (operation === "rateLimit") {
+    const resources = JSON.parse(body)?.resources || {};
+    const kept = {};
+    for (const name of RATE_RESOURCES) {
+      const r = resources[name];
+      if (r && [r.limit, r.remaining, r.used, r.reset].every(Number.isFinite)) {
+        kept[name] = { limit: r.limit, remaining: r.remaining, used: r.used, reset: r.reset };
+      }
+    }
+    return JSON.stringify({ resources: kept });
+  }
+  return body;
+}
+
 handle("github", async (operation, args, slot) => {
   const request = githubRequest(operation, args);
   if (!request || (slot !== undefined && !SLOTS.includes(slot))) return { ok: false, status: 400, error: "Unsupported GitHub read operation." };
@@ -857,7 +992,10 @@ handle("github", async (operation, args, slot) => {
   } catch {
     return { ok: false, status: 0, error: "Could not open the saved credential." };
   }
-  if (!SLOTS.some((s) => credential.tokens[s])) return { ok: false, status: 401, error: "Sign in first." };
+  if (!SLOTS.some((s) => credential.tokens[s])) {
+    const login = slot === undefined ? readPublicLogin() : null;
+    return login ? publicRead(operation, args, login, credential.signal) : { ok: false, status: 401, error: "Sign in first." };
+  }
   const order = tokenOrder(operation, credential.tokens, slot);
   if (!order.length) {
     return slot === undefined
@@ -895,33 +1033,11 @@ handle("github", async (operation, args, slot) => {
       body = JSON.stringify({ id, login, name });
       if (!credential.signal.aborted && Number.isSafeInteger(id) && typeof login === "string" && LOGIN.test(login)) sessionUser = { id, login };
     }
-    if (operation === "ownedRepos") {
-      const repos = JSON.parse(body);
-      const kept = (Array.isArray(repos) ? repos : []).filter((r) => validRepo(r?.full_name)).map((r) => ({
-        full_name: r.full_name, private: Boolean(r.private), fork: Boolean(r.fork), archived: Boolean(r.archived),
-        stargazers_count: r.stargazers_count, forks_count: r.forks_count, pushed_at: r.pushed_at,
-      }));
-      body = JSON.stringify(kept);
-    }
-    if (operation === "stargazers") {
-      const stars = JSON.parse(body);
-      body = JSON.stringify((Array.isArray(stars) ? stars : []).map((s) => s?.starred_at).filter((t) => typeof t === "string"));
-    }
+    body = shapeBody(operation, body);
     const user = sessionUser;
     if (user && !credential.signal.aborted && (operation === "ownedRepos" ||
         (operation === "traffic" && args.repo.toLowerCase().startsWith(`${user.login.toLowerCase()}/`)))) {
       await recordHistory(user, operation, args, JSON.parse(body)).catch(() => {});
-    }
-    if (operation === "rateLimit") {
-      const resources = JSON.parse(body)?.resources || {};
-      const kept = {};
-      for (const name of RATE_RESOURCES) {
-        const r = resources[name];
-        if (r && [r.limit, r.remaining, r.used, r.reset].every(Number.isFinite)) {
-          kept[name] = { limit: r.limit, remaining: r.remaining, used: r.used, reset: r.reset };
-        }
-      }
-      body = JSON.stringify({ resources: kept });
     }
     return {
       ok: true,

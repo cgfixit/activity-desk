@@ -24,8 +24,15 @@
         <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_… or ghp_…" required>
         <button class="btn primary wide" type="submit" id="signin-btn">Sign in</button>
       </form>
+      <div class="or" aria-hidden="true">or</div>
+      <form id="public-form">
+        <label for="public-login">GitHub username, without a token</label>
+        <input id="public-login" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="octocat" maxlength="40" required>
+        <button class="btn wide" type="submit" id="public-btn">View public activity</button>
+      </form>
+      <p class="small muted">The public view shows public events, repositories, and stars. The contribution calendar, pull request details, conversations, notifications, traffic, and notes need a token. GitHub allows 60 requests an hour without one.</p>
       <p class="msg" id="signin-error" role="alert"></p>
-      <button class="btn ghost hidden" id="forget-token" type="button">Remove saved tokens</button>
+      <button class="btn ghost hidden" id="forget-token" type="button">Remove the saved sign-in</button>
       <details class="help">
         <summary>Which token should I use?</summary>
         <ul>
@@ -171,7 +178,7 @@
           <h3>Token check</h3>
           <div id="token-check"></div>
           <form id="add-token-form" class="token-form">
-            <label for="add-token">Add a second token for this account, or replace a saved one</label>
+            <label for="add-token" id="add-token-label">Add a second token for this account, or replace a saved one</label>
             <div class="token-row">
               <input id="add-token" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_… or ghp_…" required>
               <button class="btn primary" type="submit" id="add-token-btn">Save token</button>

@@ -164,6 +164,27 @@ With one token saved, the dashboard works as before: a fine-grained token reads 
 
 To remove one token, select **Remove this token** under it. The token stays valid on GitHub until you revoke it there. **Sign out** removes both.
 
+## Viewing without a token
+
+On the sign-in screen, enter a username under **GitHub username, without a token** and select **View public activity**. Activity Desk sends no credential in this view. It reads only what GitHub serves to anyone, and only for that username. The sidebar shows **public view** beside the name.
+
+| View | Without a token |
+| --- | --- |
+| Overview | Agent signals from public events. The contribution figures, the calendar, and unread notifications need a token. One item under **Needs a look** lists what is missing. |
+| Stream → Your events | Up to 300 public events. Private events never appear. |
+| Stream → Conversations, Notes | Need a token. Notes stay closed because a username alone does not show whose notes to open. |
+| Insights → Recent events, and the event-based cards in Patterns | Work from the public events. |
+| Insights → Contribution year, All years, Pull requests | Need a token. |
+| Insights → Footprint | Public repositories with star and fork counts, and star dates for up to three of them. Views, clones, and referring sites are never public. |
+| Suggestions | Only the checks that read events can apply. **What was checked** marks the rest as source unavailable. |
+| Data & access | What loaded, the remaining request budget, and the form to add a token. |
+
+GitHub allows 60 requests an hour without a token, counted for your network address, so other people or tools on the same network share it. A refresh uses up to eight: the profile, up to three pages of events, the repository list, and up to three star-date reads. When the limit is reached, Activity Desk says so and keeps the last loaded data.
+
+![The public view of a fictional account, without a token](screenshots/public-view.png)
+
+Only the username is saved, in a plain file in the app's data folder, so the view reopens next time. **Sign out** removes it. To load the rest, paste a token into **Data & access → Add a token to load everything else**. The public view ends and the dashboard reloads for the account the token belongs to.
+
 ## Checking your tokens
 
 **Data & access → Token check** reads what GitHub reports about each saved token on each response.
@@ -182,7 +203,9 @@ To remove one token, select **Remove this token** under it. The token stays vali
 
 The main process sends each token to `api.github.com` for allowlisted reads, and the window never receives a token back. macOS Keychain backs encryption of the saved tokens, which are kept together in one file in the local Electron profile. A token saved by an earlier version, encrypted or plaintext, moves into that file on first use.
 
-**Sign out** clears the dashboard and removes the saved tokens. The account's seen timestamp, saved history, and notes remain in the local profile.
+In the public view no token exists. Requests go to `api.github.com` without a credential, and only the username is saved.
+
+**Sign out** clears the dashboard and removes the saved tokens, or the saved username in the public view. The account's seen timestamp, saved history, and notes remain in the local profile.
 
 **Notes** are kept in the app's data folder (`~/Library/Application Support/Activity Desk`), not inside the app itself, so updating or replacing the app keeps them. Only the main process reads or writes them. They are encrypted with the same macOS Keychain-backed key as the token, and each account has its own notes. They are never sent to GitHub. If the notes file cannot be decrypted, for example after a Keychain change, Activity Desk keeps the unreadable file beside it as `notes-unreadable-….enc`, starts a new notebook, and says so in Notes and in **Data & access → Notes on this Mac**.
 

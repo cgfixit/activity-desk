@@ -12,4 +12,8 @@
 
 You can also sign in with a classic token first and add a fine-grained one later. With both saved, the classic token reads notifications, both read your events, pull requests, and conversations, and the fine-grained token goes first for everything else. See [Using two tokens](user-guide.md#using-two-tokens). Grant only the permissions you need. A classic token with only `notifications` cannot change anything, while GitHub's classic `repo` scope also grants write access to private repositories. [GitHub personal access token documentation](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
 
+## Without a token
+
+To look before you create a token, type a GitHub username under **GitHub username, without a token** on the sign-in screen and select **View public activity**. Activity Desk shows that account's public events, public repositories, and stars. Everything else needs a token, and you can add one later in **Data & access** without starting over. See [Viewing without a token](user-guide.md#viewing-without-a-token).
+
 For a local build, see [Development and releases](development.md).
