@@ -775,7 +775,7 @@ const YEAR_QUERY = `query {
 const REPO_NAME = /^[A-Za-z0-9_.-]{1,100}$/;
 const PR_FIELDS = `title state merged isDraft createdAt mergedAt additions deletions headRefName
   author { __typename login } mergedBy { login }
-  reviews(first: 10) { totalCount nodes { submittedAt author { __typename login } } }`;
+  reviews(first: 10) { totalCount nodes { submittedAt state author { __typename login } } }`;
 
 // Recent comments on issues and pull requests that involve the user, open or closed.
 // Search finds the threads; each thread's latest comments, reviews, and review comments are read live.

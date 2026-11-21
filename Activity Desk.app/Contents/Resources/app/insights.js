@@ -101,6 +101,98 @@ function median(values) {
   return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
 }
 
+// The value a share q of the finite values fall at or below, interpolating between ranks.
+function quantile(values, q) {
+  const v = values.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
+  if (!v.length) return null;
+  const pos = (v.length - 1) * q;
+  const lo = Math.floor(pos);
+  return v[lo] + (v[Math.min(lo + 1, v.length - 1)] - v[lo]) * (pos - lo);
+}
+
+// ---------- Chance checks ----------
+// A fixed seed, so a check gives the same answer on every refresh of the same data.
+const CHANCE_SHUFFLES = 999;
+const CHANCE_P = 0.05;
+function seededRandom() {
+  let seed = 1;
+  return () => (seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296;
+}
+function shuffleInPlace(list, random) {
+  for (let i = list.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(random() * (i + 1));
+    [list[i], list[j]] = [list[j], list[i]];
+  }
+  return list;
+}
+
+// How often the same values, dealt into two groups of the same sizes at random, show a gap in the
+// statistic at least as large as the real grouping does. Near 0: the grouping matters. Large: it may not.
+function permutationP(a, b, stat) {
+  const observed = Math.abs(stat(a, b));
+  if (!Number.isFinite(observed)) return null;
+  const pool = [...a, ...b];
+  const random = seededRandom();
+  let asLarge = 0;
+  for (let round = 0; round < CHANCE_SHUFFLES; round += 1) {
+    shuffleInPlace(pool, random);
+    if (Math.abs(stat(pool.slice(0, a.length), pool.slice(a.length))) >= observed - RATIO_EPSILON) asLarge += 1;
+  }
+  return (asLarge + 1) / (CHANCE_SHUFFLES + 1);
+}
+
+// Ranks from 1, with tied values sharing the average of their ranks.
+function ranks(values) {
+  const order = values.map((v, i) => [v, i]).sort((a, b) => a[0] - b[0]);
+  const out = Array(values.length);
+  for (let i = 0; i < order.length;) {
+    let j = i;
+    while (j + 1 < order.length && order[j + 1][0] === order[i][0]) j += 1;
+    for (let k = i; k <= j; k += 1) out[order[k][1]] = (i + j) / 2 + 1;
+    i = j + 1;
+  }
+  return out;
+}
+function pearson(x, y) {
+  const mx = sum(x) / x.length;
+  const my = sum(y) / y.length;
+  let sxy = 0;
+  let sxx = 0;
+  let syy = 0;
+  for (let i = 0; i < x.length; i += 1) {
+    sxy += (x[i] - mx) * (y[i] - my);
+    sxx += (x[i] - mx) ** 2;
+    syy += (y[i] - my) ** 2;
+  }
+  return sxx && syy ? sxy / Math.sqrt(sxx * syy) : null;
+}
+
+// Spearman's rank correlation, with how often shuffling y against x matches or beats it.
+// Ranks make it robust to the long tail that merge times and change sizes both have.
+function rankCorrelation(x, y) {
+  const rx = ranks(x);
+  const ry = ranks(y);
+  const rho = pearson(rx, ry);
+  if (rho == null) return null;
+  const random = seededRandom();
+  const shuffled = ry.slice();
+  let asLarge = 0;
+  for (let round = 0; round < CHANCE_SHUFFLES; round += 1) {
+    if (Math.abs(pearson(rx, shuffleInPlace(shuffled, random))) >= Math.abs(rho) - RATIO_EPSILON) asLarge += 1;
+  }
+  return { rho, n: x.length, p: (asLarge + 1) / (CHANCE_SHUFFLES + 1) };
+}
+
+// Wording for a permutation p value: lead names the shuffle, thing the result it matched.
+function chanceNote(p, lead, thing) {
+  if (p == null) return "";
+  const often = share(p) === "0%" ? "under 1%" : share(p);
+  return p < CHANCE_P
+    ? ` ${lead} match ${thing} ${often === "under 1%" ? often : `only ${often}`} of the time.`
+    : ` ${lead} match ${thing} ${often} of the time, so it may be chance.`;
+}
+const GROUP_CHANCE = ["Random regroupings of the same merges", "a gap this large"];
+
 function prKey(repo, number) {
   return `${repo}#${number}`;
 }
@@ -524,19 +616,28 @@ function summarizeSessions(events, login) {
 }
 
 // Comparisons inside the loaded pull requests: agent branches against the rest, larger against smaller.
+const CORRELATION_MIN_MERGES = 8;
 function summarizePrPatterns(prInfo, now) {
   const rows = Object.values(prInfo || {}).filter((pr) => pr?.title);
   const size = (pr) => (pr.additions || 0) + (pr.deletions || 0);
+  const toMerge = (pr) => (Date.parse(pr.mergedAt) - Date.parse(pr.createdAt)) / 36e5;
+  const timedHours = (list) => list.map(toMerge).filter((h) => Number.isFinite(h) && h >= 0);
   const group = (list) => ({
     count: list.length,
-    medianHours: median(list
-      .map((pr) => (Date.parse(pr.mergedAt) - Date.parse(pr.createdAt)) / 36e5)
-      .filter((h) => Number.isFinite(h) && h >= 0)),
+    medianHours: median(timedHours(list)),
+    p75Hours: list.length >= 4 ? quantile(timedHours(list), 0.75) : null,
     unreviewed: list.filter((pr) => !pr.reviews).length,
     medianSize: median(list.map(size)),
     agent: list.filter((pr) => agentFromBranch(pr.headRef)).length,
   });
   const merged = rows.filter((pr) => pr.merged);
+  const agentMerged = merged.filter((pr) => agentFromBranch(pr.headRef));
+  const otherMerged = merged.filter((pr) => !agentFromBranch(pr.headRef));
+  const agentHours = timedHours(agentMerged);
+  const otherHours = timedHours(otherMerged);
+  const timed = merged.filter((pr) => Number.isFinite(toMerge(pr)) && toMerge(pr) >= 0);
+  const ref = (pr) => ({ repo: pr.repo, number: pr.number, lines: size(pr), agent: Boolean(agentFromBranch(pr.headRef)) });
+  const bySizeDesc = (list) => list.slice().sort((a, b) => size(b) - size(a) || String(a.repo).localeCompare(String(b.repo)) || a.number - b.number);
   const bySize = merged.slice().sort((a, b) => size(a) - size(b));
   const half = Math.floor(bySize.length / 2);
   const mergedLines = sum(merged.map(size));
@@ -548,8 +649,25 @@ function summarizePrPatterns(prInfo, now) {
   return {
     merged: merged.length,
     all: group(merged),
-    agent: group(merged.filter((pr) => agentFromBranch(pr.headRef))),
-    other: group(merged.filter((pr) => !agentFromBranch(pr.headRef))),
+    agent: group(agentMerged),
+    other: group(otherMerged),
+    // Whether agent-branch merges rank faster or slower than the rest beyond random regrouping: a
+    // Mann-Whitney comparison by permutation. Medians are a poor statistic here, since with three tied
+    // values per group almost every regrouping moves them as far as the real one.
+    agentGapP: agentHours.length >= 3 && otherHours.length >= 3 ? (() => {
+      const r = ranks([...agentHours, ...otherHours]);
+      const mean = (x) => sum(x) / x.length;
+      return permutationP(r.slice(0, agentHours.length), r.slice(agentHours.length), (x, y) => mean(x) - mean(y));
+    })() : null,
+    // The same check for the share of merges with zero recorded reviews.
+    agentReviewP: agentMerged.length >= 3 && otherMerged.length >= 3 ? permutationP(
+      agentMerged.map((pr) => (pr.reviews ? 0 : 1)), otherMerged.map((pr) => (pr.reviews ? 0 : 1)),
+      (x, y) => sum(x) / x.length - sum(y) / y.length) : null,
+    // Size against time to merge across every timed merge, by rank.
+    sizeVsTime: timed.length >= CORRELATION_MIN_MERGES ? rankCorrelation(timed.map(size), timed.map(toMerge)) : null,
+    largest: bySizeDesc(merged).slice(0, 3).map(ref),
+    largestUnreviewed: bySizeDesc(merged.filter((pr) => !pr.reviews)).slice(0, 3).map(ref),
+    largestUnreviewedAgent: bySizeDesc(agentMerged.filter((pr) => !pr.reviews)).slice(0, 3).map(ref),
     // An odd middle PR is left out so both halves hold the same number.
     smaller: half >= 3 ? group(bySize.slice(0, half)) : null,
     larger: half >= 3 ? group(bySize.slice(-half)) : null,
@@ -699,13 +817,45 @@ function summarizeReviewFlow(prInfo, login) {
     .filter((r) => !r.bot && r.login && r.login.toLowerCase() !== String(pr.author || "").toLowerCase() && Number.isFinite(Date.parse(r.at)))
     .sort((a, b) => Date.parse(a.at) - Date.parse(b.at))[0];
 
+  // Review verdicts arrive as states such as approved or changes_requested. Older loads lack them,
+  // and then the approval counts below are null rather than zero.
+  const states = authored.length > 0 && authored.every((pr) => pr.reviewList.every((r) => typeof r.state === "string"));
+  const humanBy = (pr, state) => pr.reviewList.filter((r) => !r.bot && r.login && r.login.toLowerCase() !== String(pr.author || "").toLowerCase() &&
+    r.state === state && Number.isFinite(Date.parse(r.at)));
+
   const waits = [];
+  const approvalWaits = [];
   let reviewedBeforeMerge = 0;
+  let approvedBeforeMerge = 0;
+  let changesRequested = 0;
+  const repos = new Map();
   for (const pr of authored) {
+    if (!repos.has(pr.repo)) repos.set(pr.repo, { repo: pr.repo, authored: 0, merged: 0, noHuman: 0, approved: 0, waits: [] });
+    const row = repos.get(pr.repo);
+    row.authored += 1;
+    if (pr.merged) row.merged += 1;
+    if (states) {
+      const approvals = humanBy(pr, "approved").sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+      if (approvals.length) {
+        const h = (Date.parse(approvals[0].at) - Date.parse(pr.createdAt)) / 36e5;
+        if (Number.isFinite(h) && h >= 0) approvalWaits.push(h);
+      }
+      if (pr.merged && approvals.some((r) => Date.parse(r.at) <= Date.parse(pr.mergedAt))) {
+        approvedBeforeMerge += 1;
+        row.approved += 1;
+      }
+      if (humanBy(pr, "changes_requested").length) changesRequested += 1;
+    }
     const first = firstHuman(pr);
-    if (!first) continue;
+    if (!first) {
+      if (pr.merged) row.noHuman += 1;
+      continue;
+    }
     const hours = (Date.parse(first.at) - Date.parse(pr.createdAt)) / 36e5;
-    if (Number.isFinite(hours) && hours >= 0) waits.push(hours);
+    if (Number.isFinite(hours) && hours >= 0) {
+      waits.push(hours);
+      row.waits.push(hours);
+    }
     if (pr.merged && Date.parse(first.at) <= Date.parse(pr.mergedAt)) reviewedBeforeMerge += 1;
   }
 
@@ -713,6 +863,11 @@ function summarizeReviewFlow(prInfo, login) {
   const botOnly = merged.filter((pr) => pr.reviewList.length && pr.reviewList.every((r) => r.bot));
   const noHuman = merged.filter((pr) => !firstHuman(pr));
   const selfMerged = merged.filter((pr) => pr.mergedBy && pr.mergedBy.toLowerCase() === me);
+  // Current state of every pull request you opened that loaded. The authored search covers the whole
+  // window, so this is a fuller sample than pull requests opened inside the Events feed.
+  const closedUnmerged = authored.filter((pr) => !pr.merged && pr.state === "CLOSED");
+  const byRepo = [...repos.values()].map(({ waits: w, ...r }) => ({ ...r, timed: w.length, medianFirstReviewHours: median(w) }))
+    .sort((a, b) => b.merged - a.merged || b.authored - a.authored || a.repo.localeCompare(b.repo));
 
   // Who reviews this user's work, counting each reviewer once per pull request.
   const reviewers = new Map();
@@ -731,6 +886,16 @@ function summarizeReviewFlow(prInfo, login) {
     authored: authored.length,
     withHumanReview: waits.length,
     medianFirstReviewHours: median(waits),
+    // The slowest quarter of waits starts here. Shown from four waits up.
+    p75FirstReviewHours: waits.length >= 4 ? quantile(waits, 0.75) : null,
+    states,
+    approved: states ? approvalWaits.length : null,
+    medianFirstApprovalHours: states ? median(approvalWaits) : null,
+    approvedBeforeMerge: states ? approvedBeforeMerge : null,
+    changesRequested: states ? changesRequested : null,
+    outcomes: { merged: merged.length, closed: closedUnmerged.length, open: authored.filter((pr) => pr.state === "OPEN").length },
+    closed: closedUnmerged.map((pr) => ({ repo: pr.repo, number: pr.number, agent: Boolean(agentFromBranch(pr.headRef)) })),
+    byRepo,
     merged: merged.length,
     reviewedBeforeMerge,
     botOnly: botOnly.length,
@@ -803,6 +968,8 @@ function summarizeCollaboration(prInfo, reviewed, login, { complete = false } = 
     if (h != null) p.outHours.push(h); else unmatched += 1;
   }
 
+  // Your own speed on other people's pull requests, across everyone.
+  const outAll = [...people.values()].flatMap((p) => p.outHours);
   const rows = [...people.values()].map((p) => ({
     login: p.login, in: p.in, out: p.out,
     inMedianHours: median(p.inHours), outMedianHours: median(p.outHours),
@@ -832,8 +999,18 @@ function summarizeCollaboration(prInfo, reviewed, login, { complete = false } = 
   return {
     authored: authored.length, reviewedCount: Object.keys(reviewed || {}).length,
     received, given, botAuthored, unmatched, truncated, complete,
+    outTimed: outAll.length, outMedianHours: median(outAll), outP75Hours: outAll.length >= 4 ? quantile(outAll, 0.75) : null,
     people: rows, mutual: rows.filter((r) => r.kind === "mutual").length, findings,
   };
+}
+
+const CORRELATION_MIN_RHO = 0.3;
+// One sentence on a rank correlation between size and time to merge.
+function correlationText(c) {
+  if (!c) return "";
+  const strength = Math.abs(c.rho) < 0.1 ? "no" : Math.abs(c.rho) < CORRELATION_MIN_RHO ? "a weak" : Math.abs(c.rho) < 0.6 ? "a moderate" : "a strong";
+  const direction = Math.abs(c.rho) < 0.1 ? "" : c.rho > 0 ? " positive" : " negative";
+  return ` Across all ${plural(c.n, "timed merge")}, size and time to merge show ${strength}${direction} rank correlation (ρ ${c.rho.toFixed(2)}).${chanceNote(c.p, "Random pairings of the same sizes and times", "a correlation this strong")}`;
 }
 
 // Plain-language findings. Each names its source, and each needs a minimum sample before it appears.
@@ -895,12 +1072,12 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review 
         const times = (x) => `${x >= 10 ? Math.round(x) : x.toFixed(1)}×`;
         if (ratio >= 2 || ratio <= 0.5) {
           add("info", PRS, `Agent-branch PRs merged ${ratio >= 2 ? `${times(ratio)} faster` : `${times(1 / ratio)} slower`} than other PRs`,
-            `Median ${durationLabel(agent.medianHours)} across ${agent.count} agent-branch merges, ${durationLabel(other.medianHours)} across ${other.count} others.`);
+            `Median ${durationLabel(agent.medianHours)} across ${agent.count} agent-branch merges, ${durationLabel(other.medianHours)} across ${other.count} others.${chanceNote(prs.agentGapP, ...GROUP_CHANCE)}`);
         }
       }
       if (agent.unreviewed / agent.count - other.unreviewed / other.count >= 0.3 - RATIO_EPSILON) {
         add("warn", PRS, "Agent-branch merges skip review more often",
-          `${agent.unreviewed} of ${agent.count} had zero recorded reviews, against ${other.unreviewed} of ${other.count} other merges.`);
+          `${agent.unreviewed} of ${agent.count} had zero recorded reviews, against ${other.unreviewed} of ${other.count} other merges.${chanceNote(prs.agentReviewP, ...GROUP_CHANCE)}`);
       }
     }
     if (prs.merged >= 3 && prs.mergedLines > 0 && prs.unreviewedLines / prs.mergedLines >= 0.5) {
@@ -913,8 +1090,15 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review 
       // Size and branch type overlap, so say so instead of crediting size alone.
       const skew = Math.abs(larger.agent - smaller.agent) / larger.count >= 0.3
         ? ` Agent branches make up ${larger.agent} of the larger ${larger.count} and ${smaller.agent} of the smaller ${smaller.count}, so branch type may explain the gap.` : "";
-      if (ratio >= 2) add("info", PRS, "Larger PRs took noticeably longer to merge", basis + skew);
-      else if (ratio <= 1) add("info", PRS, "Larger PRs merged at least as fast as smaller ones", `${basis}${skew || " Time to merge is not scaling with size."}`);
+      const rank = correlationText(prs.sizeVsTime);
+      if (ratio >= 2) add("info", PRS, "Larger PRs took noticeably longer to merge", basis + skew + rank);
+      else if (ratio <= 1) add("info", PRS, "Larger PRs merged at least as fast as smaller ones", `${basis}${skew || " Time to merge is not scaling with size."}${rank}`);
+    }
+    // Without a halves finding, a clear rank correlation across every merge still says something.
+    const c = prs.sizeVsTime;
+    if (!out.some((o) => o.title.startsWith("Larger PRs")) && c && c.p < CHANCE_P && Math.abs(c.rho) >= CORRELATION_MIN_RHO) {
+      add("info", PRS, c.rho > 0 ? "Bigger pull requests took longer to merge" : "Bigger pull requests merged faster",
+        `Across ${plural(c.n, "timed merge")}, ranked by lines changed and by time to merge.${correlationText(c)}`);
     }
     if (prs.stale) {
       const o = prs.oldestOpen;
@@ -949,7 +1133,16 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review 
         `Counting branches at least ${FOLLOW_GRACE_DAYS} days old. Oldest is ${follow.withoutPr[0].ref} in ${follow.withoutPr[0].repo}.${agents}`);
     }
   }
-  if (follow) {
+  // Outcomes come from the pull requests you opened that loaded, which the authored search fills for
+  // the whole window. The Events feed is the fallback when that sample is too small.
+  const searched = review && review.outcomes.merged + review.outcomes.closed >= 4;
+  if (searched) {
+    const { merged, closed, open } = review.outcomes;
+    if (closed / (merged + closed) >= 0.3) {
+      add("warn", PRS, `${closed} of ${plural(merged + closed, "finished pull request")} you opened were closed without merging`,
+        `From the loaded pull requests you opened, by current state. ${open} are still open.`);
+    }
+  } else if (follow) {
     const { merged, closed } = follow.outcomes;
     const decided = merged + closed;
     if (decided >= 4 && closed / decided >= 0.3) {
@@ -960,7 +1153,14 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review 
 
   if (review && review.withHumanReview >= 3) {
     add("info", PRS, `Your pull requests waited a median of ${durationLabel(review.medianFirstReviewHours)} for a first human review`,
-      `Across ${plural(review.withHumanReview, "pull request")} that you authored and someone else reviewed. Bots and your own reviews are left out.`);
+      `Across ${plural(review.withHumanReview, "pull request")} that you authored and someone else reviewed. Bots and your own reviews are left out.${review.p75FirstReviewHours != null ? ` One in four waited longer than ${durationLabel(review.p75FirstReviewHours)}.` : ""}`);
+  }
+  if (review && review.states && review.merged >= 3) {
+    const unapproved = review.merged - review.noHuman - review.approvedBeforeMerge;
+    if (unapproved >= 2 && unapproved / review.merged >= 0.25) {
+      add("info", PRS, `${unapproved} of your ${plural(review.merged, "merge")} had a human review but no approval before merging`,
+        `${review.approvedBeforeMerge} had an approval from another person before merging, and ${review.noHuman} had no review from another person. A comment-only review is feedback, not sign-off.`);
+    }
   }
   if (review && review.merged >= 3) {
     if (review.botOnly && review.botOnly / review.merged >= 0.25) {
@@ -1021,14 +1221,18 @@ const SUGGEST_STALE_DAYS = 14;
 const SUGGEST_WAITING_DAYS = 2;
 const SUGGEST_LATE_SHARE = 0.15;
 const SUGGEST_CI_SHARE = 0.4;
+const SUGGEST_OUT_MIN = 5;
 
 const lines = (n) => Math.round(n).toLocaleString();
 const ageDays = (nowTime, at) => (nowTime - Date.parse(at)) / DAY_MS;
+const SUGGEST_TARGETS = 3;
+const prLabel = (r) => `${r.repo} #${r.number}`;
 
 // Each rule returns null when it checked the data and found nothing to suggest, { unavailable } when
 // its source did not load, { short } when the sample is below its minimum, or the suggestion.
 // `seen` describes the loaded data. Each `why` claim names its source; `act` is what to try.
-// Segments are [text, ...reading ids].
+// Segments are [text, ...reading ids]. `basis` names the sample, and `targets` lists up to three
+// specific repositories, pull requests, branches, threads, or people to start with.
 const SUGGESTION_RULES = [
   {
     id: "review-before-merge", area: "Review", source: "Pull requests you opened",
@@ -1039,10 +1243,15 @@ const SUGGESTION_RULES = [
       if (review.noHuman / review.merged < 0.5) return null;
       const bots = review.botOnly ? ` ${review.botOnly} had only bot reviews.` : "";
       const cut = review.truncated ? ` ${plural(review.truncated, "pull request")} had more than 10 reviews, and only the first 10 were read.` : "";
-      const seen = `${review.noHuman} of your ${plural(review.merged, "merged pull request")} had no review from another person.${bots}${cut}`;
+      const approved = review.states ? ` ${review.approvedBeforeMerge} had an approval from another person before merging.` : "";
+      const seen = `${review.noHuman} of your ${plural(review.merged, "merged pull request")} had no review from another person.${approved}${bots}${cut}`;
+      const basis = `${plural(review.merged, "merged pull request")} you opened`;
+      // Rulesets are set per repository, so name the repositories where unreviewed merges collect.
+      const targets = review.byRepo.filter((r) => r.noHuman).sort((a, b) => b.noHuman - a.noHuman || a.repo.localeCompare(b.repo))
+        .slice(0, SUGGEST_TARGETS).map((r) => `${r.repo}: ${r.noHuman} of ${plural(r.merged, "merge")} with no review from another person`);
       if (!review.reviewers.length && !review.truncated) {
         return {
-          tone: "warn",
+          tone: "warn", basis, targets,
           seen: `${seen} Nobody else reviewed your pull requests in this window.`,
           why: [
             ["GitHub does not let authors approve their own pull requests, so a required approval has to come from someone else.", "gh-approve"],
@@ -1052,7 +1261,7 @@ const SUGGESTION_RULES = [
         };
       }
       return {
-        tone: "warn",
+        tone: "warn", basis, targets,
         seen: `${seen}${review.selfMerged ? ` You merged ${review.selfMerged} yourself.` : ""}`,
         why: [["At Microsoft, finding defects was the main reason developers gave for review, but reviews turned out less about defects than expected and also spread knowledge, team awareness, and alternative solutions.", "bacchelli-2013"]],
         act: [["Add a ruleset on your default branch with Require a pull request before merging and one required approval.", "gh-rulesets"]],
@@ -1071,6 +1280,8 @@ const SUGGESTION_RULES = [
       if (a.unreviewed / a.count < 0.5 && !gap) return null;
       return {
         tone: "warn",
+        basis: `${plural(a.count, "agent-branch merge")}${o.count ? ` and ${plural(o.count, "other merge")}` : ""}`,
+        targets: p.largestUnreviewedAgent.map((r) => `${prLabel(r)}: ${lines(r.lines)} lines, no recorded review`),
         seen: `${a.unreviewed} of ${plural(a.count, "agent-branch merge")} had no recorded review${o.count ? `, against ${o.unreviewed} of ${o.count} other merges` : ""}. Agent branches are matched by prefix, such as claude/ or codex/.`,
         why: [
           ["In a 47-person study, participants with an AI code assistant wrote less secure code on four of five tasks, and were more likely to believe it was secure.", "perry-2023"],
@@ -1089,10 +1300,33 @@ const SUGGESTION_RULES = [
       if (!(review.medianFirstReviewHours >= SUGGEST_REVIEW_WAIT_HOURS)) return null;
       return {
         tone: "info",
-        seen: `Your pull requests waited a median of ${durationLabel(review.medianFirstReviewHours)} for a first review from another person, across ${plural(review.withHumanReview, "pull request")}. Time as a draft counts toward the wait.`,
+        basis: `${plural(review.withHumanReview, "pull request")} you opened that another person reviewed`,
+        targets: review.byRepo.filter((r) => r.timed >= 2 && r.medianFirstReviewHours >= SUGGEST_REVIEW_WAIT_HOURS)
+          .sort((a, b) => b.medianFirstReviewHours - a.medianFirstReviewHours).slice(0, SUGGEST_TARGETS)
+          .map((r) => `${r.repo}: median ${durationLabel(r.medianFirstReviewHours)} across ${r.timed}`),
+        seen: `Your pull requests waited a median of ${durationLabel(review.medianFirstReviewHours)} for a first review from another person, across ${plural(review.withHumanReview, "pull request")}.${review.p75FirstReviewHours != null ? ` One in four waited longer than ${durationLabel(review.p75FirstReviewHours)}.` : ""} Time as a draft counts toward the wait.`,
         why: [["Google's review guide sets one business day as the maximum time to respond to a review request.", "google-speed"]],
         act: [["Request a reviewer as you open it, or add a CODEOWNERS file so GitHub requests one automatically. Code owners are not requested on drafts until they are marked ready.", "gh-codeowners"]],
         more: ["chaoss-first-response"],
+      };
+    },
+  },
+  {
+    id: "answer-review-requests", area: "Review", source: "Pull requests you reviewed",
+    title: "Answer other people's pull requests within a day",
+    check: ({ collab }) => {
+      if (!collab) return { unavailable: "The search for pull requests you reviewed did not load." };
+      if (collab.outTimed < SUGGEST_OUT_MIN) return { short: `Needs ${SUGGEST_OUT_MIN} pull requests by others with a readable time for your first review; ${collab.outTimed} loaded.` };
+      if (!(collab.outMedianHours >= SUGGEST_REVIEW_WAIT_HOURS)) return null;
+      return {
+        tone: "info",
+        basis: `${plural(collab.outTimed, "pull request")} by other people that you reviewed`,
+        targets: collab.people.filter((p) => p.outTimed >= 2 && p.outMedianHours >= SUGGEST_REVIEW_WAIT_HOURS)
+          .sort((a, b) => b.outMedianHours - a.outMedianHours).slice(0, SUGGEST_TARGETS)
+          .map((p) => `${p.login}: median ${durationLabel(p.outMedianHours)} across ${p.outTimed}`),
+        seen: `Your first review on other people's pull requests came a median of ${durationLabel(collab.outMedianHours)} after they were opened, across ${plural(collab.outTimed, "pull request")}.${collab.outP75Hours != null ? ` One in four took longer than ${durationLabel(collab.outP75Hours)}.` : ""} Times run from when each pull request was opened, not from when you were asked, so a late request reads as a slow review.`,
+        why: [["Google's review guide sets one business day as the maximum time to respond to a review request.", "google-speed"]],
+        act: [["Set one or two fixed times a day to clear your review requests. When a full review has to wait, reply with when you will get to it."]],
       };
     },
   },
@@ -1106,6 +1340,7 @@ const SUGGESTION_RULES = [
       const [name, count] = review.reviewers[0];
       return {
         tone: "info",
+        basis: `${plural(review.withHumanReview, "pull request")} you opened that another person reviewed`,
         seen: `${name} reviewed ${plural(count, "pull request")} of yours, ${share(review.topReviewerShare)} of all reviewer visits.`,
         why: [["In a reviewer-recommendation study, picking reviewers by ownership alone concentrated knowledge in a few people; balancing expertise with spreading knowledge cut the files at risk from turnover by 28%.", "mirsaeedi-2020"]],
         act: [["Name a second owner for your busiest paths in CODEOWNERS, or, in an organization, have a team assign reviewers by round robin or load balance.", "gh-team-review"]],
@@ -1129,7 +1364,9 @@ const SUGGESTION_RULES = [
         : `Loaded merges changed a median of ${lines(p.all.medianSize)} lines.`;
       return {
         tone: "info",
-        seen,
+        basis: `${plural(p.merged, "merged pull request")}`,
+        targets: p.largest.map((r) => `${prLabel(r)}: ${lines(r.lines)} lines`),
+        seen: seen + correlationText(p.sizeVsTime),
         why: [
           ["Google's review guide says small changes are reviewed more quickly and more thoroughly, and are less likely to introduce bugs.", "google-small-cls"],
           ["Across 100 open-source projects, though, pull request size was only weakly related to time to merge, so your own numbers are the better guide.", "kudrjavets-2022"],
@@ -1151,6 +1388,7 @@ const SUGGESTION_RULES = [
       const o = stale[0];
       return {
         tone: "warn",
+        targets: stale.slice(0, SUGGEST_TARGETS).map((r) => `${prLabel(r.pr)}${r.pr.isDraft ? " (draft)" : ""}: open ${plural(Math.floor(r.days), "day")}`),
         seen: `${plural(stale.length, "pull request")} you opened ${stale.length === 1 ? "has" : "have"} been open more than two weeks. Oldest: ${o.pr.repo} #${o.pr.number}${o.pr.isDraft ? " (draft)" : ""}, ${plural(Math.floor(o.days), "day")}.`,
         act: [
           ["Decide each one: merge it, close it with a one-line reason, or convert it to a draft so it stops reading as ready.", "gh-draft"],
@@ -1162,16 +1400,23 @@ const SUGGESTION_RULES = [
   {
     id: "agree-before-building", area: "Pull requests", source: "Recent events",
     title: "Agree on the approach before building",
-    check: ({ follow }) => {
-      if (!follow) return { unavailable: "Recent events or pull request details did not load." };
-      const { merged, closed } = follow.outcomes;
+    check: ({ follow, review }) => {
+      // The authored search covers every pull request you opened in its window, so it is preferred.
+      // The Events feed is used when that search did not load or found too few finished ones.
+      const fromSearch = review && review.outcomes.merged + review.outcomes.closed >= 4;
+      const source = fromSearch ? review : follow;
+      if (!source) return { unavailable: "Recent events or pull request details did not load." };
+      const { merged, closed } = source.outcomes;
       const decided = merged + closed;
-      if (decided < 4) return { short: `Needs 4 finished pull requests opened in the loaded events; ${decided} found.` };
+      if (decided < 4) return { short: `Needs 4 finished pull requests you opened; ${decided} found.` };
       if (closed / decided < 0.3) return null;
-      const agents = follow.closed.filter((c) => c.agent).length;
+      const agents = source.closed.filter((c) => c.agent).length;
       return {
         tone: "info",
-        seen: `${closed} of ${plural(decided, "finished pull request")} you opened in the loaded events closed without merging${agents ? `, ${agents} of them from agent branches` : ""}.`,
+        source: fromSearch ? "Pull requests you opened" : "Recent events",
+        basis: `${plural(decided, "finished pull request")} you opened${fromSearch ? "" : " in the loaded events"}`,
+        targets: source.closed.slice(0, SUGGEST_TARGETS).map((c) => `${prLabel(c)}${c.agent ? " (agent branch)" : ""}`),
+        seen: `${closed} of ${plural(decided, "finished pull request")} you opened${fromSearch ? "" : " in the loaded events"} closed without merging${agents ? `, ${agents} of them from agent branches` : ""}.`,
         act: [["For larger changes, open an issue or a draft pull request first and settle the approach before polishing it.", "gh-draft"]],
       };
     },
@@ -1187,6 +1432,8 @@ const SUGGESTION_RULES = [
       const o = follow.withoutPr[0];
       return {
         tone: "info",
+        basis: `${plural(follow.settled, "branch", "branches")} created in the loaded events`,
+        targets: follow.withoutPr.slice(0, SUGGEST_TARGETS).map((b) => `${b.ref} in ${b.repo}: ${plural(Math.floor(b.days), "day")} old`),
         seen: `${n} of ${plural(follow.settled, "branch", "branches")} created in the loaded events have no pull request${follow.agentWithoutPr ? `, ${follow.agentWithoutPr} of them agent branches` : ""}. Oldest: ${o.ref} in ${o.repo}.`,
         act: [
           ["Open a draft pull request once a branch has a direction, so the work is visible.", "gh-draft"],
@@ -1216,6 +1463,7 @@ const SUGGESTION_RULES = [
       const o = waiting[0];
       return {
         tone: "info",
+        targets: waiting.slice(0, SUGGEST_TARGETS).map((r) => `${r.c.thread.repo} #${r.c.thread.number}: ${r.c.author}, ${plural(Math.floor(r.days), "day")} ago`),
         seen: `${waiting.length} open issues or pull requests you opened end with a reply from someone else, ${SUGGEST_WAITING_DAYS} or more days old. Oldest: ${o.c.thread.repo} #${o.c.thread.number}, from ${o.c.author}, ${plural(Math.floor(o.days), "day")} ago.`,
         act: [["Reply, resolve, or close each thread. If one no longer needs you, close it with a note so nobody keeps waiting."]],
       };
@@ -1230,6 +1478,7 @@ const SUGGESTION_RULES = [
       if (sessions.multiRepo / sessions.multi < 0.5) return null;
       return {
         tone: "info",
+        basis: `${plural(sessions.multi, "work session")} with several events`,
         seen: `${sessions.multiRepo} of ${plural(sessions.multi, "work session")} crossed repositories. A session is a run of events with gaps under an hour.`,
         why: [
           ["Developers describe productive days as finishing tasks without many interruptions or context switches, although when observed they switched often and still felt productive.", "meyer-2014"],
@@ -1248,6 +1497,7 @@ const SUGGESTION_RULES = [
       if (t.afterActive.rate - t.afterIdle.rate < 0.3 - RATIO_EPSILON) return null;
       return {
         tone: "info",
+        basis: `${plural(t.afterActive.days + t.afterIdle.days, "day")} in the contribution year`,
         seen: `After an active day you were active again ${share(t.afterActive.rate)} of the time; after an idle day, ${share(t.afterIdle.rate)}. Restarting is the harder step.`,
         why: [["Across 10,000 recorded sessions, programmers resumed editing within a minute of an interruption only 10% of the time, and used several strategies to rebuild context.", "parnin-2011"]],
         act: [["Before you stop, write the next concrete step in the issue or pull request, or leave a failing test, so the first move back is obvious."]],
@@ -1263,6 +1513,7 @@ const SUGGESTION_RULES = [
       if (sessions.lateNight < 5 || sessions.lateNight / sessions.timed < SUGGEST_LATE_SHARE) return null;
       return {
         tone: "info",
+        basis: `${plural(sessions.timed, "timed event")}`,
         seen: `${share(sessions.lateNight / sessions.timed)} of loaded events (${sessions.lateNight.toLocaleString()}) happened between midnight and 4am, local time.`,
         why: [["In the Linux kernel, PostgreSQL, and X.org server histories, commits made between midnight and 4am were significantly buggier.", "eyolfson-2014"]],
         act: [["Open late-night work as a draft and read the diff the next day before merging."]],
@@ -1278,6 +1529,7 @@ const SUGGESTION_RULES = [
       if (notes.ciNoise / notes.unread < SUGGEST_CI_SHARE) return null;
       return {
         tone: "info",
+        basis: `${plural(notes.unread, "unread notification")}`,
         seen: `${notes.ciNoise} of ${plural(notes.unread, "unread notification")}${notesNote ? " on the first page" : ""} are routine CI updates.`,
         act: [["In GitHub's notification settings, under GitHub Actions, choose Only notify for failed workflows.", "gh-notifications"]],
       };
@@ -1292,6 +1544,7 @@ const SUGGESTION_RULES = [
       if (n < 3) return null;
       return {
         tone: "info",
+        basis: `${plural(n, "issue")} you opened in the loaded events`,
         seen: `${plural(n, "issue")} you opened in the loaded events start with a bracketed tag: ${ev.tags.slice(0, 3).map(([t]) => `[${t}]`).join(", ")}.`,
         why: [["Labels let you find issues and pull requests by label, for example label:\"bug\".", "gh-labels"]],
         act: [["Create matching labels and apply them instead. An issue form can add existing labels automatically.", "gh-issue-forms"]],
@@ -1311,6 +1564,8 @@ const SUGGESTION_RULES = [
       const o = quiet[0];
       return {
         tone: "info",
+        basis: `14-day traffic for ${plural(known.length, "repository", "repositories")}`,
+        targets: quiet.slice(0, SUGGEST_TARGETS).map((r) => `${r.repo}: ${r.uniques.toLocaleString()} unique visitors, no new stars`),
         seen: `${o.repo} had ${o.uniques.toLocaleString()} unique visitors in 14 days and no new stars${quiet.length > 1 ? `, and so did ${plural(quiet.length - 1, "other repository", "other repositories")}` : ""}.`,
         why: [["A README is often the first item a visitor will see.", "gh-readme"], ["Topics help other people find and contribute to a project.", "gh-topics"]],
         act: [["Open the README with what the project does, a screenshot or example of it working, and how to start. Then add topics and, for a public repository, a social preview image.", "gh-social-preview"]],
@@ -1358,7 +1613,7 @@ function deriveSuggestions(input) {
   const checked = [];
   for (const rule of SUGGESTION_RULES) {
     const result = rule.check(x, { me, nowTime });
-    const base = { id: rule.id, area: rule.area, source: rule.source, title: rule.title };
+    const base = { id: rule.id, area: rule.area, source: result?.source || rule.source, title: rule.title };
     if (!result) checked.push({ ...base, status: "clear" });
     else if (result.unavailable) checked.push({ ...base, status: "unavailable", detail: result.unavailable });
     else if (result.short) checked.push({ ...base, status: "short", detail: result.short });
@@ -1366,7 +1621,8 @@ function deriveSuggestions(input) {
       // Number the sources in the order the text cites them, then any further reading.
       const cited = [...(result.why || []), ...(result.act || [])].flatMap((segment) => segment.slice(1));
       const reading = [...new Set([...cited, ...(result.more || [])])].filter((id) => Object.hasOwn(READING, id));
-      items.push({ ...base, title: result.title || rule.title, tone: result.tone, seen: result.seen, why: result.why || [], act: result.act || [], reading });
+      items.push({ ...base, title: result.title || rule.title, tone: result.tone, seen: result.seen, why: result.why || [], act: result.act || [], reading,
+        basis: result.basis || "", targets: (result.targets || []).slice(0, SUGGEST_TARGETS) });
       checked.push({ ...base, status: "shown" });
     }
   }
@@ -1584,6 +1840,7 @@ function normalizePullRequest(pr, repo, number, source) {
     reviews: pr.reviews.totalCount,
     reviewList: (Array.isArray(pr.reviews.nodes) ? pr.reviews.nodes : []).map((r) => ({
       login: r?.author?.login || "", at: r?.submittedAt,
+      state: typeof r?.state === "string" ? r.state.toLowerCase() : null,
       bot: r?.author?.__typename === "Bot" || isBotLogin(r?.author?.login),
     })),
   };
@@ -2038,6 +2295,9 @@ const api = {
   agentFromBranch,
   titleTag,
   median,
+  quantile,
+  permutationP,
+  rankCorrelation,
   prKey,
   prRefsFromEvents,
   describeEvent,

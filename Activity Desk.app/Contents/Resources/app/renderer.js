@@ -687,6 +687,7 @@ function computed() {
     follow: eventsLoaded && prsLoaded ? follow : null,
     prPatterns: prsLoaded ? prPatterns : null, review: a ? review : null, prInfo: a ? state.prInfo : null,
     trajectory, notes, notesNote: state.errors.notifications || "", footprint, conversations: state.conversations, token,
+    collab: state.reviewed ? collab : null,
   });
   return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, observations, footprint, suggestions };
 }
@@ -1126,9 +1127,10 @@ function patternInsights({ ev, pr, rhythm, sessions, prPatterns, trajectory, fol
   const prCard = prPatterns.merged ? `
       ${stats([["Merged lines with no review", prPatterns.mergedLines ? pct(prPatterns.unreviewedLines / prPatterns.mergedLines) : "—"], ["Open over two weeks", prPatterns.open ? `${fmt(prPatterns.stale)} / ${fmt(prPatterns.open)}` : "—"], ["Oldest open", prPatterns.oldestOpen ? `${fmt(Math.floor(prPatterns.oldestOpen.days))} d` : "—"]])}
       <table class="compare"><caption class="note">Loaded merges by group</caption>
-        <thead><tr><th scope="col">Group</th><th scope="col">Merged</th><th scope="col">Median to merge</th><th scope="col">Zero reviews</th><th scope="col">Median lines</th></tr></thead>
-        <tbody>${groups.map(([name, g]) => `<tr><th scope="row">${esc(name)}</th><td>${fmt(g.count)}</td><td>${esc(hoursLabel(g.medianHours))}</td><td>${fmt(g.unreviewed)} / ${fmt(g.count)}</td><td>${fmt(Math.round(g.medianSize))}</td></tr>`).join("")}</tbody></table>
-      <p class="note">Agent branches are matched by prefix such as <code>claude/</code> or <code>codex/</code>. Size halves appear with six or more merges. Small groups can swing on a single pull request.</p>`
+        <thead><tr><th scope="col">Group</th><th scope="col">Merged</th><th scope="col">Median to merge</th><th scope="col">Slowest quarter over</th><th scope="col">Zero reviews</th><th scope="col">Median lines</th></tr></thead>
+        <tbody>${groups.map(([name, g]) => `<tr><th scope="row">${esc(name)}</th><td>${fmt(g.count)}</td><td>${esc(hoursLabel(g.medianHours))}</td><td>${g.p75Hours != null ? esc(hoursLabel(g.p75Hours)) : "—"}</td><td>${fmt(g.unreviewed)} / ${fmt(g.count)}</td><td>${fmt(Math.round(g.medianSize))}</td></tr>`).join("")}</tbody></table>
+      <p class="note">${chanceSummary(prPatterns)}</p>
+      <p class="note">Agent branches are matched by prefix such as <code>claude/</code> or <code>codex/</code>. Size halves appear with six or more merges, the slowest quarter with four in a group, and the size correlation with eight. Chance checks deal the same merges out at random 999 times, so groups of three can never pass the 5% bar.</p>`
     : `<p class="note">${pr.total ? "No merged pull requests in the loaded details." : "No pull request details are loaded."}</p>`;
 
   return insightSection("insight-patterns", "Patterns", caption, `
@@ -1147,6 +1149,23 @@ function patternInsights({ ev, pr, rhythm, sessions, prPatterns, trajectory, fol
       <article class="card insight-wide"><h4>Review turnaround</h4>${sourceTag("Pull requests you opened")}${reviewCard(review, pr)}</article>
       <article class="card insight-wide"><h4>Review partners</h4>${sourceTag("Pull requests you opened and reviewed")}${partnersCard(collab)}</article>
     </div>`);
+}
+
+// The merge-pattern chance checks in one sentence each, or what they still need.
+function chanceSummary(p) {
+  const out = [];
+  if (p.agentGapP != null) {
+    out.push(p.agentGapP < 0.05
+      ? `Agent-branch merge times differ from the rest beyond chance: random regroupings match the gap ${p.agentGapP < 0.01 ? "under 1%" : pct(p.agentGapP)} of the time.`
+      : `Agent-branch merge times: random regroupings match the gap ${pct(p.agentGapP)} of the time, so treat it as unconfirmed.`);
+  }
+  if (p.agentReviewP != null && p.agent.unreviewed !== p.other.unreviewed) {
+    out.push(`The gap in zero-review merges between agent branches and the rest ${p.agentReviewP < 0.05 ? "is beyond chance" : "is within chance"} (random regroupings match it ${p.agentReviewP < 0.01 ? "under 1%" : pct(p.agentReviewP)} of the time).`);
+  }
+  const c = p.sizeVsTime;
+  if (c) out.push(`Size against time to merge: rank correlation <strong>ρ ${esc(c.rho.toFixed(2))}</strong> across ${fmt(c.n)} merges, ${c.p < 0.05 ? "beyond chance" : "within chance"} (shuffles match it ${c.p < 0.01 ? "under 1%" : pct(c.p)} of the time).`);
+  else out.push(`A size correlation needs 8 timed merges; ${fmt(p.merged)} ${p.merged === 1 ? "is" : "are"} loaded.`);
+  return out.join(" ");
 }
 
 function trajectoryCard(t) {
@@ -1184,13 +1203,22 @@ function reviewCard(r, pr) {
   if (!pr.total) return '<p class="note">No pull request details are loaded.</p>';
   if (!r.authored) return `<p class="note">${state.prLookup.authored ? `You opened no pull requests in the last ${AUTHORED_DAYS} days that this token can read, so there is no review wait to measure.` : "The search for pull requests you opened did not load, and none of the other loaded pull requests were authored by you."}</p>`;
   const people = r.reviewers.slice(0, 5);
+  const ratio = (n, d) => (d && n != null ? `${fmt(n)} / ${fmt(d)}` : "—");
+  const verdicts = r.states ? stats([["Merges approved by another person", ratio(r.approvedBeforeMerge, r.merged)], ["Median to first approval", r.approved ? hoursLabel(r.medianFirstApprovalHours) : "—"], ["Changes requested", ratio(r.changesRequested, r.withHumanReview)]]) : "";
+  const repos = r.byRepo.filter((x) => x.merged || x.timed).slice(0, REVIEW_REPO_ROWS);
+  const repoTable = r.byRepo.length > 1 && repos.length ? `<table class="compare"><caption class="note">By repository, busiest first</caption>
+      <thead><tr><th scope="col">Repository</th><th scope="col">Opened</th><th scope="col">Merged</th><th scope="col">No human review</th>${r.states ? '<th scope="col">Approved</th>' : ""}<th scope="col">Median first review</th></tr></thead>
+      <tbody>${repos.map((x) => `<tr><th scope="row">${esc(shortRepo(x.repo))}</th><td>${fmt(x.authored)}</td><td>${fmt(x.merged)}</td><td>${ratio(x.noHuman, x.merged)}</td>${r.states ? `<td>${ratio(x.approved, x.merged)}</td>` : ""}<td>${x.timed ? esc(hoursLabel(x.medianFirstReviewHours)) : "—"}</td></tr>`).join("")}</tbody></table>` : "";
   return `
-    ${stats([["Median to first human review", r.withHumanReview ? hoursLabel(r.medianFirstReviewHours) : "—"], ["Merges reviewed only by bots", r.merged ? `${fmt(r.botOnly)} / ${fmt(r.merged)}` : "—"], ["Merged by you", r.merged ? `${fmt(r.selfMerged)} / ${fmt(r.merged)}` : "—"]])}
+    ${stats([["Median to first human review", r.withHumanReview ? hoursLabel(r.medianFirstReviewHours) : "—"], ["Slowest quarter waited over", r.p75FirstReviewHours != null ? hoursLabel(r.p75FirstReviewHours) : "—"], ["Merged by you", r.merged ? `${fmt(r.selfMerged)} / ${fmt(r.merged)}` : "—"]])}
+    ${verdicts}
     ${people.length ? bars(people, { violet: true }) + '<p class="note">Pull requests each person reviewed.</p>' : '<p class="note">No one besides you or a bot reviewed the pull requests you authored.</p>'}
-    <p class="note">Measured on ${fmt(r.authored)} ${r.authored === 1 ? "pull request" : "pull requests"} you authored${authoredCoverage()}, following the CHAOSS time-to-first-response definition: the first review by a human who is not the author, from creation. Draft time counts toward the wait. ${fmt(r.withHumanReview)} had a human review; ${fmt(r.reviewedBeforeMerge)} of ${fmt(r.merged)} merges got one before merging.${r.truncated ? ` ${fmt(r.truncated)} had more than 10 reviews, and only the first 10 are read.` : ""}</p>`;
+    ${repoTable}
+    <p class="note">Measured on ${fmt(r.authored)} ${r.authored === 1 ? "pull request" : "pull requests"} you authored${authoredCoverage()}, following the CHAOSS time-to-first-response definition: the first review by a human who is not the author, from creation. Draft time counts toward the wait. ${fmt(r.withHumanReview)} had a human review; ${fmt(r.reviewedBeforeMerge)} of ${fmt(r.merged)} merges got one before merging, and ${fmt(r.botOnly)} ${r.botOnly === 1 ? "was" : "were"} reviewed only by bots. The slowest quarter appears from four timed waits.${r.states ? " An approval counts when another person approved before the merge. Comment-only reviews count as reviewed but not approved." : ""}${r.truncated ? ` ${fmt(r.truncated)} had more than 10 reviews, and only the first 10 are read.` : ""}</p>`;
 }
 
 const PARTNER_ROWS = 8;
+const REVIEW_REPO_ROWS = 6;
 const PARTNER_KINDS = { mutual: "Both ways", "reviews-you": "Reviews you", "you-review": "You review" };
 function partnersCard(c) {
   const a = state.prLookup.authored;
@@ -1208,6 +1236,7 @@ function partnersCard(c) {
     <table class="compare"><caption class="note">Pull requests in each direction, last ${AUTHORED_DAYS} days</caption>
       <thead><tr><th scope="col">Person</th><th scope="col">Direction</th><th scope="col">Reviewed yours</th><th scope="col">Their median first review</th><th scope="col">You reviewed theirs</th><th scope="col">Your median first review</th></tr></thead>
       <tbody>${rows}</tbody></table>
+    ${c.outTimed ? `<p class="note">Your first review on other people's pull requests came a median of <strong>${esc(hoursLabel(c.outMedianHours))}</strong> after they opened, across ${fmt(c.outTimed)}${c.outP75Hours != null ? `. The slowest quarter took over ${esc(hoursLabel(c.outP75Hours))}` : ""}.</p>` : ""}
     <p class="note">From ${window(a, "pull requests you opened")} and ${window(r, "pull requests by others that you reviewed")}. Each person counts once per pull request. Times run from when the pull request was created to that person's first review, so draft time and waiting for a review request both count.${more}${c.truncated ? ` ${fmt(c.truncated)} of your pull requests had more than 10 reviews, and only the first 10 are read.` : ""}${c.botAuthored ? ` ${fmt(c.botAuthored)} ${c.botAuthored === 1 ? "pull request by a bot that you reviewed is" : "pull requests by bots that you reviewed are"} left out.` : ""}${c.unmatched ? ` ${fmt(c.unmatched)} reviewed ${c.unmatched === 1 ? "pull request had" : "pull requests had"} no readable review time.` : ""}</p>`;
 }
 
@@ -1362,10 +1391,12 @@ function suggestionCard(s) {
   return `<article class="card suggestion ${esc(s.tone)}">
     <div class="suggestion-tags"><span class="src area">${esc(s.area)}</span>${sourceTag(s.source)}</div>
     <h4>${esc(s.title)}</h4>
+    ${s.basis ? `<p class="basis">Based on ${esc(s.basis)}</p>` : ""}
     <dl class="suggestion-body">
       <dt>Seen</dt><dd>${esc(s.seen)}</dd>
       ${s.why.length ? `<dt>Why</dt><dd>${citedText(s.why, numbers)}</dd>` : ""}
       <dt>Try</dt><dd>${citedText(s.act, numbers)}</dd>
+      ${s.targets.length ? `<dt>Where</dt><dd><ul class="targets">${s.targets.map((t) => `<li>${esc(t)}</li>`).join("")}</ul></dd>` : ""}
     </dl>
     ${reading ? `<h5>Further reading</h5><ol class="reading">${reading}</ol>` : ""}
   </article>`;
