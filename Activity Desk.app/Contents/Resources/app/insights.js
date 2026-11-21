@@ -1599,6 +1599,9 @@ const lines = (n) => Math.round(n).toLocaleString();
 const ageDays = (nowTime, at) => (nowTime - Date.parse(at)) / DAY_MS;
 const SUGGEST_TARGETS = 3;
 const prLabel = (r) => `${r.repo} #${r.number}`;
+// A Where line that names a repository, or a pull request or issue in it, so the card can open it on
+// github.com. The main process builds the URL itself from the repository name and number.
+const ref = (text, repo, number) => ({ text, repo, number: Number.isInteger(number) ? number : null });
 
 // Each rule returns null when it checked the data and found nothing to suggest, { unavailable } when
 // its source did not load, { short } when the sample is below its minimum, or the suggestion.
@@ -1630,7 +1633,7 @@ const SUGGESTION_RULES = [
       return {
         tone: "warn", confirmed: r.standouts.length > 0,
         basis: `${plural(r.settled, "merged pull request")} you opened, each at least ${REWORK_HOURS / 24} days old`,
-        targets: r.examples.map((e) => `${prLabel(e)} (${lines(e.lines)} lines${e.agent ? ", agent branch" : ""}): #${e.by} followed after ${durationLabel(e.hours)}`),
+        targets: r.examples.map((e) => ref(`${prLabel(e)} (${lines(e.lines)} lines${e.agent ? ", agent branch" : ""}): #${e.by} followed after ${durationLabel(e.hours)}`, e.repo, e.number)),
         why: [["DORA measures the instability of software delivery partly by change fail rate: the share of deployments that need immediate intervention afterwards, likely a rollback or a hotfix.", "dora-metrics"]],
         seen: `${r.followed} of your ${plural(r.settled, "settled merge")} were followed within ${REWORK_HOURS / 24} days by a pull request in the same repository titled as a fix or revert${r.named ? `, ${r.named} of them naming the merge` : ""}. ${reworkStandout(r)} A title is a proxy: a fix that opens after a merge is not always a fix for it, and a merge is not a deployment.`,
         act: [
@@ -1653,7 +1656,7 @@ const SUGGESTION_RULES = [
       return {
         tone: "info", confirmed: true,
         basis: `${plural(f.load.n, "merged pull request")} you opened`,
-        targets: f.openNow.slice(0, SUGGEST_TARGETS).map((o) => `${prLabel(o)}${o.draft ? " (draft)" : ""}: open ${plural(Math.floor(o.days), "day")}`),
+        targets: f.openNow.slice(0, SUGGEST_TARGETS).map((o) => ref(`${prLabel(o)}${o.draft ? " (draft)" : ""}: open ${plural(Math.floor(o.days), "day")}`, o.repo, o.number)),
         seen: `${flowText(f, true)}${f.peak ? ` You had up to ${f.peak.count} open at once, on ${f.peak.at}.` : ""} Busy stretches can cause both, so this is a pattern to test, not a proven cause.`,
         why: [["DORA's guidance for teams says that spreading people across several tasks makes tasks take longer to finish, and that its research shows limits on work in process help improve software delivery performance.", "dora-wip"]],
         act: [[`Try a limit of ${plural(limit, "open pull request")} for two weeks. At the limit, merge or close the oldest before you open another, then compare your time to merge here.`]],
@@ -1677,7 +1680,7 @@ const SUGGESTION_RULES = [
       return {
         tone: "info", confirmed: tracks,
         basis: `${plural(s.n, "merged pull request")} you opened with a last-commit time`,
-        targets: s.idle.map((o) => `${prLabel(o)}: merged ${durationLabel(o.waiting)} after its last commit`),
+        targets: s.idle.map((o) => ref(`${prLabel(o)}: merged ${durationLabel(o.waiting)} after its last commit`, o.repo, o.number)),
         seen: `${share(s.waitingShare)} of the hours your merged pull requests spent open came after their last commit. Per pull request, the median was ${durationLabel(s.workingHours)} from opening to the last commit and ${durationLabel(s.waitingHours)} from the last commit to the merge.${tracks ? ` The wait grew with the number of your other pull requests open (ρ ${w.rho.toFixed(2)}).` : ""} A last commit is not always the end of the work: a review can still ask for changes.`,
         why: [["DORA's guidance for teams says that spreading people across several tasks makes tasks take longer to finish, and that its research shows limits on work in process help improve software delivery performance.", "dora-wip"]],
         act: [["When the last commit of a pull request is in and its checks pass, merge it or ask for the review that day, before you start something new. The pull requests below waited longest."]],
@@ -1699,7 +1702,7 @@ const SUGGESTION_RULES = [
       const tone = backedByOutcomes(outcomes, "review") ? "warn" : "info";
       // Rulesets are set per repository, so name the repositories where unreviewed merges collect.
       const targets = review.byRepo.filter((r) => r.noHuman).sort((a, b) => b.noHuman - a.noHuman || a.repo.localeCompare(b.repo))
-        .slice(0, SUGGEST_TARGETS).map((r) => `${r.repo}: ${r.noHuman} of ${plural(r.merged, "merge")} with no review from another person`);
+        .slice(0, SUGGEST_TARGETS).map((r) => ref(`${r.repo}: ${r.noHuman} of ${plural(r.merged, "merge")} with no review from another person`, r.repo));
       if (!review.reviewers.length && !review.truncated) {
         return {
           tone, basis, targets,
@@ -1732,7 +1735,7 @@ const SUGGESTION_RULES = [
       return {
         tone: backedByOutcomes(outcomes, "agent") ? "warn" : "info", confirmed: gap && passes(chance, "agent-review", p.agentReviewP),
         basis: `${plural(a.count, "agent-branch merge")}${o.count ? ` and ${plural(o.count, "other merge")}` : ""}`,
-        targets: p.largestUnreviewedAgent.map((r) => `${prLabel(r)}: ${lines(r.lines)} lines, no recorded review`),
+        targets: p.largestUnreviewedAgent.map((r) => ref(`${prLabel(r)}: ${lines(r.lines)} lines, no recorded review`, r.repo, r.number)),
         seen: `${a.unreviewed} of ${plural(a.count, "agent-branch merge")} had no recorded review${o.count ? `, against ${o.unreviewed} of ${o.count} other merges` : ""}. Agent branches are matched by prefix, such as claude/ or codex/.${reworkNote(outcomes, "agent")}`,
         why: [
           ["In a 47-person study, participants with an AI code assistant wrote less secure code on four of five tasks, and were more likely to believe it was secure.", "perry-2023"],
@@ -1754,7 +1757,7 @@ const SUGGESTION_RULES = [
         basis: `${plural(review.withHumanReview, "pull request")} you opened that another person reviewed`,
         targets: review.byRepo.filter((r) => r.timed >= 2 && r.medianFirstReviewHours >= SUGGEST_REVIEW_WAIT_HOURS)
           .sort((a, b) => b.medianFirstReviewHours - a.medianFirstReviewHours).slice(0, SUGGEST_TARGETS)
-          .map((r) => `${r.repo}: median ${durationLabel(r.medianFirstReviewHours)} across ${r.timed}`),
+          .map((r) => ref(`${r.repo}: median ${durationLabel(r.medianFirstReviewHours)} across ${r.timed}`, r.repo)),
         seen: `Your pull requests waited a median of ${durationLabel(review.medianFirstReviewHours)} for a first review from another person, across ${plural(review.withHumanReview, "pull request")}.${review.p75FirstReviewHours != null ? ` One in four waited longer than ${durationLabel(review.p75FirstReviewHours)}.` : ""} Time as a draft counts toward the wait.`,
         why: [["Google's review guide sets one business day as the maximum time to respond to a review request.", "google-speed"]],
         act: [["Request a reviewer as you open it, or add a CODEOWNERS file so GitHub requests one automatically. Code owners are not requested on drafts until they are marked ready.", "gh-codeowners"]],
@@ -1817,7 +1820,7 @@ const SUGGESTION_RULES = [
       return {
         tone: "info", confirmed: Boolean(c && passes(chance, "size-time", c.p) && c.rho >= CORRELATION_MIN_RHO),
         basis: `${plural(p.merged, "merged pull request")}`,
-        targets: p.largest.map((r) => `${prLabel(r)}: ${lines(r.lines)} lines`),
+        targets: p.largest.map((r) => ref(`${prLabel(r)}: ${lines(r.lines)} lines`, r.repo, r.number)),
         seen: seen + correlationText(c, Boolean(c) && passes(chance, "size-time", c.p)) + reworkNote(outcomes, "size"),
         why: [
           ["Google's review guide says small changes are reviewed more quickly and more thoroughly, and are less likely to introduce bugs.", "google-small-cls"],
@@ -1836,7 +1839,7 @@ const SUGGESTION_RULES = [
         ["Decide each one: merge it, close it with a one-line reason, or convert it to a draft so it stops reading as ready.", "gh-draft"],
         ["Where outside contributors open pull requests, actions/stale can label inactive ones and close them later.", "actions-stale"],
       ];
-      const target = (r) => `${prLabel(r)}${r.draft ? " (draft)" : ""}: open ${plural(Math.floor(r.days), "day")}`;
+      const target = (r) => ref(`${prLabel(r)}${r.draft ? " (draft)" : ""}: open ${plural(Math.floor(r.days), "day")}`, r.repo, r.number);
       // With enough merges of your own, "too long" is measured against them, not against a fixed two weeks.
       const b = outcomes?.baseline;
       if (b) {
@@ -1886,7 +1889,7 @@ const SUGGESTION_RULES = [
         tone: "info",
         source: fromSearch ? "Pull requests you opened" : "Recent events",
         basis: `${plural(decided, "finished pull request")} you opened${fromSearch ? "" : " in the loaded events"}`,
-        targets: source.closed.slice(0, SUGGEST_TARGETS).map((c) => `${prLabel(c)}${c.agent ? " (agent branch)" : ""}`),
+        targets: source.closed.slice(0, SUGGEST_TARGETS).map((c) => ref(`${prLabel(c)}${c.agent ? " (agent branch)" : ""}`, c.repo, c.number)),
         seen: `${closed} of ${plural(decided, "finished pull request")} you opened${fromSearch ? "" : " in the loaded events"} closed without merging${agents ? `, ${agents} of them from agent branches` : ""}.`,
         act: [["For larger changes, open an issue or a draft pull request first and settle the approach before polishing it.", "gh-draft"]],
       };
@@ -1904,7 +1907,7 @@ const SUGGESTION_RULES = [
       return {
         tone: "info",
         basis: `${plural(follow.settled, "branch", "branches")} created in the loaded events`,
-        targets: follow.withoutPr.slice(0, SUGGEST_TARGETS).map((b) => `${b.ref} in ${b.repo}: ${plural(Math.floor(b.days), "day")} old`),
+        targets: follow.withoutPr.slice(0, SUGGEST_TARGETS).map((b) => ref(`${b.ref} in ${b.repo}: ${plural(Math.floor(b.days), "day")} old`, b.repo)),
         seen: `${n} of ${plural(follow.settled, "branch", "branches")} created in the loaded events have no pull request${follow.agentWithoutPr ? `, ${follow.agentWithoutPr} of them agent branches` : ""}. Oldest: ${o.ref} in ${o.repo}.`,
         act: [
           ["Open a draft pull request once a branch has a direction, so the work is visible.", "gh-draft"],
@@ -1934,7 +1937,7 @@ const SUGGESTION_RULES = [
       const o = waiting[0];
       return {
         tone: "info",
-        targets: waiting.slice(0, SUGGEST_TARGETS).map((r) => `${r.c.thread.repo} #${r.c.thread.number}: ${r.c.author}, ${plural(Math.floor(r.days), "day")} ago`),
+        targets: waiting.slice(0, SUGGEST_TARGETS).map((r) => ref(`${r.c.thread.repo} #${r.c.thread.number}: ${r.c.author}, ${plural(Math.floor(r.days), "day")} ago`, r.c.thread.repo, r.c.thread.number)),
         seen: `${waiting.length} open issues or pull requests you opened end with a reply from someone else, ${SUGGEST_WAITING_DAYS} or more days old. Oldest: ${o.c.thread.repo} #${o.c.thread.number}, from ${o.c.author}, ${plural(Math.floor(o.days), "day")} ago.`,
         act: [["Reply, resolve, or close each thread. If one no longer needs you, close it with a note so nobody keeps waiting."]],
       };
@@ -2036,7 +2039,7 @@ const SUGGESTION_RULES = [
       return {
         tone: "info",
         basis: `14-day traffic for ${plural(known.length, "repository", "repositories")}`,
-        targets: quiet.slice(0, SUGGEST_TARGETS).map((r) => `${r.repo}: ${r.uniques.toLocaleString()} unique visitors, no new stars`),
+        targets: quiet.slice(0, SUGGEST_TARGETS).map((r) => ref(`${r.repo}: ${r.uniques.toLocaleString()} unique visitors, no new stars`, r.repo)),
         seen: `${o.repo} had ${o.uniques.toLocaleString()} unique visitors in 14 days and no new stars${quiet.length > 1 ? `, and so did ${plural(quiet.length - 1, "other repository", "other repositories")}` : ""}.`,
         why: [["A README is often the first item a visitor will see.", "gh-readme"], ["Topics help other people find and contribute to a project.", "gh-topics"]],
         act: [["Open the README with what the project does, a screenshot or example of it working, and how to start. Then add topics and, for a public repository, a social preview image.", "gh-social-preview"]],
@@ -2077,6 +2080,107 @@ const SUGGESTION_RULES = [
 // Suggestions built on the loaded summaries. Returns the suggestions that apply and, for every rule,
 // whether it was shown, folded into another, found nothing, lacked data, or lacked a source, so the
 // view can say what it checked. `links` maps a Patterns finding id to the suggestion that acts on it.
+// ---------- Card states ----------
+// The number each suggestion's advice should move, read the same way whether or not the card shows,
+// so a card marked "trying" can report the number then against now even after it stops appearing.
+// Every number here is better lower. Each needs the minimum sample its finding uses.
+const SUGGESTION_METRICS = {
+  "trace-follow-up-fixes": ({ outcomes: o }) => o && o.rework.settled >= REWORK_MIN_SETTLED && { label: "Merges followed by a fix", value: o.rework.rate, unit: "share" },
+  "limit-open-work": ({ outcomes: o }) => o?.baseline && { label: "Median time to merge", value: o.baseline.medianHours, unit: "hours" },
+  "merge-finished-work": ({ outcomes: o }) => o?.split && o.split.waitingShare != null && { label: "Open hours after the last commit", value: o.split.waitingShare, unit: "share" },
+  "review-before-merge": ({ review: r }) => r && r.merged >= SUGGEST_MIN_MERGES && { label: "Merges with no review from another person", value: r.noHuman / r.merged, unit: "share" },
+  "review-agent-branches": ({ prPatterns: p }) => p && p.agent.count >= SUGGEST_MIN_MERGES && { label: "Agent-branch merges with no recorded review", value: p.agent.unreviewed / p.agent.count, unit: "share" },
+  "faster-first-review": ({ review: r }) => r && r.withHumanReview >= 3 && r.medianFirstReviewHours != null && { label: "Median wait for a first review", value: r.medianFirstReviewHours, unit: "hours" },
+  "answer-review-requests": ({ collab: c }) => c && c.outTimed >= SUGGEST_OUT_MIN && c.outMedianHours != null && { label: "Median time to your first review of others' work", value: c.outMedianHours, unit: "hours" },
+  "spread-reviews": ({ review: r }) => r && r.withHumanReview >= 4 && r.topReviewerShare != null && { label: "Reviews by your most frequent reviewer", value: r.topReviewerShare, unit: "share" },
+  "smaller-prs": ({ prPatterns: p }) => p && p.merged >= SUGGEST_MIN_MERGES && p.all.medianSize != null && { label: "Median lines per merge", value: p.all.medianSize, unit: "lines" },
+  "settle-stale-prs": ({ outcomes: o, prPatterns: p }) => (o?.baseline
+    ? { label: "Open pull requests past your usual merge time", value: o.overdue.length, unit: "count" }
+    : p && { label: "Open pull requests older than two weeks", value: p.stale, unit: "count" }),
+  "branches-without-prs": ({ follow: f }) => f && f.settled >= 4 && { label: "Branches without a pull request", value: f.withoutPr.length, unit: "count" },
+};
+// Cards that can never be snoozed or dismissed: write access on a token is never noise.
+const PINNED_SUGGESTIONS = new Set(["fine-grained-token"]);
+const SNOOZE_DAYS = [7, 30];
+// A dismissed card comes back when its number is clearly worse than when it was dismissed: a quarter
+// higher, and by more than a small floor for its unit, so a count of 1 becoming 2 is not enough alone.
+const WORSE_FLOOR = { share: 0.1, hours: 12, lines: 100, count: 2 };
+const metricText = (m, value) => (m.unit === "share" ? share(value) : m.unit === "hours" ? durationLabel(value)
+  : m.unit === "lines" ? `${Math.round(value).toLocaleString()} lines` : Math.round(value).toLocaleString());
+function clearlyWorse(unit, then, now) {
+  return Number.isFinite(then) && Number.isFinite(now) && now - then > (WORSE_FLOOR[unit] ?? 0) && now >= then * 1.25;
+}
+
+// Sorts suggestions by what the user said about each card: trying, snoozed until a date, or
+// dismissed. `states` maps rule id to { state, at, until, metric } as the main process saved it.
+function applyCardStates(suggestions, states, now) {
+  const nowTime = now == null ? Date.now() : new Date(now).getTime();
+  const saved = states && typeof states === "object" ? states : {};
+  const byId = new Map(suggestions.items.map((i) => [i.id, i]));
+  const items = [];
+  const trying = [];
+  const snoozed = [];
+  const dismissed = [];
+  const checked = suggestions.checked.map((c) => ({ ...c }));
+  for (const item of suggestions.items) {
+    const st = saved[item.id];
+    const pinned = PINNED_SUGGESTIONS.has(item.id);
+    if (!st || pinned) { items.push(item); continue; }
+    if (st.state === "trying") {
+      const then = st.metric ? metricText(st.metric, st.metric.value) : null;
+      items.push({ ...item, trying: { ...st, then, now: item.metric ? metricText(item.metric, item.metric.value) : null } });
+      continue;
+    }
+    if (st.state === "snoozed" && Date.parse(st.until) > nowTime) { snoozed.push({ ...item, until: st.until }); continue; }
+    if (st.state === "dismissed") {
+      const m = item.metric;
+      if (m && st.metric && clearlyWorse(m.unit, st.metric.value, m.value)) {
+        items.push({ ...item, returned: { at: st.at, then: metricText(m, st.metric.value), now: metricText(m, m.value), label: m.label } });
+      } else {
+        dismissed.push({ ...item, dismissedAt: st.at });
+      }
+      continue;
+    }
+    items.push(item);
+  }
+  // A card being tried is listed even after its rule stops firing, with its number then and now.
+  for (const [id, st] of Object.entries(saved)) {
+    if (st?.state !== "trying") continue;
+    const shown = items.find((i) => i.id === id);
+    const check = checked.find((c) => c.id === id);
+    if (!check) continue;
+    const metric = (shown || byId.get(id))?.metric || check.metric || null;
+    trying.push({
+      id, title: check.title, at: st.at, showing: Boolean(shown), status: check.status,
+      then: st.metric && metric ? metricText(metric, st.metric.value) : null,
+      now: metric ? metricText(metric, metric.value) : null,
+      label: metric?.label || st.metric?.label || null,
+      better: st.metric && metric ? metric.value < st.metric.value : null,
+    });
+  }
+  for (const c of checked) {
+    const st = saved[c.id];
+    if (!st || PINNED_SUGGESTIONS.has(c.id)) continue;
+    if (snoozed.some((x) => x.id === c.id)) Object.assign(c, { status: "snoozed", detail: `Snoozed until ${String(snoozed.find((x) => x.id === c.id).until).slice(0, 10)}.` });
+    if (dismissed.some((x) => x.id === c.id)) Object.assign(c, { status: "dismissed", detail: `Dismissed ${String(st.at).slice(0, 10)}. It comes back if its number gets clearly worse.` });
+  }
+  // Cards being tried lead, then the order deriveSuggestions chose. A finding links only to a card shown.
+  items.sort((a, b) => Number(Boolean(b.trying)) - Number(Boolean(a.trying)));
+  const showing = new Set(items.map((i) => i.id));
+  const links = Object.fromEntries(Object.entries(suggestions.links || {}).filter(([, l]) => showing.has(l.id)));
+  return { ...suggestions, items, trying, snoozed, dismissed, checked, links };
+}
+
+// Where lines as text, with an aligned list of what each one names on github.com (or null).
+const REF_REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+function whereLines(list) {
+  const lines = (list || []).slice(0, SUGGEST_TARGETS);
+  return {
+    targets: lines.map((t) => (typeof t === "string" ? t : t.text)),
+    refs: lines.map((t) => (t && typeof t === "object" && REF_REPO.test(t.repo || "") ? { repo: t.repo, number: t.number } : null)),
+  };
+}
+
 function deriveSuggestions(input) {
   // Follow-up comparisons are judged by the page's chance budget when the caller passes one.
   const x = input ? { ...input, outcomes: withBudget(input.outcomes, input.chance) } : {};
@@ -2086,13 +2190,15 @@ function deriveSuggestions(input) {
   const checked = [];
   for (const rule of SUGGESTION_RULES) {
     const result = rule.check(x, { me, nowTime });
-    const base = { id: rule.id, area: rule.area, source: result?.source || rule.source, title: rule.title };
+    const measured = SUGGESTION_METRICS[rule.id]?.(x);
+    const metric = measured && Number.isFinite(measured.value) ? measured : null;
+    const base = { id: rule.id, area: rule.area, source: result?.source || rule.source, title: rule.title, metric, pinned: PINNED_SUGGESTIONS.has(rule.id) };
     if (!result) checked.push({ ...base, status: "clear" });
     else if (result.unavailable) checked.push({ ...base, status: "unavailable", detail: result.unavailable });
     else if (result.short) checked.push({ ...base, status: "short", detail: result.short });
     else {
       shown.set(rule.id, { ...base, title: result.title || rule.title, tone: result.tone, seen: result.seen, why: result.why || [], act: result.act || [],
-        more: result.more || [], basis: result.basis || "", targets: (result.targets || []).slice(0, SUGGEST_TARGETS),
+        more: result.more || [], basis: result.basis || "", ...whereLines(result.targets),
         confirmed: Boolean(result.confirmed), patterns: rule.patterns || [], also: [], folded: [] });
       checked.push({ ...base, title: result.title || rule.title, status: "shown" });
     }
@@ -2107,7 +2213,10 @@ function deriveSuggestions(input) {
     into.also.push(from.seen);
     into.why = [...into.why, ...from.why.filter((w) => !into.why.some((v) => v[0] === w[0]))];
     into.more = [...into.more, ...from.more];
-    if (from.targets.length) into.targets = [...into.targets.slice(0, SUGGEST_TARGETS - 1), from.targets[0]];
+    if (from.targets.length) {
+      into.targets = [...into.targets.slice(0, SUGGEST_TARGETS - 1), from.targets[0]];
+      into.refs = [...into.refs.slice(0, SUGGEST_TARGETS - 1), from.refs[0]];
+    }
     into.patterns = [...new Set([...into.patterns, ...from.patterns])];
     if (from.tone === "warn") into.tone = "warn";
     into.folded.push(from.title);
@@ -2824,6 +2933,8 @@ const api = {
   CONVERSATION_FILTERS,
   deriveObservations,
   deriveSuggestions,
+  applyCardStates,
+  SNOOZE_DAYS,
   READING,
   REWORK_HOURS,
   durationLabel,

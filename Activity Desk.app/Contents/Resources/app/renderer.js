@@ -49,6 +49,7 @@ const initialState = {
   reviewed: null,
   prLookup: { authored: null, referenced: { total: 0, covered: 0, asked: 0, found: 0 }, commits: null },
   snapshotSaved: false,
+  cards: {},
   rateLimit: null,
   tokenMeta: null,
   footprint: null,
@@ -561,7 +562,7 @@ async function refresh() {
     });
     // Notes load once per account. Later refreshes keep the notes in memory, including unsaved edits.
     const notesTask = account.notes?.userId === user.id && !account.notes.failed ? null : window.desk.notes();
-    const [notes, year, prs, talk, authored, footprint, yearsResult, reviewedResult, notebook] = await Promise.allSettled([
+    const [notes, year, prs, talk, authored, footprint, yearsResult, reviewedResult, notebook, cardStates] = await Promise.allSettled([
       classic ? api(account, "notifications") : null,
       yearTask,
       lookupTask,
@@ -571,14 +572,20 @@ async function refresh() {
       historyTask,
       reviewedTask,
       notesTask,
+      window.desk.cards(),
     ]);
     if (account !== state) return;
     if (notesTask) account.notes = notesFrom(notebook.value, user.id);
+    // Suggestion card states belong to the signed-in account; a failed read shows every card.
+    const cardRead = cardStates.value;
+    account.cards = cardRead?.ok ? cardRead.cards : {};
     // Read last so the budget reflects this refresh. GitHub does not count this call against the limit.
     const rate = await api(account, "rateLimit").catch(() => null);
     if (account !== state) return;
 
     const errors = {};
+    if (cardRead && !cardRead.ok) errors.cards = cardRead.error;
+    else if (cardRead?.note) errors.cards = cardRead.note;
     if (feed.issue) errors.events = feed.issue;
     const notifications = Array.isArray(notes.value?.data) ? notes.value.data : null;
     if (!notifications) errors.notifications = classic
@@ -748,14 +755,14 @@ function computed() {
   // instead of "nothing found". Events failed when none loaded and the feed reported an issue.
   const eventsLoaded = state.events.length > 0 || !state.errors.events;
   const prsLoaded = Boolean(a) || Object.keys(state.prInfo).length > 0;
-  const suggestions = I.deriveSuggestions({
+  const suggestions = I.applyCardStates(I.deriveSuggestions({
     login: state.user && state.user.login, now: state.refreshedAt,
     ev: eventsLoaded ? ev : null, sessions: eventsLoaded ? sessions : null,
     follow: eventsLoaded && prsLoaded ? follow : null,
     prPatterns: prsLoaded ? prPatterns : null, review: a ? review : null, prInfo: a ? state.prInfo : null,
     trajectory, notes, notesNote: state.errors.notifications || "", footprint, conversations: state.conversations, token,
     collab: state.reviewed ? collab : null, outcomes, observations, chance,
-  });
+  }), state.public ? {} : state.cards, state.refreshedAt);
   return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, outcomes, observations, footprint, suggestions, chance, snapshots };
 }
 
@@ -1549,7 +1556,26 @@ const SUGGESTION_STATUS = {
   clear: ["✓", "ok", "Nothing found"],
   short: ["…", "muted", "Not enough data"],
   unavailable: ["✕", "no", "Source unavailable"],
+  snoozed: ["◷", "muted", "Snoozed"],
+  dismissed: ["–", "muted", "Dismissed"],
 };
+const shortDate = (iso) => new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+
+// What a card's owner can do with it. Pinned cards (token access) offer nothing to set them aside.
+function cardActions(s) {
+  if (state.public || s.pinned) return "";
+  const metric = s.metric ? ` data-metric="1"` : "";
+  if (s.trying) {
+    const m = s.metric;
+    const then = s.trying.then && s.trying.now ? `. ${esc(m.label)}: ${esc(s.trying.then)} then, ${esc(s.trying.now)} now` : "";
+    return `<div class="card-actions"><span class="trying-since">Trying since ${esc(shortDate(s.trying.at))}${then}</span>
+      <button type="button" class="link" data-card="${esc(s.id)}" data-state="">Stop trying</button></div>`;
+  }
+  return `<div class="card-actions">
+    <button type="button" class="link" data-card="${esc(s.id)}" data-state="trying"${metric}>Trying this</button>
+    ${I.SNOOZE_DAYS.map((d) => `<button type="button" class="link" data-card="${esc(s.id)}" data-state="snoozed" data-days="${d}">Snooze ${d} days</button>`).join("")}
+    <button type="button" class="link" data-card="${esc(s.id)}" data-state="dismissed"${metric}>Dismiss</button></div>`;
+}
 const readingHost = (url) => new URL(url).hostname.replace(/^www\./, "");
 
 // Text segments are [text, ...reading ids]; each cited id becomes a numbered button that opens the source.
@@ -1569,19 +1595,81 @@ function suggestionCard(s) {
   const also = s.also.map((text) => `<p class="also">${esc(text)}</p>`).join("");
   const from = s.patterns.length ? `<p class="basis">From Patterns: ${s.patterns.map((f) =>
     `<button type="button" class="link" data-finding="${esc(f.id)}">${esc(f.title)}</button>`).join(" · ")}</p>` : "";
-  return `<article class="card suggestion ${esc(s.tone)}" id="suggestion-${esc(s.id)}" tabindex="-1">
+  const back = s.returned ? `<p class="returned">Back after you dismissed it on ${esc(shortDate(s.returned.at))}: ${esc(s.returned.label.toLowerCase())} was ${esc(s.returned.then)}, now ${esc(s.returned.now)}.</p>` : "";
+  return `<article class="card suggestion ${esc(s.tone)}${s.trying ? " is-trying" : ""}" id="suggestion-${esc(s.id)}" tabindex="-1">
     <div class="suggestion-tags"><span class="src area">${esc(s.area)}</span>${sourceTag(s.source)}${s.confirmed ? '<span class="src confirmed" title="The gap or correlation behind this suggestion passed its chance check.">Beyond chance</span>' : ""}</div>
     <h4>${esc(s.title)}</h4>
+    ${back}
     ${s.basis ? `<p class="basis">Based on ${esc(s.basis)}</p>` : ""}
     ${from}
     <dl class="suggestion-body">
       <dt>Seen</dt><dd>${esc(s.seen)}${also}</dd>
       ${s.why.length ? `<dt>Why</dt><dd>${citedText(s.why, numbers)}</dd>` : ""}
       <dt>Try</dt><dd>${citedText(s.act, numbers)}</dd>
-      ${s.targets.length ? `<dt>Where</dt><dd><ul class="targets">${s.targets.map((t) => `<li>${esc(t)}</li>`).join("")}</ul></dd>` : ""}
+      ${s.targets.length ? `<dt>Where</dt><dd><ul class="targets">${s.targets.map((t, i) => `<li>${whereLine(t, s.refs?.[i])}</li>`).join("")}</ul></dd>` : ""}
     </dl>
     ${reading ? `<h5>Further reading</h5><ol class="reading">${reading}</ol>` : ""}
+    ${cardActions(s)}
   </article>`;
+}
+
+// A Where line whose leading name opens on github.com: "owner/repo #12" or "owner/repo".
+// Lines that name a branch or a person stay text, apart from the repository they mention.
+function whereLine(text, ref) {
+  if (!ref) return esc(text);
+  const label = ref.number ? `${ref.repo} #${ref.number}` : ref.repo;
+  const at = text.indexOf(label);
+  if (at < 0) return esc(text);
+  const button = `<button type="button" class="link where-link" data-open-repo="${esc(ref.repo)}"${ref.number ? ` data-open-number="${ref.number}"` : ""} title="${esc(`Open ${label} on github.com`)}">${esc(label)}</button>`;
+  return `${esc(text.slice(0, at))}${button}${esc(text.slice(at + label.length))}`;
+}
+
+// Cards being tried, with the number each was measured by when you started and now.
+function tryingPanel(list) {
+  if (!list.length) return "";
+  const row = (t) => {
+    const change = t.then && t.now ? `${esc(t.label)}: ${esc(t.then)} → <strong>${esc(t.now)}</strong>${t.better == null ? "" : t.better ? " (lower)" : t.then === t.now ? " (no change)" : " (not lower yet)"}` : t.label ? `${esc(t.label)} is not measurable in the loaded data yet.` : "No number to follow for this card.";
+    const where = t.showing ? "" : ` <span class="muted small">· ${t.status === "clear" ? "No longer suggested" : esc(SUGGESTION_STATUS[t.status]?.[2] || "")}</span>`;
+    return `<li><div><div>${esc(t.title)}${where}</div><div class="d">Since ${esc(shortDate(t.at))}. ${change}</div></div>
+      <button type="button" class="link" data-card="${esc(t.id)}" data-state="">Stop</button></li>`;
+  };
+  return `<article class="card trying-panel"><h4>Trying</h4><ul class="cap">${list.map(row).join("")}</ul>
+    <p class="note">Each number covers the loaded window, the last ${AUTHORED_DAYS} days for pull requests, so a change you made shows up gradually as older work leaves the window.</p></article>`;
+}
+
+// Snoozed and dismissed cards, each with an undo.
+function setAsideList(snoozed, dismissed) {
+  const all = [...snoozed.map((x) => [x, `Snoozed until ${shortDate(x.until)}`]), ...dismissed.map((x) => [x, `Dismissed ${shortDate(x.dismissedAt)}`])];
+  if (!all.length) return "";
+  return `<details class="card set-aside"><summary>Set aside: ${fmt(all.length)}</summary><ul class="cap">${all.map(([x, label]) =>
+    `<li><div><div>${esc(x.title)} <span class="muted small">· ${esc(label)}</span></div></div><button type="button" class="link" data-card="${esc(x.id)}" data-state="">Show again</button></li>`).join("")}</ul>
+    <p class="note">A dismissed card comes back on its own when the number it was measured by gets clearly worse. The token-access warning cannot be set aside.</p></details>`;
+}
+
+// Saves a card's state in the main process. Trying and dismissing record the card's number now.
+async function setCardState(id, next, days) {
+  const account = state;
+  if (account.public) return;
+  const shown = computed().suggestions;
+  const item = shown.items.find((i) => i.id === id) || shown.checked.find((i) => i.id === id);
+  const input = next ? { state: next, ...(next === "snoozed" ? { days } : {}), ...(item?.metric ? { metric: item.metric } : {}) } : null;
+  let result;
+  try {
+    result = await window.desk.setCard(id, input);
+  } catch {
+    result = { ok: false, error: "The suggestion state could not be saved." };
+  }
+  if (account !== state) return;
+  if (result.ok) {
+    state.cards = result.cards;
+    delete state.errors.cards;
+  } else {
+    state.errors.cards = result.error;
+  }
+  renderAll();
+  // Keep keyboard focus near the card: on it if it is still shown, else on the Set aside list.
+  const target = document.getElementById(`suggestion-${id}`) || document.querySelector("#suggestions .set-aside summary");
+  if (target) target.focus({ preventScroll: false });
 }
 
 function renderSuggestions(c) {
@@ -1599,7 +1687,10 @@ function renderSuggestions(c) {
   $("suggestions").innerHTML = `
     ${notice ? `<p class="insight-notice">${esc(notice)}</p>` : ""}
     <p class="msg error" id="reading-status" role="status"></p>
+    ${state.errors.cards ? `<p class="insight-notice">${esc(state.errors.cards)}</p>` : ""}
+    ${tryingPanel(c.suggestions.trying || [])}
     ${items.length ? `<div class="grid suggestion-grid">${items.map(suggestionCard).join("")}</div>` : ""}
+    ${setAsideList(c.suggestions.snoozed || [], c.suggestions.dismissed || [])}
     <details class="card checked">
       <summary>What was checked: ${fmt(items.length)} of ${fmt(checked.length)} suggested</summary>
       <ul class="cap">${rows}</ul>
@@ -2378,6 +2469,22 @@ $("insights").addEventListener("click", (event) => {
   jumpTo(`#suggestion-${CSS.escape(button.dataset.suggestion)}`);
 });
 $("suggestions").addEventListener("click", async (event) => {
+  const page = event.target.closest("[data-open-repo]");
+  if (page) {
+    const number = page.dataset.openNumber ? Number(page.dataset.openNumber) : null;
+    let opened = false;
+    try {
+      opened = (await window.desk.openGitHub(page.dataset.openRepo, number)).ok;
+    } catch { /* The system browser could not be opened. */ }
+    const status = $("reading-status");
+    if (status) status.textContent = opened ? "" : `Could not open ${page.textContent} in your browser.`;
+    return;
+  }
+  const card = event.target.closest("[data-card]");
+  if (card) {
+    await setCardState(card.dataset.card, card.dataset.state, Number(card.dataset.days) || 0);
+    return;
+  }
   const finding = event.target.closest("[data-finding]");
   if (finding) {
     state.insight = "patterns";

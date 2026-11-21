@@ -507,3 +507,29 @@ test("splits time to merge at the last commit and summarizes saved weeks", () =>
   const row = snap.rows.find((r) => r.key === "medianMergeHours");
   assert.deepEqual([snap.weeks, row.first.value, row.back.value, row.latest.value], [3, 30, 20, 10]);
 });
+
+test("sorts suggestions by card state and brings a dismissed card back when its number gets worse", () => {
+  const item = (id, metric) => ({ id, title: id, metric, targets: [], refs: [], also: [], why: [], act: [] });
+  const suggestions = {
+    items: [item("a", { unit: "share", value: 0.2, label: "A" }), item("b", { unit: "share", value: 0.7, label: "B" }),
+      item("c", null), item("d", { unit: "count", value: 3, label: "D" }), item("fine-grained-token", null)],
+    checked: ["a", "b", "c", "d", "fine-grained-token", "e"].map((id) => ({ id, title: id, status: id === "e" ? "clear" : "shown",
+      metric: id === "e" ? { unit: "hours", value: 5, label: "E" } : undefined })),
+    links: { fa: { id: "c" }, fb: { id: "a" } },
+  };
+  const now = "2026-11-21T00:00:00Z";
+  const r = insights.applyCardStates(suggestions, {
+    a: { state: "trying", at: "2026-11-01T00:00:00Z", metric: { unit: "share", value: 0.4, label: "A" } },
+    b: { state: "dismissed", at: "2026-11-10T00:00:00Z", metric: { unit: "share", value: 0.3, label: "B" } }, // 30% → 70%: back
+    c: { state: "snoozed", at: "2026-11-20T00:00:00Z", until: "2026-11-27T00:00:00Z" },
+    d: { state: "dismissed", at: "2026-11-10T00:00:00Z", metric: { unit: "count", value: 2, label: "D" } }, // 2 → 3: not enough
+    e: { state: "trying", at: "2026-11-01T00:00:00Z", metric: { unit: "hours", value: 30, label: "E" } }, // no longer shown
+    "fine-grained-token": { state: "dismissed", at: "2026-11-10T00:00:00Z" },
+  }, now);
+  assert.deepEqual(r.items.map((i) => i.id), ["a", "b", "fine-grained-token"]);
+  assert.deepEqual([r.items[0].trying.then, r.items[0].trying.now], ["40%", "20%"]);
+  assert.deepEqual([r.items[1].returned.then, r.items[1].returned.now], ["30%", "70%"]);
+  assert.deepEqual([r.snoozed.map((x) => x.id), r.dismissed.map((x) => x.id)], [["c"], ["d"]]);
+  assert.deepEqual(r.trying.map((t) => [t.id, t.showing, t.then, t.now, t.better]), [["a", true, "40%", "20%", true], ["e", false, "30 h", "5.0 h", true]]);
+  assert.deepEqual(Object.keys(r.links), ["fb"]);
+});

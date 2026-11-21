@@ -108,13 +108,18 @@ Each card has up to six parts:
 - **Seen** describes what the loaded data shows and names the source. Where a card's advice can be tested against your own merges, Seen includes that test: how often a fix followed the merges the advice targets, against the rest.
 - **Why** gives the reason the change may help. Each claim carries a numbered link to its source. Cards that rest only on your data, such as **Answer replies waiting on your threads**, have no Why.
 - **Try** is the change to make.
-- **Where** lists up to three places to start, such as the repositories where unreviewed merges collect, the largest merges, the oldest open pull requests or branches, or the people whose pull requests you take longest to review.
+- **Where** lists up to three places to start, such as the repositories where unreviewed merges collect, the largest merges, the oldest open pull requests or branches, or the people whose pull requests you take longest to review. A named pull request, issue, or repository opens on github.com when you select it. The app builds that link itself from the repository name and number, and opens nothing but github.com pages this way.
+- The links at the bottom of a card record what you decided about it. **Trying this** records the date and the number the advice should move, such as the share of merges followed by a fix. **Snooze 7 days** and **Snooze 30 days** hide the card until then. **Dismiss** moves it to **Set aside**. The token-access warning has none of these.
 
 A card tagged **Beyond chance** rests on a gap or correlation that passed the page's shared chance bar, and comes before other cards of the same kind. Warnings are kept for outcomes in your own data and for token access. **Get a second look before merging** and **Review agent branches like a colleague's work** are notes unless your own merges back them: the merges they target were followed by fixes more often than the rest, beyond chance. When both apply they end in the same advice, so the second is shown inside the first, and **What was checked** says so.
 
+Cards you are trying come first, and a **Trying** panel above them shows each one's number when you started and now. A card stays in the panel after it stops appearing, which is often the point: it says **No longer suggested** beside the change. Each number covers the loaded window, the last 90 days for pull requests, so a change shows up gradually as older work leaves it. **Set aside**, below the cards, lists snoozed and dismissed cards with **Show again**. A dismissed card comes back on its own, with a line saying why, when its number is clearly worse than when you dismissed it: at least a quarter higher, and past a floor for its kind (10 points for a share, 12 hours, 100 lines, or 2 pull requests or branches). These choices are kept per account in the app's data folder, encrypted like notes. They hold rule names, dates, and the one number each card was measured by, and are closed in the public view.
+
+![Suggestions with one card being tried and two set aside, for a fictional account](screenshots/suggestions-trying.png)
+
 **Further reading** lists the sources in order. Selecting a source opens it in your browser. Activity Desk opens only links from its built-in list, and only on known hosts.
 
-A suggestion appears only when its sample is large enough. **What was checked** lists every suggestion with one of five results: suggested, shown inside another suggestion, nothing found, not enough data (with the minimum it needs), or source unavailable. A source is unavailable when its request failed, such as the Events feed or the search for pull requests you opened, or when the token cannot read it, such as traffic without Administration access. Suggestions describe patterns in the loaded samples, not their causes. A merge without a recorded review, for example, may still have been checked another way.
+A suggestion appears only when its sample is large enough. **What was checked** lists every suggestion with one of seven results: suggested, shown inside another suggestion, snoozed, dismissed, nothing found, not enough data (with the minimum it needs), or source unavailable. A source is unavailable when its request failed, such as the Events feed or the search for pull requests you opened, or when the token cannot read it, such as traffic without Administration access. Suggestions describe patterns in the loaded samples, not their causes. A merge without a recorded review, for example, may still have been checked another way.
 
 | Suggestion | Appears when | Sources |
 | --- | --- | --- |
@@ -223,7 +228,7 @@ The main process sends each token to `api.github.com` for allowlisted reads, and
 
 In the public view no token exists. Requests go to `api.github.com` without a credential, and only the username is saved.
 
-**Sign out** clears the dashboard and removes the saved tokens, or the saved username in the public view. The account's seen timestamp, saved history, and notes remain in the local profile.
+**Sign out** clears the dashboard and removes the saved tokens, or the saved username in the public view. The account's seen timestamp, saved history, notes, and suggestion card states remain in the local profile.
 
 **Notes** are kept in the app's data folder (`~/Library/Application Support/Activity Desk`), not inside the app itself, so updating or replacing the app keeps them. Only the main process reads or writes them. They are encrypted with the same macOS Keychain-backed key as the token, and each account has its own notes. They are never sent to GitHub. If the notes file cannot be decrypted, for example after a Keychain change, Activity Desk keeps the unreadable file beside it as `notes-unreadable-….enc`, starts a new notebook, and says so in Notes and in **Data & access → Notes on this Mac**.
 
