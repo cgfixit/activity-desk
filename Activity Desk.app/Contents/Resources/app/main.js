@@ -13,7 +13,7 @@ const TOKEN_PAGES = {
 const API = "https://api.github.com";
 // Suggestions cite sources from this catalogue. The renderer asks for a link by id only.
 const { READING } = require(path.join(__dirname, "insights.js"));
-const READING_HOSTS = new Set(["docs.github.com", "github.com", "google.github.io", "chaoss.community", "doi.org"]);
+const READING_HOSTS = new Set(["docs.github.com", "github.com", "google.github.io", "chaoss.community", "doi.org", "dora.dev"]);
 
 const DOCUMENT = pathToFileURL(path.join(__dirname, "index.html")).href;
 const singleInstance = app.requestSingleInstanceLock();
@@ -773,7 +773,7 @@ const YEAR_QUERY = `query {
 }`;
 
 const REPO_NAME = /^[A-Za-z0-9_.-]{1,100}$/;
-const PR_FIELDS = `title state merged isDraft createdAt mergedAt additions deletions headRefName
+const PR_FIELDS = `title state merged isDraft createdAt mergedAt closedAt additions deletions headRefName
   author { __typename login } mergedBy { login }
   reviews(first: 10) { totalCount nodes { submittedAt state author { __typename login } } }`;
 

@@ -129,10 +129,11 @@ test("groups events into sessions and compares sampled merges with sample guards
   assert.equal(prs.larger.agent, 3);
   assert.deepEqual(prs.oldestOpen, { repo: "fixture/one", number: 7, days: 20 });
   assert.deepEqual(insights.deriveObservations({ prs }).map((finding) => [finding.tone, finding.title]), [
-    ["warn", "Agent-branch merges skip review more often"],
-    ["warn", "98% of merged lines landed without a recorded review"],
+    // Review findings are notes unless the user's own outcomes back them, so only the open one warns.
     ["warn", "1 loaded open PR older than two weeks"],
     ["info", "Agent-branch PRs merged 10× faster than other PRs"],
+    ["info", "Agent-branch merges skip review more often"],
+    ["info", "98% of merged lines landed without a recorded review"],
     ["info", "Larger PRs merged at least as fast as smaller ones"],
   ]);
   const few = insights.summarizePrPatterns(Object.fromEntries(Object.entries(sample).slice(1, 5)), "2026-03-02T00:00:00Z");
@@ -375,4 +376,101 @@ test("suggests answering other people's pull requests within a day", () => {
   assert.equal(slow.basis, "6 pull requests by other people that you reviewed");
   assert.deepEqual(slow.targets, ["zed: median 3 days across 3", "yan: median 2 days across 3"]);
   assert.deepEqual(slow.reading, ["google-speed"]);
+});
+
+// Outcome fixtures: hours from a fixed start, one repository, authored by "me".
+function outcomeRow(number, openedH, life, lines, extra = {}) {
+  const at = (h) => new Date(Date.parse("2026-03-01T12:00:00Z") + h * 36e5).toISOString();
+  return [`me/app#${number}`, { title: `Change ${number}`, repo: "me/app", number, author: "me", headRef: "work",
+    createdAt: at(openedH), state: life == null ? "OPEN" : extra.closed ? "CLOSED" : "MERGED", merged: life != null && !extra.closed,
+    mergedAt: life != null && !extra.closed ? at(openedH + life) : null, closedAt: life == null ? null : at(openedH + life),
+    additions: lines, deletions: 0, reviews: 0, reviewList: [], ...extra.fields }];
+}
+const outcomeNow = new Date(Date.parse("2026-03-01T12:00:00Z") + 1000 * 36e5).toISOString();
+
+test("counts follow-up fixes, the user's own merge baseline, and what slow pull requests did", () => {
+  const rows = [];
+  // Eight large agent merges, each followed six hours later by a small fix, then eight small reviewed ones.
+  for (let i = 0; i < 8; i += 1) {
+    rows.push(outcomeRow(1 + i * 2, i * 48, 2, 800 + i, { fields: { headRef: "claude/big" } }));
+    rows.push(outcomeRow(2 + i * 2, i * 48 + 8, 1, 10 + i, { fields: { title: i === 0 ? 'Revert "Change 1"' : i === 1 ? "Fix #3 crash" : "fix: follow-up" } }));
+  }
+  for (let i = 0; i < 8; i += 1) rows.push(outcomeRow(17 + i, 400 + i * 24, 1, 40 + i, { fields: { reviews: 1 } }));
+  rows.push(outcomeRow(25, 700, 100, 300), outcomeRow(26, 701, 110, 310), outcomeRow(27, 702, 120, 320));
+  rows.push(outcomeRow(28, 600, 90, 50, { closed: true }), outcomeRow(29, 610, 95, 50, { closed: true }));
+  // Two still open, and one merged nine hours ago, too recent for a follow-up to have had its chance.
+  rows.push(outcomeRow(30, 500, null, 60), outcomeRow(31, 950, null, 60), outcomeRow(32, 990, 1, 5));
+  const prInfo = Object.fromEntries(rows);
+  const o = insights.summarizeOutcomes(prInfo, "me", outcomeNow);
+  const group = (key) => o.rework.groups.find((g) => g.key === key);
+
+  assert.deepEqual([o.authored, o.merged, o.rework.settled, o.rework.followed, o.rework.named], [32, 28, 27, 8, 2]);
+  assert.deepEqual(o.rework.examples[0], { repo: "me/app", number: 15, lines: 807, agent: true, by: 16, hours: 6, named: false });
+  assert.deepEqual([group("agent").a, group("agent").b], [{ label: "Agent branches", n: 8, followed: 8 }, { label: "Other branches", n: 19, followed: 0 }]);
+  assert.deepEqual([group("size").a.followed, group("size").a.n, group("size").b.followed], [8, 13, 0]);
+  // Several comparisons share the 5% bar. The hour-of-day group depends on the local time zone, so its presence is not pinned.
+  assert.ok(o.rework.tested >= 3 && Math.abs(o.rework.bar - 0.05 / o.rework.tested) < 1e-12);
+  assert.ok(group("agent").clear && group("size").clear && !group("review").clear, "8 of 19 unreviewed against 0 of 8 reviewed does not clear the shared bar");
+  assert.equal(group("speed"), undefined, "no merge was faster than the median, so there is nothing to compare");
+
+  assert.deepEqual([o.baseline.n, o.baseline.medianHours, o.baseline.p75Hours], [28, 1, 2]);
+  assert.ok(Math.abs(o.overdueAfterHours - 31.4) < 1e-6);
+  assert.deepEqual(o.overdue.map((p) => p.number), [30, 31]);
+  assert.deepEqual([o.late.slow, o.late.quick], [{ n: 5, merged: 3 }, { n: 25, merged: 25 }]);
+  assert.deepEqual([o.flow.peak, o.flow.openNow.length, o.flow.unknownEnd], [{ count: 5, at: "2026-03-30" }, 2, 0]);
+
+  // A closed pull request saved before close times were read has no known end, and is left out of open work.
+  const legacy = insights.summarizeOutcomes({ ...prInfo, "me/app#28": { ...prInfo["me/app#28"], closedAt: undefined } }, "me", outcomeNow);
+  assert.deepEqual([legacy.flow.unknownEnd, legacy.flow.counted], [1, 31]);
+  // Fewer than six merges set no baseline, and other people's pull requests are not the user's outcomes.
+  const few = insights.summarizeOutcomes(Object.fromEntries(rows.slice(0, 4)), "me", outcomeNow);
+  assert.deepEqual([few.baseline, few.overdue, few.late], [null, [], null]);
+  assert.equal(insights.summarizeOutcomes(prInfo, "someone-else", outcomeNow).authored, 0);
+
+  const prs = insights.summarizePrPatterns(prInfo, outcomeNow);
+  const review = insights.summarizeReviewFlow(prInfo, "me");
+  const observations = insights.deriveObservations({ prs, review, outcomes: o });
+  const tone = (id) => observations.find((f) => f.id === id)?.tone;
+  // The agent finding warns because agent merges needed fixes more often; the review finding stays a note.
+  assert.deepEqual([tone("fixes-follow-merges"), tone("open-too-long"), tone("agent-skip-review"), tone("unreviewed-lines")], ["warn", "warn", "warn", "info"]);
+  assert.ok(!observations.some((f) => f.title.includes("older than two weeks")), "the user's own baseline replaces the fixed two weeks");
+
+  const s = insights.deriveSuggestions({ login: "me", now: outcomeNow, prPatterns: prs, review, prInfo, outcomes: o, observations });
+  assert.deepEqual(s.items.map((i) => [i.tone, i.confirmed, i.id]), [
+    ["warn", true, "trace-follow-up-fixes"], ["warn", true, "settle-stale-prs"], ["warn", false, "review-before-merge"], ["info", true, "smaller-prs"],
+  ]);
+  const trace = s.items[0];
+  assert.deepEqual(trace.patterns, [{ id: "fixes-follow-merges", title: "8 of your 27 settled merges were followed by a fix within 3 days" }]);
+  assert.deepEqual(trace.reading, ["dora-metrics"]);
+  assert.equal(trace.targets[0], "me/app #15 (807 lines, agent branch): #16 followed after 6.0 h");
+  assert.match(trace.act[1][0], /^Start with agent branches/);
+  assert.match(s.items[1].seen, /^2 pull requests you opened have been open longer than 31 h\. 90% of your 28 merges finished within 31 h/);
+  // The agent rule ends in the same advice as the review rule, so it is shown inside it.
+  const second = s.items[2];
+  assert.deepEqual(second.folded, ["Review agent branches like a colleague's work"]);
+  assert.equal(second.also.length, 1);
+  assert.ok(second.reading.includes("perry-2023") && second.reading.includes("bacchelli-2013"));
+  assert.equal(s.checked.find((c) => c.id === "review-agent-branches").status, "folded");
+  assert.deepEqual(s.links["agent-skip-review"], { id: "review-before-merge", title: "Get a second look before merging" });
+  assert.equal(s.links["open-too-long"].id, "settle-stale-prs");
+});
+
+test("suggests a limit on open work only when it tracks time to merge beyond chance", () => {
+  const rule = (o) => insights.deriveSuggestions({ login: "me", outcomes: o });
+  const status = (o) => rule(o).checked.find((c) => c.id === "limit-open-work").status;
+  // Eight opened one at a time merge in an hour; six opened on top of each other take days.
+  const alone = Array.from({ length: 8 }, (_, i) => outcomeRow(1 + i, i * 24, 1, 50));
+  const piled = Array.from({ length: 6 }, (_, i) => outcomeRow(20 + i, 300 + i, 100 + i * 10, 50));
+  const o = insights.summarizeOutcomes(Object.fromEntries([...alone, ...piled, outcomeRow(40, 900, null, 50)]), "me", outcomeNow);
+  assert.deepEqual(o.flow.split, { cut: 0, quiet: { n: 9, medianHours: 1 }, busy: { n: 5, medianHours: 130 } });
+  assert.ok(o.flow.load.rho > 0.8 && o.flow.load.p < 0.01);
+  assert.equal(o.flow.peak.count, 6);
+  const item = rule(o).items.find((i) => i.id === "limit-open-work");
+  assert.deepEqual([item.tone, item.confirmed, item.reading, item.targets], ["info", true, ["dora-wip"], ["me/app #40: open 4 days"]]);
+  assert.match(item.act[0][0], /^Try a limit of 1 open pull request for two weeks/);
+
+  assert.equal(status(null), "unavailable");
+  assert.equal(status(insights.summarizeOutcomes(Object.fromEntries(alone.slice(0, 5)), "me", outcomeNow)), "short", "needs 8 merges");
+  // Open work that never varies has no correlation, and nothing to suggest.
+  assert.equal(status(insights.summarizeOutcomes(Object.fromEntries(alone), "me", outcomeNow)), "clear");
 });
