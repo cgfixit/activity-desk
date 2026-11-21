@@ -670,7 +670,9 @@ function computed() {
   const a = state.prLookup.authored;
   const complete = Boolean(a && state.reviewed && !a.capped && !state.reviewed.capped);
   const collab = I.summarizeCollaboration(state.prInfo, state.reviewed?.info, state.user && state.user.login, { complete });
-  const observations = [...I.deriveObservations({ rhythm, sessions, prs: prPatterns, trajectory, follow, review }), ...collab.findings];
+  // Outcome findings cover the pull requests the authored search returned, so they wait for it.
+  const outcomes = a ? I.summarizeOutcomes(state.prInfo, state.user && state.user.login, state.refreshedAt) : null;
+  const observations = [...I.deriveObservations({ rhythm, sessions, prs: prPatterns, trajectory, follow, review, outcomes }), ...collab.findings];
   const footprint = state.footprint ? I.summarizeFootprint(state.footprint, state.savedHistory, state.refreshedAt) : null;
   const years = state.contributionHistory
     ? I.summarizeContributionHistory(state.contributionHistory.byYear, localDayKey(new Date()), state.viewer?.createdAt) : null;
@@ -687,9 +689,9 @@ function computed() {
     follow: eventsLoaded && prsLoaded ? follow : null,
     prPatterns: prsLoaded ? prPatterns : null, review: a ? review : null, prInfo: a ? state.prInfo : null,
     trajectory, notes, notesNote: state.errors.notifications || "", footprint, conversations: state.conversations, token,
-    collab: state.reviewed ? collab : null,
+    collab: state.reviewed ? collab : null, outcomes, observations,
   });
-  return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, observations, footprint, suggestions };
+  return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, outcomes, observations, footprint, suggestions };
 }
 
 function renderOverview(c) {
@@ -1076,7 +1078,7 @@ function pullRequestInsights(pr) {
 
 const sourceTag = (name) => `<span class="src">${esc(name)}</span>`;
 
-function patternInsights({ ev, pr, rhythm, sessions, prPatterns, trajectory, follow, review, collab, observations }) {
+function patternInsights({ ev, pr, rhythm, sessions, prPatterns, trajectory, follow, review, collab, outcomes, observations, suggestions }) {
   const sources = [
     rhythm ? "the contribution year" : "",
     ev.total ? `${fmt(ev.total)} loaded events` : "",
@@ -1086,8 +1088,12 @@ function patternInsights({ ev, pr, rhythm, sessions, prPatterns, trajectory, fol
   const notice = [state.errors.year, state.errors.events, state.errors.authored, state.errors.reviewed, state.errors.prs].filter(Boolean).join(" ");
 
   const findings = observations.length
-    ? `<ul class="attention">${observations.map((o) =>
-      `<li class="${esc(o.tone)}"><span class="dot"></span><div><div class="t">${esc(o.title)}</div><div class="d">${esc(o.detail)}</div>${sourceTag(o.source)}</div></li>`).join("")}</ul>`
+    ? `<ul class="attention">${observations.map((o) => {
+      // A finding that a shown suggestion acts on links to it.
+      const link = o.id && suggestions.links[o.id];
+      const go = link ? ` <button type="button" class="link jump" data-suggestion="${esc(link.id)}">Suggestion: ${esc(link.title)} →</button>` : "";
+      return `<li class="${esc(o.tone)}"${o.id ? ` data-finding="${esc(o.id)}" tabindex="-1"` : ""}><span class="dot"></span><div><div class="t">${esc(o.title)}</div><div class="d">${esc(o.detail)}</div>${sourceTag(o.source)}${go}</div></li>`;
+    }).join("")}</ul>`
     : '<p class="note">Nothing crossed a reporting threshold in the loaded data. Each finding needs a minimum sample before it appears.</p>';
 
   let rhythmCard = `<p class="note">${esc(state.errors.year || "The contribution calendar did not load.")}</p>`;
@@ -1146,6 +1152,8 @@ function patternInsights({ ev, pr, rhythm, sessions, prPatterns, trajectory, fol
       <article class="card"><h4>Merge patterns</h4>${sourceTag("Pull requests")}${prCard}</article>
       <article class="card"><h4>Trajectory</h4>${sourceTag("Contribution year")}${trajectoryCard(trajectory)}</article>
       <article class="card"><h4>Follow-through</h4>${sourceTag("Recent events")}${followCard(follow)}</article>
+      <article class="card"><h4>After the merge</h4>${sourceTag("Pull requests you opened")}${reworkCard(outcomes)}</article>
+      <article class="card"><h4>Open work</h4>${sourceTag("Pull requests you opened")}${openWorkCard(outcomes)}</article>
       <article class="card insight-wide"><h4>Review turnaround</h4>${sourceTag("Pull requests you opened")}${reviewCard(review, pr)}</article>
       <article class="card insight-wide"><h4>Review partners</h4>${sourceTag("Pull requests you opened and reviewed")}${partnersCard(collab)}</article>
     </div>`);
@@ -1166,6 +1174,51 @@ function chanceSummary(p) {
   if (c) out.push(`Size against time to merge: rank correlation <strong>ρ ${esc(c.rho.toFixed(2))}</strong> across ${fmt(c.n)} merges, ${c.p < 0.05 ? "beyond chance" : "within chance"} (shuffles match it ${c.p < 0.01 ? "under 1%" : pct(c.p)} of the time).`);
   else out.push(`A size correlation needs 8 timed merges; ${fmt(p.merged)} ${p.merged === 1 ? "is" : "are"} loaded.`);
   return out.join(" ");
+}
+
+const oftenPct = (p) => (p < 0.01 ? "under 1%" : pct(p));
+const noOutcomes = () => `<p class="note">${esc(state.errors.authored || "The search for pull requests you opened did not load, so there are no outcomes to compare.")}</p>`;
+
+// Whether merges needed a follow-up fix, and which kind of merge needed one more often.
+function reworkCard(o) {
+  if (!o) return noOutcomes();
+  const r = o.rework;
+  if (!r.merged) return `<p class="note">You merged no pull requests in the last ${AUTHORED_DAYS} days that this token can read.</p>`;
+  const ratio = (x) => `${fmt(x.followed)} / ${fmt(x.n)}`;
+  const chance = (g) => (g.p == null ? "—" : `${g.clear ? "Beyond chance" : "Within chance"} (${oftenPct(g.p)})`);
+  const table = r.groups.length ? `<table class="compare"><caption class="note">Settled merges followed by a fix, by group</caption>
+      <thead><tr><th scope="col">Group</th><th scope="col">Followed</th><th scope="col">Against</th><th scope="col">Followed</th><th scope="col">Random regroupings match</th></tr></thead>
+      <tbody>${r.groups.map((g) => `<tr><th scope="row">${esc(g.a.label)}</th><td>${ratio(g.a)}</td><td>${esc(g.b.label)}</td><td>${ratio(g.b)}</td><td>${esc(chance(g))}</td></tr>`).join("")}</tbody></table>` : "";
+  return `
+    ${stats([["Followed by a fix", r.settled ? `${fmt(r.followed)} / ${fmt(r.settled)}` : "—"], ["Median until the fix", r.followed ? hoursLabel(r.medianHours) : "—"], ["Fixes naming the merge", r.followed ? `${fmt(r.named)} / ${fmt(r.followed)}` : "—"]])}
+    ${table}
+    <p class="note">A settled merge is one you opened that merged at least ${I.REWORK_HOURS / 24} days ago${r.merged > r.settled ? `; ${fmt(r.merged - r.settled)} newer ${r.merged - r.settled === 1 ? "one is" : "ones are"} left out` : ""}. It counts as followed when a loaded pull request in the same repository, titled as a fix or revert, opened within ${I.REWORK_HOURS / 24} days of it. A follow-up that names a merge by number or quoted title counts against that merge, any other against the nearest merge before it. Titles are a proxy, and fixes opened by people whose pull requests did not load are missed.
+      ${r.tested ? `Groups are compared once each side has four merges. ${fmt(r.tested)} ${r.tested === 1 ? "comparison ran" : "comparisons ran"} on the same merges, so each must be matched by fewer than ${esc(String(Number((r.bar * 100).toFixed(2))))}% of random regroupings to count as beyond chance.` : "Groups are compared once each side has four merges and two merges were followed."}</p>`;
+}
+
+// How much the user keeps open at once, and how open pull requests compare with their own merges.
+function openWorkCard(o) {
+  if (!o) return noOutcomes();
+  if (!o.authored) return `<p class="note">You opened no pull requests in the last ${AUTHORED_DAYS} days that this token can read.</p>`;
+  const f = o.flow;
+  const b = o.baseline;
+  const count = (x) => (x == null ? "—" : Number.isInteger(x) ? fmt(x) : x.toFixed(1));
+  const split = f.split ? `<table class="compare"><caption class="note">Merges by how many of your others were open when each one opened</caption>
+      <thead><tr><th scope="col">Others open</th><th scope="col">Merged</th><th scope="col">Median to merge</th></tr></thead>
+      <tbody><tr><th scope="row">${f.split.cut === 0 ? "None" : `${esc(count(f.split.cut))} or fewer`}</th><td>${fmt(f.split.quiet.n)}</td><td>${esc(hoursLabel(f.split.quiet.medianHours))}</td></tr>
+        <tr><th scope="row">${f.split.cut === 0 ? "One or more" : `More than ${esc(count(f.split.cut))}`}</th><td>${fmt(f.split.busy.n)}</td><td>${esc(hoursLabel(f.split.busy.medianHours))}</td></tr></tbody></table>` : "";
+  const load = f.load
+    ? `Open work against time to merge: rank correlation <strong>ρ ${esc(f.load.rho.toFixed(2))}</strong> across ${fmt(f.load.n)} merges, ${f.load.p < 0.05 ? "beyond chance" : "within chance"} (shuffles match it ${oftenPct(f.load.p)} of the time).`
+    : `A correlation between open work and time to merge needs 8 merges with differing counts; ${fmt(o.merged)} ${o.merged === 1 ? "is" : "are"} loaded.`;
+  const l = o.late;
+  const late = l && l.slow.n && l.quick.n
+    ? ` Of ${fmt(l.slow.n)} finished pull requests still open after ${esc(hoursLabel(l.afterHours))}, <strong>${fmt(l.slow.merged)}</strong> merged, against ${fmt(l.quick.merged)} of ${fmt(l.quick.n)} that finished sooner${l.p == null ? "" : ` (random regroupings match that gap ${oftenPct(l.p)} of the time)`}.` : "";
+  return `
+    ${stats([["Open now", fmt(f.openNow.length)], ["Others open when you start one", count(f.typicalOthers)], ["Most open at once", f.peak ? fmt(f.peak.count) : "—"]])}
+    ${stats([["Half your merges finish within", b ? hoursLabel(b.medianHours) : "—"], ["90% finish within", b ? hoursLabel(b.p90Hours) : "—"], ["Open past your usual time", b ? `${fmt(o.overdue.length)} / ${fmt(f.openNow.length)}` : "—"]])}
+    ${split}
+    <p class="note">${load}${late}</p>
+    <p class="note">Each pull request you opened counts as open from creation until it merged, closed, or now${f.peak ? `; the most at once came on ${esc(f.peak.at)}` : ""}. Your usual time comes from your own merges once six are loaded, and an open pull request is past it when it is older than 90% of them took, and at least a day old.${f.unknownEnd ? ` ${fmt(f.unknownEnd)} closed ${f.unknownEnd === 1 ? "pull request has" : "pull requests have"} no recorded close time and ${f.unknownEnd === 1 ? "is" : "are"} left out.` : ""} Pull requests opened before the ${AUTHORED_DAYS}-day window are not loaded, so the earliest counts run low.</p>`;
 }
 
 function trajectoryCard(t) {
@@ -1368,6 +1421,7 @@ function renderInsights(c) {
 // ---------- suggestions ----------
 const SUGGESTION_STATUS = {
   shown: ["→", "part", "Suggested"],
+  folded: ["↳", "part", "Shown inside another suggestion"],
   clear: ["✓", "ok", "Nothing found"],
   short: ["…", "muted", "Not enough data"],
   unavailable: ["✕", "no", "Source unavailable"],
@@ -1388,12 +1442,16 @@ function suggestionCard(s) {
     const r = I.READING[id];
     return `<li><button type="button" class="link" data-reading="${esc(id)}">${esc(r.title)}</button> <span class="muted">${esc(r.by)} · ${esc(readingHost(r.url))}</span></li>`;
   }).join("");
-  return `<article class="card suggestion ${esc(s.tone)}">
-    <div class="suggestion-tags"><span class="src area">${esc(s.area)}</span>${sourceTag(s.source)}</div>
+  const also = s.also.map((text) => `<p class="also">${esc(text)}</p>`).join("");
+  const from = s.patterns.length ? `<p class="basis">From Patterns: ${s.patterns.map((f) =>
+    `<button type="button" class="link" data-finding="${esc(f.id)}">${esc(f.title)}</button>`).join(" · ")}</p>` : "";
+  return `<article class="card suggestion ${esc(s.tone)}" id="suggestion-${esc(s.id)}" tabindex="-1">
+    <div class="suggestion-tags"><span class="src area">${esc(s.area)}</span>${sourceTag(s.source)}${s.confirmed ? '<span class="src confirmed" title="The gap or correlation behind this suggestion passed its chance check.">Beyond chance</span>' : ""}</div>
     <h4>${esc(s.title)}</h4>
     ${s.basis ? `<p class="basis">Based on ${esc(s.basis)}</p>` : ""}
+    ${from}
     <dl class="suggestion-body">
-      <dt>Seen</dt><dd>${esc(s.seen)}</dd>
+      <dt>Seen</dt><dd>${esc(s.seen)}${also}</dd>
       ${s.why.length ? `<dt>Why</dt><dd>${citedText(s.why, numbers)}</dd>` : ""}
       <dt>Try</dt><dd>${citedText(s.act, numbers)}</dd>
       ${s.targets.length ? `<dt>Where</dt><dd><ul class="targets">${s.targets.map((t) => `<li>${esc(t)}</li>`).join("")}</ul></dd>` : ""}
@@ -1406,7 +1464,7 @@ function renderSuggestions(c) {
   const { items, checked } = c.suggestions;
   $("suggestion-count").textContent = items.length ? String(items.length) : "";
   $("suggestions-caption").textContent = items.length
-    ? `${items.length} ${items.length === 1 ? "change" : "changes"} to try, each triggered by a pattern in the loaded data. Each card says what it saw and what to try. Where it gives a reason, each claim links to its source.`
+    ? `${items.length} ${items.length === 1 ? "change" : "changes"} to try, each triggered by a pattern in the loaded data. Each card says what it saw and what to try. Where it gives a reason, each claim links to its source. Warnings rest on an outcome in your own data or on access. Advice about review stays a note unless your merges back it.`
     : "Nothing in the loaded data calls for a change. Each suggestion needs a minimum sample before it appears.";
   const notice = [state.errors.refresh, state.errors.events, state.errors.authored, state.errors.prs, state.errors.year,
     state.errors.conversations, state.errors.footprint].filter(Boolean).join(" ");
@@ -2180,7 +2238,28 @@ $("insights").addEventListener("click", (event) => {
   renderStream(computed());
   $("repo-filter").focus();
 });
+// A finding and the suggestion that acts on it link to each other.
+function jumpTo(selector) {
+  const target = document.querySelector(selector);
+  if (!target) return;
+  target.scrollIntoView({ block: "start" });
+  target.focus({ preventScroll: true });
+}
+$("insights").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-suggestion]");
+  if (!button) return;
+  showTab("suggestions");
+  jumpTo(`#suggestion-${CSS.escape(button.dataset.suggestion)}`);
+});
 $("suggestions").addEventListener("click", async (event) => {
+  const finding = event.target.closest("[data-finding]");
+  if (finding) {
+    state.insight = "patterns";
+    renderInsights(computed());
+    showTab("insights");
+    jumpTo(`#insights li[data-finding="${CSS.escape(finding.dataset.finding)}"]`);
+    return;
+  }
   const button = event.target.closest("[data-reading]");
   if (!button) return;
   const id = button.dataset.reading;
