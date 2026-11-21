@@ -366,3 +366,21 @@ input[type="search"] { width: 180px; }
 @media (max-width: 760px) {
   .suggestion-grid { grid-template-columns: minmax(0, 1fr); }
 }
+.more-findings { margin-top: 6px; }
+.more-findings > summary { cursor: pointer; color: var(--accent); font-size: 12px; padding: 4px 0; }
+.more-findings > summary:hover { color: var(--text); }
+.more-findings[open] > summary { margin-bottom: 4px; }
+.attention .src.confirmed { margin-left: 6px; }
+.compare .week { display: block; font-size: 11px; color: var(--muted); }
+.card-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 12px; }
+.card-actions .link { color: var(--accent); padding: 0; }
+.card-actions .link:hover { color: var(--text); }
+.card-actions .trying-since { color: var(--good); }
+.suggestion.is-trying { border-color: color-mix(in srgb, var(--good) 45%, var(--line)); }
+.suggestion .returned { margin: 4px 0 8px; font-size: 12px; color: var(--warn); }
+.trying-panel, .set-aside { margin-bottom: 14px; }
+.trying-panel li, .set-aside li { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+.set-aside { margin-top: 14px; }
+.set-aside > summary { cursor: pointer; }
+.trying-panel h4 { margin-top: 0; }
+.targets .where-link { color: var(--accent); padding: 0; font: inherit; }

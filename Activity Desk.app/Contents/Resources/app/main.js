@@ -194,6 +194,8 @@ function resetSession() {
 // Daily repository traffic, star and fork counts, and referrer sightings, kept so trends can outlast
 // GitHub's 14-day traffic window. Only the main process writes it, and only from GitHub responses it
 // fetched itself for the signed-in account's own repositories. It is encrypted like the token.
+// It also keeps one snapshot a week of outcome numbers the window computed from those responses. The
+// main process accepts only the known keys, as bounded numbers, under a week it works out itself.
 const HISTORY_FILE = "history.enc";
 const HISTORY_ON = "history-on"; // present only after the user turned saved history on
 const HISTORY_VERSION = 1;
@@ -252,9 +254,36 @@ function repoHistory(account, repo) {
   return entry;
 }
 
+// Snapshot keys and the largest value each may take. Rates and shares are between 0 and 1.
+const SNAPSHOT_LIMITS = { merged: 100000, medianMergeHours: HISTORY_DAYS * 24, reworkRate: 1, averageOpen: 10000, waitingShare: 1 };
+const SNAPSHOT_WEEKS = 60;
+
+// The Monday that starts the current week, in UTC.
+function weekStart() {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+  return d.toISOString().slice(0, 10);
+}
+
+function cleanSnapshot(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const out = {};
+  for (const [key, limit] of Object.entries(SNAPSHOT_LIMITS)) {
+    const v = value[key];
+    if (v === null || v === undefined) continue;
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > limit) return null;
+    out[key] = key === "merged" ? Math.round(v) : Math.round(v * 1000) / 1000;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 function pruneHistory(store) {
   const oldest = new Date(Date.now() - HISTORY_DAYS * 864e5).toISOString().slice(0, 10);
   for (const account of Object.values(store.accounts)) {
+    if (account.snapshots) {
+      const weeks = Object.keys(account.snapshots).filter((w) => DAY.test(w) && w >= oldest).sort();
+      for (const w of Object.keys(account.snapshots)) if (!weeks.slice(-SNAPSHOT_WEEKS).includes(w)) delete account.snapshots[w];
+    }
     for (const [repo, entry] of Object.entries(account.repos)) {
       if (!entry.seen || entry.seen < oldest) { delete account.repos[repo]; continue; }
       for (const series of [entry.views, entry.clones, entry.counts]) {
@@ -326,9 +355,26 @@ handle("history", () => withHistory(async () => {
     await saveHistory();
     const account = store.accounts[String(sessionUser.id)];
     const file = readIfPresent(path.join(app.getPath("userData"), HISTORY_FILE));
-    return { ok: true, enabled: historyEnabled(), repos: account ? account.repos : {}, bytes: file ? file.length : 0, note: historyNote };
+    return { ok: true, enabled: historyEnabled(), repos: account ? account.repos : {}, snapshots: account?.snapshots || {}, week: weekStart(), bytes: file ? file.length : 0, note: historyNote };
   } catch {
     return { ok: false, error: "Saved history could not be read or saved." };
+  }
+}));
+
+// This week's outcome numbers for the signed-in account, replacing any saved earlier in the same week.
+handle("snapshot", (value) => withHistory(async () => {
+  if (!sessionUser) return { ok: false, error: signInFirst() };
+  if (!historyEnabled()) return { ok: false, error: "Saved history is off." };
+  const clean = cleanSnapshot(value);
+  if (!clean) return { ok: false, error: "Invalid snapshot." };
+  try {
+    const account = accountHistory(await loadHistory(), sessionUser);
+    const week = weekStart();
+    (account.snapshots || (account.snapshots = {}))[week] = clean;
+    scheduleHistorySave();
+    return { ok: true, week };
+  } catch {
+    return { ok: false, error: "The weekly snapshot could not be saved." };
   }
 }));
 
@@ -515,6 +561,112 @@ handle("note-delete", (id) => withNotes(async () => {
     return { ok: true };
   } catch {
     return { ok: false, error: "The note could not be deleted. Try again." };
+  }
+}));
+
+// ---------- Suggestion card states ----------
+// What the user said about each suggestion card: trying it, snoozed until a date, or dismissed. Kept
+// per account, encrypted like notes, and only after the user acts on a card. Rule ids and dates only,
+// plus the one number a card was measured by when the user acted, so "trying" can show then and now.
+const CARDS_FILE = "cards.enc";
+const CARDS_VERSION = 1;
+const CARDS_MAX = 100;
+const CARD_ID = /^[a-z0-9-]{1,60}$/;
+const CARD_STATES = ["trying", "snoozed", "dismissed"];
+const CARD_UNITS = ["share", "hours", "lines", "count"];
+const SNOOZE_MAX_DAYS = 90;
+let cardsStore = null;
+let cardsNote = "";
+let cardsQueue = Promise.resolve();
+
+function withCards(operation) {
+  const pending = cardsQueue.then(operation);
+  cardsQueue = pending.catch(() => {});
+  return pending;
+}
+
+// The number a card was measured by, or null. Shares are 0 to 1; the others are bounded counts.
+function cleanCardMetric(m) {
+  if (!m || typeof m !== "object" || !CARD_UNITS.includes(m.unit) || typeof m.value !== "number" ||
+      !Number.isFinite(m.value) || m.value < 0 || m.value > (m.unit === "share" ? 1 : 1e7) ||
+      typeof m.label !== "string" || m.label.length > 80) return null;
+  return { unit: m.unit, value: m.value, label: m.label };
+}
+
+function cleanCard(c, now = Date.now()) {
+  if (!c || !CARD_STATES.includes(c.state) || typeof c.at !== "string" || !ISO_TIME.test(c.at)) return null;
+  const out = { state: c.state, at: c.at };
+  if (c.state === "snoozed") {
+    const until = typeof c.until === "string" && ISO_TIME.test(c.until) ? Date.parse(c.until) : NaN;
+    if (!(until > Date.parse(c.at)) || until - Date.parse(c.at) > SNOOZE_MAX_DAYS * 864e5 + 6e4) return null;
+    if (until <= now) return null; // an expired snooze is dropped on the next save
+    out.until = c.until;
+  }
+  const metric = cleanCardMetric(c.metric);
+  if (metric) out.metric = metric;
+  return out;
+}
+
+async function loadCards() {
+  if (cardsStore) return cardsStore;
+  const store = { version: CARDS_VERSION, accounts: {} };
+  const encrypted = readIfPresent(path.join(app.getPath("userData"), CARDS_FILE));
+  if (encrypted) {
+    try {
+      const parsed = JSON.parse((await safeStorage.decryptStringAsync(encrypted)).result);
+      if (parsed?.version !== CARDS_VERSION || !parsed.accounts || typeof parsed.accounts !== "object") throw new Error("format");
+      for (const [key, cards] of Object.entries(parsed.accounts)) {
+        if (!/^\d+$/.test(key) || !cards || typeof cards !== "object") continue;
+        const clean = {};
+        for (const [id, c] of Object.entries(cards).slice(0, CARDS_MAX)) {
+          const card = CARD_ID.test(id) ? cleanCard(c) : null;
+          if (card) clean[id] = card;
+        }
+        store.accounts[key] = clean;
+      }
+    } catch {
+      cardsNote = "Saved suggestion states could not be read, so every card starts fresh.";
+    }
+  }
+  cardsStore = store;
+  return store;
+}
+
+handle("cards", () => withCards(async () => {
+  if (!sessionUser) return { ok: false, error: signInFirst() };
+  try {
+    const store = await loadCards();
+    return { ok: true, cards: { ...(store.accounts[String(sessionUser.id)] || {}) }, note: cardsNote };
+  } catch {
+    return { ok: false, error: "Saved suggestion states could not be opened." };
+  }
+}));
+
+// Sets one card's state, or clears it with state null. The main process stamps the time itself.
+handle("card-set", (id, input) => withCards(async () => {
+  if (!sessionUser) return { ok: false, error: signInFirst() };
+  if (typeof id !== "string" || !CARD_ID.test(id)) return { ok: false, error: "Invalid card." };
+  let card = null;
+  if (input !== null) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) return { ok: false, error: "Invalid card state." };
+    const at = new Date().toISOString();
+    const days = input.state === "snoozed" ? input.days : 0;
+    if (input.state === "snoozed" && !(Number.isInteger(days) && days >= 1 && days <= SNOOZE_MAX_DAYS)) return { ok: false, error: "Invalid snooze." };
+    card = cleanCard({ state: input.state, at, until: days ? new Date(Date.now() + days * 864e5).toISOString() : undefined, metric: input.metric });
+    if (!card) return { ok: false, error: "Invalid card state." };
+  }
+  try {
+    const store = await loadCards();
+    const key = String(sessionUser.id);
+    const cards = store.accounts[key] || (store.accounts[key] = {});
+    if (card) cards[id] = card; else delete cards[id];
+    for (const [old, c] of Object.entries(cards)) if (c.state === "snoozed" && Date.parse(c.until) <= Date.now()) delete cards[old];
+    if (Object.keys(cards).length > CARDS_MAX) return { ok: false, error: "Too many saved suggestion states." };
+    await writeEncrypted(CARDS_FILE, JSON.stringify(store));
+    cardsNote = "";
+    return { ok: true, cards: { ...cards } };
+  } catch {
+    return { ok: false, error: "The suggestion state could not be saved." };
   }
 }));
 
@@ -757,6 +909,26 @@ handle("open-reading", async (id) => {
   return { ok: true };
 });
 
+// A repository, or an issue or pull request in it, on github.com. The window sends only a repository
+// name and an optional number; the URL is built here, on github.com only, and nothing else is accepted.
+// /issues/<n> also reaches a pull request: GitHub redirects it.
+function githubPageUrl(repo, number) {
+  if (typeof repo !== "string") return null;
+  const [owner, name, extra] = repo.split("/");
+  if (extra !== undefined || !REPO_NAME.test(owner || "") || !REPO_NAME.test(name || "") ||
+      [owner, name].some((part) => part === "." || part === "..")) return null;
+  if (number !== null && number !== undefined && !(Number.isInteger(number) && number >= 1 && number <= 2147483647)) return null;
+  const url = new URL(`https://github.com/${owner}/${name}${number ? `/issues/${number}` : ""}`);
+  return url.hostname === "github.com" && url.protocol === "https:" ? url.href : null;
+}
+
+handle("open-github", async (repo, number) => {
+  const url = githubPageUrl(repo, number);
+  if (!url) return { ok: false, status: 400, error: "Not a GitHub repository or number." };
+  await shell.openExternal(url);
+  return { ok: true };
+});
+
 const YEAR_QUERY = `query {
   viewer {
     createdAt
@@ -776,6 +948,9 @@ const REPO_NAME = /^[A-Za-z0-9_.-]{1,100}$/;
 const PR_FIELDS = `title state merged isDraft createdAt mergedAt closedAt additions deletions headRefName
   author { __typename login } mergedBy { login }
   reviews(first: 10) { totalCount nodes { submittedAt state author { __typename login } } }`;
+
+// When the last commit on a pull request was made, which splits time to merge into work and waiting.
+const COMMIT_FIELDS = "commits(last: 1) { nodes { commit { committedDate } } }";
 
 // Recent comments on issues and pull requests that involve the user, open or closed.
 // Search finds the threads; each thread's latest comments, reviews, and review comments are read live.
@@ -896,8 +1071,11 @@ function githubRequest(operation, args) {
       }
       break;
     }
-    case "pullRequests": {
+    case "pullRequests":
+    case "pullRequestCommits": {
       if (!Array.isArray(args) || args.length === 0 || args.length > 40) break;
+      // Commit times are their own request, so a token that cannot read commits loses only them.
+      const fieldsFor = operation === "pullRequests" ? PR_FIELDS : COMMIT_FIELDS;
       const declarations = [];
       const fields = [];
       const variables = {};
@@ -907,7 +1085,7 @@ function githubRequest(operation, args) {
         if (extra !== undefined || !REPO_NAME.test(owner) || !repo || !REPO_NAME.test(repo) ||
             !Number.isInteger(ref.number) || ref.number < 1 || ref.number > 2147483647) return null;
         declarations.push(`$o${i}: String!, $r${i}: String!, $n${i}: Int!`);
-        fields.push(`p${i}: repository(owner: $o${i}, name: $r${i}) { pullRequest(number: $n${i}) { ${PR_FIELDS} } }`);
+        fields.push(`p${i}: repository(owner: $o${i}, name: $r${i}) { pullRequest(number: $n${i}) { ${fieldsFor} } }`);
         Object.assign(variables, { [`o${i}`]: owner, [`r${i}`]: repo, [`n${i}`]: ref.number });
       }
       return { route: "/graphql", body: { query: `query (${declarations.join(", ")}) { ${fields.join("\n")} }`, variables } };

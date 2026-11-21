@@ -47,7 +47,9 @@ const initialState = {
   events: [],
   prInfo: {},
   reviewed: null,
-  prLookup: { authored: null, referenced: { total: 0, covered: 0, asked: 0, found: 0 } },
+  prLookup: { authored: null, referenced: { total: 0, covered: 0, asked: 0, found: 0 }, commits: null },
+  snapshotSaved: false,
+  cards: {},
   rateLimit: null,
   tokenMeta: null,
   footprint: null,
@@ -265,6 +267,57 @@ async function lookupPullRequests(account, refs) {
   return {
     info, total: refs.length, asked: usable.length, found: Object.keys(info).length,
   };
+}
+
+// This week's outcome numbers go to saved history when it is on. A capped search would make the week
+// look unlike the others, so that week is skipped and the card says why.
+async function saveWeeklySnapshot(account, mine) {
+  account.snapshotSaved = false;
+  const h = account.savedHistory;
+  if (account.public || !h?.enabled || !mine) return;
+  if (mine.capped) {
+    account.errors.snapshot = "This week's numbers were not saved, because the search for pull requests you opened was capped.";
+    return;
+  }
+  const snapshot = I.snapshotOf(I.summarizeOutcomes(account.prInfo, account.user.login, account.refreshedAt));
+  const result = await window.desk.saveSnapshot(snapshot).catch(() => ({ ok: false, error: "The weekly snapshot could not be saved." }));
+  if (result.ok) {
+    account.snapshotSaved = true;
+    h.week = result.week;
+  } else {
+    account.errors.snapshot = result.error;
+  }
+}
+
+// When the last commit landed on each merged pull request you opened, newest merges first. A separate
+// read, so a token that cannot see commits loses only the working-and-waiting split. Capped at
+// COMMIT_LOOKUP_LIMIT merges, in batches the main process accepts.
+const COMMIT_LOOKUP_LIMIT = 120;
+async function lookupCommitTimes(account, info, login) {
+  const me = String(login || "").toLowerCase();
+  const merged = Object.values(info).filter((pr) => pr.merged && String(pr.author || "").toLowerCase() === me)
+    .sort((a, b) => Date.parse(b.mergedAt) - Date.parse(a.mergedAt));
+  const usable = merged.slice(0, COMMIT_LOOKUP_LIMIT);
+  const out = { total: merged.length, asked: usable.length, found: 0, issue: "" };
+  for (let i = 0; i < usable.length; i += 40) {
+    const list = usable.slice(i, i + 40).map((pr) => ({ repo: pr.repo, number: pr.number }));
+    try {
+      const { data: result } = await api(account, "pullRequestCommits", list);
+      if (result?.errors?.length && !out.issue) out.issue = "GitHub returned errors for some commit reads, which can mean the token cannot read the repository's contents.";
+      list.forEach((r, j) => {
+        const at = result?.data?.[`p${j}`]?.pullRequest?.commits?.nodes?.[0]?.commit?.committedDate;
+        if (typeof at === "string" && Number.isFinite(Date.parse(at))) {
+          info[I.prKey(r.repo, r.number)].lastCommitAt = at;
+          out.found += 1;
+        }
+      });
+    } catch (error) {
+      if (error.message === "Session changed.") throw error;
+      out.issue = error.message;
+      break;
+    }
+  }
+  return out;
 }
 
 async function mapLimit(items, limit, fn) {
@@ -509,7 +562,7 @@ async function refresh() {
     });
     // Notes load once per account. Later refreshes keep the notes in memory, including unsaved edits.
     const notesTask = account.notes?.userId === user.id && !account.notes.failed ? null : window.desk.notes();
-    const [notes, year, prs, talk, authored, footprint, yearsResult, reviewedResult, notebook] = await Promise.allSettled([
+    const [notes, year, prs, talk, authored, footprint, yearsResult, reviewedResult, notebook, cardStates] = await Promise.allSettled([
       classic ? api(account, "notifications") : null,
       yearTask,
       lookupTask,
@@ -519,14 +572,20 @@ async function refresh() {
       historyTask,
       reviewedTask,
       notesTask,
+      window.desk.cards(),
     ]);
     if (account !== state) return;
     if (notesTask) account.notes = notesFrom(notebook.value, user.id);
+    // Suggestion card states belong to the signed-in account; a failed read shows every card.
+    const cardRead = cardStates.value;
+    account.cards = cardRead?.ok ? cardRead.cards : {};
     // Read last so the budget reflects this refresh. GitHub does not count this call against the limit.
     const rate = await api(account, "rateLimit").catch(() => null);
     if (account !== state) return;
 
     const errors = {};
+    if (cardRead && !cardRead.ok) errors.cards = cardRead.error;
+    else if (cardRead?.note) errors.cards = cardRead.note;
     if (feed.issue) errors.events = feed.issue;
     const notifications = Array.isArray(notes.value?.data) ? notes.value.data : null;
     if (!notifications) errors.notifications = classic
@@ -559,6 +618,14 @@ async function refresh() {
       referenced: { total: refs.length, covered: refs.length - pendingRefs.length, asked: lookup.asked, found: lookup.found },
     };
     const prInfo = { ...lookup.info, ...(mine ? mine.info : {}) };
+    const commitTimes = mine && !account.public ? await lookupCommitTimes(account, prInfo, user.login) : null;
+    prLookup.commits = commitTimes;
+    if (commitTimes && commitTimes.found < commitTimes.asked) {
+      errors.commits = `Last-commit times loaded for ${fmt(commitTimes.found)} of ${fmt(commitTimes.asked)} merged pull requests you opened${commitTimes.issue ? `. ${commitTimes.issue}` : "."}`;
+    }
+    if (commitTimes && commitTimes.asked < commitTimes.total) {
+      errors.commits = `${errors.commits ? `${errors.commits} ` : ""}Last-commit times are read for the newest ${COMMIT_LOOKUP_LIMIT} merges.`;
+    }
     // Kept apart from prInfo: these are other people's pull requests, and the PR summaries describe yours.
     const theirs = reviewedResult.value || null;
     if (!theirs) errors.reviewed = `Pull requests you reviewed did not load. ${reviewedResult.reason?.message || ""}`.trim();
@@ -622,6 +689,7 @@ async function refresh() {
       : null;
 
     Object.assign(account, { tokenUse, user, viewer, contributions, events, notifications, prLookup, prInfo, reviewed, rateLimit, footprint: footprintData, savedHistory, contributionHistory, conversations, errors, refreshedAt: new Date() });
+    await saveWeeklySnapshot(account, mine);
     if (!events.some((e) => I.repoName(e) === account.repo)) account.repo = "";
     account.lastSeen = localStorage.getItem(seenKey());
     if (!account.lastSeen && newestActivity(account)) {
@@ -672,7 +740,11 @@ function computed() {
   const collab = I.summarizeCollaboration(state.prInfo, state.reviewed?.info, state.user && state.user.login, { complete });
   // Outcome findings cover the pull requests the authored search returned, so they wait for it.
   const outcomes = a ? I.summarizeOutcomes(state.prInfo, state.user && state.user.login, state.refreshedAt) : null;
-  const observations = [...I.deriveObservations({ rhythm, sessions, prs: prPatterns, trajectory, follow, review, outcomes }), ...collab.findings];
+  // One chance budget across every check on the page, which findings and suggestions both use.
+  const chance = I.chanceBudget({ prs: prPatterns, outcomes, trajectory });
+  const observations = [...I.deriveObservations({ rhythm, sessions, prs: prPatterns, trajectory, follow, review, outcomes, chance }), ...collab.findings];
+  const h = state.savedHistory;
+  const snapshots = h?.enabled ? I.summarizeSnapshots(h.snapshots, state.snapshotSaved ? I.snapshotOf(outcomes) : null, h.week) : null;
   const footprint = state.footprint ? I.summarizeFootprint(state.footprint, state.savedHistory, state.refreshedAt) : null;
   const years = state.contributionHistory
     ? I.summarizeContributionHistory(state.contributionHistory.byYear, localDayKey(new Date()), state.viewer?.createdAt) : null;
@@ -683,15 +755,15 @@ function computed() {
   // instead of "nothing found". Events failed when none loaded and the feed reported an issue.
   const eventsLoaded = state.events.length > 0 || !state.errors.events;
   const prsLoaded = Boolean(a) || Object.keys(state.prInfo).length > 0;
-  const suggestions = I.deriveSuggestions({
+  const suggestions = I.applyCardStates(I.deriveSuggestions({
     login: state.user && state.user.login, now: state.refreshedAt,
     ev: eventsLoaded ? ev : null, sessions: eventsLoaded ? sessions : null,
     follow: eventsLoaded && prsLoaded ? follow : null,
     prPatterns: prsLoaded ? prPatterns : null, review: a ? review : null, prInfo: a ? state.prInfo : null,
     trajectory, notes, notesNote: state.errors.notifications || "", footprint, conversations: state.conversations, token,
-    collab: state.reviewed ? collab : null, outcomes, observations,
-  });
-  return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, outcomes, observations, footprint, suggestions };
+    collab: state.reviewed ? collab : null, outcomes, observations, chance,
+  }), state.public ? {} : state.cards, state.refreshedAt);
+  return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, outcomes, observations, footprint, suggestions, chance, snapshots };
 }
 
 function renderOverview(c) {
@@ -1078,7 +1150,10 @@ function pullRequestInsights(pr) {
 
 const sourceTag = (name) => `<span class="src">${esc(name)}</span>`;
 
-function patternInsights({ ev, pr, rhythm, sessions, prPatterns, trajectory, follow, review, collab, outcomes, observations, suggestions }) {
+// The five strongest findings show first: warnings, then those that passed a chance check.
+const FINDINGS_SHOWN = 5;
+
+function patternInsights({ ev, pr, rhythm, sessions, prPatterns, trajectory, follow, review, collab, outcomes, observations, suggestions, chance, snapshots }) {
   const sources = [
     rhythm ? "the contribution year" : "",
     ev.total ? `${fmt(ev.total)} loaded events` : "",
@@ -1087,13 +1162,19 @@ function patternInsights({ ev, pr, rhythm, sessions, prPatterns, trajectory, fol
   const caption = sources.length ? `Derived from ${new Intl.ListFormat(undefined, { type: "conjunction" }).format(sources)}` : "No data loaded";
   const notice = [state.errors.year, state.errors.events, state.errors.authored, state.errors.reviewed, state.errors.prs].filter(Boolean).join(" ");
 
+  const finding = (o) => {
+    // A finding that a shown suggestion acts on links to it.
+    const link = o.id && suggestions.links[o.id];
+    const go = link ? ` <button type="button" class="link jump" data-suggestion="${esc(link.id)}">Suggestion: ${esc(link.title)} →</button>` : "";
+    const tag = o.confirmed ? '<span class="src confirmed">Beyond chance</span>' : "";
+    return `<li class="${esc(o.tone)}"${o.id ? ` data-finding="${esc(o.id)}" tabindex="-1"` : ""}><span class="dot"></span><div><div class="t">${esc(o.title)}</div><div class="d">${esc(o.detail)}</div>${sourceTag(o.source)}${tag}${go}</div></li>`;
+  };
+  // The rest stay one click away. A jump from a suggestion opens the list first (see jumpTo).
+  const top = observations.slice(0, FINDINGS_SHOWN);
+  const rest = observations.slice(FINDINGS_SHOWN);
   const findings = observations.length
-    ? `<ul class="attention">${observations.map((o) => {
-      // A finding that a shown suggestion acts on links to it.
-      const link = o.id && suggestions.links[o.id];
-      const go = link ? ` <button type="button" class="link jump" data-suggestion="${esc(link.id)}">Suggestion: ${esc(link.title)} →</button>` : "";
-      return `<li class="${esc(o.tone)}"${o.id ? ` data-finding="${esc(o.id)}" tabindex="-1"` : ""}><span class="dot"></span><div><div class="t">${esc(o.title)}</div><div class="d">${esc(o.detail)}</div>${sourceTag(o.source)}${go}</div></li>`;
-    }).join("")}</ul>`
+    ? `<ul class="attention">${top.map(finding).join("")}</ul>${rest.length ? `<details class="more-findings"><summary>Show all ${fmt(observations.length)} findings</summary><ul class="attention">${rest.map(finding).join("")}</ul></details>` : ""}
+      ${chanceNoteLine(chance)}`
     : '<p class="note">Nothing crossed a reporting threshold in the loaded data. Each finding needs a minimum sample before it appears.</p>';
 
   let rhythmCard = `<p class="note">${esc(state.errors.year || "The contribution calendar did not load.")}</p>`;
@@ -1135,8 +1216,8 @@ function patternInsights({ ev, pr, rhythm, sessions, prPatterns, trajectory, fol
       <table class="compare"><caption class="note">Loaded merges by group</caption>
         <thead><tr><th scope="col">Group</th><th scope="col">Merged</th><th scope="col">Median to merge</th><th scope="col">Slowest quarter over</th><th scope="col">Zero reviews</th><th scope="col">Median lines</th></tr></thead>
         <tbody>${groups.map(([name, g]) => `<tr><th scope="row">${esc(name)}</th><td>${fmt(g.count)}</td><td>${esc(hoursLabel(g.medianHours))}</td><td>${g.p75Hours != null ? esc(hoursLabel(g.p75Hours)) : "—"}</td><td>${fmt(g.unreviewed)} / ${fmt(g.count)}</td><td>${fmt(Math.round(g.medianSize))}</td></tr>`).join("")}</tbody></table>
-      <p class="note">${chanceSummary(prPatterns)}</p>
-      <p class="note">Agent branches are matched by prefix such as <code>claude/</code> or <code>codex/</code>. Size halves appear with six or more merges, the slowest quarter with four in a group, and the size correlation with eight. Chance checks deal the same merges out at random 999 times, so groups of three can never pass the 5% bar.</p>`
+      <p class="note">${chanceSummary(prPatterns, chance)}</p>
+      <p class="note">Agent branches are matched by prefix such as <code>claude/</code> or <code>codex/</code>. Size halves appear with six or more merges, the slowest quarter with four in a group, and the size correlation with eight. Chance checks deal the same merges out at random 999 times, and every check on the page shares one bar (see What stands out), so small groups rarely pass.</p>`
     : `<p class="note">${pr.total ? "No merged pull requests in the loaded details." : "No pull request details are loaded."}</p>`;
 
   return insightSection("insight-patterns", "Patterns", caption, `
@@ -1152,40 +1233,90 @@ function patternInsights({ ev, pr, rhythm, sessions, prPatterns, trajectory, fol
       <article class="card"><h4>Merge patterns</h4>${sourceTag("Pull requests")}${prCard}</article>
       <article class="card"><h4>Trajectory</h4>${sourceTag("Contribution year")}${trajectoryCard(trajectory)}</article>
       <article class="card"><h4>Follow-through</h4>${sourceTag("Recent events")}${followCard(follow)}</article>
-      <article class="card"><h4>After the merge</h4>${sourceTag("Pull requests you opened")}${reworkCard(outcomes)}</article>
-      <article class="card"><h4>Open work</h4>${sourceTag("Pull requests you opened")}${openWorkCard(outcomes)}</article>
+      <article class="card"><h4>After the merge</h4>${sourceTag("Pull requests you opened")}${reworkCard(outcomes, chance)}</article>
+      <article class="card"><h4>Open work</h4>${sourceTag("Pull requests you opened")}${openWorkCard(outcomes, chance)}</article>
+      <article class="card"><h4>Working and waiting</h4>${sourceTag("Pull requests you opened")}${workWaitCard(outcomes, chance)}</article>
+      <article class="card"><h4>Week by week</h4>${sourceTag("Saved history")}${snapshotCard(snapshots)}</article>
       <article class="card insight-wide"><h4>Review turnaround</h4>${sourceTag("Pull requests you opened")}${reviewCard(review, pr)}</article>
       <article class="card insight-wide"><h4>Review partners</h4>${sourceTag("Pull requests you opened and reviewed")}${partnersCard(collab)}</article>
     </div>`);
 }
 
+// Whether a chance check passed the page's shared bar; without a budget, 5% alone.
+const beyond = (chance, key, p) => (chance ? Boolean(chance.cleared[key]) : p != null && p < 0.05);
+
+// How many chance checks ran on the page and how many passed the shared bar, in one line.
+function chanceNoteLine(chance) {
+  if (!chance || !chance.tested) return "";
+  const passed = chance.entries.filter((t) => t.clear);
+  const list = passed.length ? ` Passed: ${passed.map((t) => `${t.label.toLowerCase()} (${oftenPct(t.p)})`).join("; ")}.` : "";
+  return `<p class="note">${fmt(chance.tested)} chance ${chance.tested === 1 ? "check ran" : "checks ran"} on this page and ${fmt(passed.length)} passed. They share one bar (Holm's method), so with no real effect anywhere the chance of any finding reading "beyond chance" stays near 5%: the strongest result must beat ${esc(String(Number((5 / chance.tested).toFixed(2))))}%, the next a little less strict, and so on.${esc(list)}</p>`;
+}
+
 // The merge-pattern chance checks in one sentence each, or what they still need.
-function chanceSummary(p) {
+function chanceSummary(p, chance) {
   const out = [];
   if (p.agentGapP != null) {
-    out.push(p.agentGapP < 0.05
+    out.push(beyond(chance, "agent-gap", p.agentGapP)
       ? `Agent-branch merge times differ from the rest beyond chance: random regroupings match the gap ${p.agentGapP < 0.01 ? "under 1%" : pct(p.agentGapP)} of the time.`
       : `Agent-branch merge times: random regroupings match the gap ${pct(p.agentGapP)} of the time, so treat it as unconfirmed.`);
   }
   if (p.agentReviewP != null && p.agent.unreviewed !== p.other.unreviewed) {
-    out.push(`The gap in zero-review merges between agent branches and the rest ${p.agentReviewP < 0.05 ? "is beyond chance" : "is within chance"} (random regroupings match it ${p.agentReviewP < 0.01 ? "under 1%" : pct(p.agentReviewP)} of the time).`);
+    out.push(`The gap in zero-review merges between agent branches and the rest ${beyond(chance, "agent-review", p.agentReviewP) ? "is beyond chance" : "is within chance"} (random regroupings match it ${p.agentReviewP < 0.01 ? "under 1%" : pct(p.agentReviewP)} of the time).`);
   }
   const c = p.sizeVsTime;
-  if (c) out.push(`Size against time to merge: rank correlation <strong>ρ ${esc(c.rho.toFixed(2))}</strong> across ${fmt(c.n)} merges, ${c.p < 0.05 ? "beyond chance" : "within chance"} (shuffles match it ${c.p < 0.01 ? "under 1%" : pct(c.p)} of the time).`);
+  if (c) out.push(`Size against time to merge: rank correlation <strong>ρ ${esc(c.rho.toFixed(2))}</strong> across ${fmt(c.n)} merges, ${beyond(chance, "size-time", c.p) ? "beyond chance" : "within chance"} (shuffles match it ${c.p < 0.01 ? "under 1%" : pct(c.p)} of the time).`);
   else out.push(`A size correlation needs 8 timed merges; ${fmt(p.merged)} ${p.merged === 1 ? "is" : "are"} loaded.`);
   return out.join(" ");
 }
 
 const oftenPct = (p) => (p < 0.01 ? "under 1%" : pct(p));
+
+// Time to merge split at the last commit: work still landing, then finished work waiting.
+function workWaitCard(o, chance) {
+  if (!o) return noOutcomes();
+  const c = state.prLookup.commits;
+  if (!o.merged) return `<p class="note">You merged no pull requests in the last ${AUTHORED_DAYS} days that this token can read.</p>`;
+  const s = o.split;
+  const read = c ? `Last-commit times loaded for ${fmt(c.found)} of ${fmt(c.asked)} merges${c.asked < c.total ? ` (the newest ${fmt(c.asked)} of ${fmt(c.total)})` : ""}.` : "Last-commit times were not requested.";
+  if (!s) {
+    return `<p class="note">${esc(state.errors.commits || read)} The split needs six merges with a last-commit time; ${fmt(o.commits.read)} ${o.commits.read === 1 ? "has" : "have"} one.</p>`;
+  }
+  const w = s.waitingLoad;
+  const load = w ? ` Open work against the waiting part: <strong>ρ ${esc(w.rho.toFixed(2))}</strong> across ${fmt(w.n)} merges, ${beyond(chance, "waiting", w.p) ? "beyond chance" : "within chance"} (shuffles match it ${oftenPct(w.p)} of the time).` : "";
+  return `
+    ${stats([["Open to last commit", hoursLabel(s.workingHours)], ["Last commit to merge", hoursLabel(s.waitingHours)], ["Open hours after the last commit", s.waitingShare != null ? pct(s.waitingShare) : "—"]])}
+    ${bars(s.idle.map((x) => [`${x.repo.split("/").pop()} #${x.number}`, Math.round(x.waiting)]), { suffix: " h" })}
+    <p class="note">The longest waits after the last commit, in hours.${load}</p>
+    <p class="note">Medians across ${fmt(s.n)} merges. A last commit made before the pull request opened counts as no work time. ${esc(read)} A last commit is not always the end of the work: a review can still ask for changes, and a rebase rewrites commit times.</p>`;
+}
+
+// The saved weekly numbers: where each started, where it was about four weeks ago, and where it is now.
+function snapshotCard(snap) {
+  const h = state.savedHistory;
+  if (state.public) return '<p class="note">Weekly numbers need a token. A username alone does not show whose saved history to open.</p>';
+  if (!h || !h.enabled) return '<p class="note">Turn on saved history in Data &amp; access to keep one snapshot a week of your merge time, follow-up fixes, open work, and waiting. Changes appear from the second week.</p>';
+  if (!snap || snap.weeks < 2) {
+    return `<p class="note">${state.errors.snapshot ? `${esc(state.errors.snapshot)} ` : ""}The first snapshot is saved${snap?.latest ? ` for the week of ${esc(snap.latest)}` : ""}. Changes appear once a second week is saved.</p>`;
+  }
+  const rows = snap.rows.filter((r) => r.latest);
+  const day = (w) => new Date(`${w}T00:00:00Z`).toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
+  const cell = (r, p) => (p ? `${esc(r.format(p.value))}<span class="week">${esc(day(p.week))}</span>` : "—");
+  return `
+    <table class="compare"><caption class="note">${fmt(snap.weeks)} saved weeks, from the week of ${esc(day(snap.first))}</caption>
+      <thead><tr><th scope="col">Number</th><th scope="col">First saved</th><th scope="col">About 4 weeks ago</th><th scope="col">Now</th></tr></thead>
+      <tbody>${rows.map((r) => `<tr><th scope="row">${esc(r.label)}</th><td>${cell(r, r.first)}</td><td>${cell(r, r.back)}</td><td>${cell(r, r.latest)}</td></tr>`).join("")}</tbody></table>
+    <p class="note">${state.errors.snapshot ? `${esc(state.errors.snapshot)} ` : ""}Each week's numbers cover the ${AUTHORED_DAYS} days before it, so neighbouring weeks share most of their pull requests and a change you make shows up gradually. Compare points at least four weeks apart. Weeks when the search for your pull requests was capped are not saved.</p>`;
+}
 const noOutcomes = () => `<p class="note">${esc(state.errors.authored || "The search for pull requests you opened did not load, so there are no outcomes to compare.")}</p>`;
 
 // Whether merges needed a follow-up fix, and which kind of merge needed one more often.
-function reworkCard(o) {
+function reworkCard(o, budget) {
   if (!o) return noOutcomes();
   const r = o.rework;
   if (!r.merged) return `<p class="note">You merged no pull requests in the last ${AUTHORED_DAYS} days that this token can read.</p>`;
   const ratio = (x) => `${fmt(x.followed)} / ${fmt(x.n)}`;
-  const chance = (g) => (g.p == null ? "—" : `${g.clear ? "Beyond chance" : "Within chance"} (${oftenPct(g.p)})`);
+  const chance = (g) => (g.p == null ? "—" : `${(budget ? beyond(budget, `rework:${g.key}`, g.p) : g.clear) ? "Beyond chance" : "Within chance"} (${oftenPct(g.p)})`);
   const table = r.groups.length ? `<table class="compare"><caption class="note">Settled merges followed by a fix, by group</caption>
       <thead><tr><th scope="col">Group</th><th scope="col">Followed</th><th scope="col">Against</th><th scope="col">Followed</th><th scope="col">Random regroupings match</th></tr></thead>
       <tbody>${r.groups.map((g) => `<tr><th scope="row">${esc(g.a.label)}</th><td>${ratio(g.a)}</td><td>${esc(g.b.label)}</td><td>${ratio(g.b)}</td><td>${esc(chance(g))}</td></tr>`).join("")}</tbody></table>` : "";
@@ -1193,11 +1324,11 @@ function reworkCard(o) {
     ${stats([["Followed by a fix", r.settled ? `${fmt(r.followed)} / ${fmt(r.settled)}` : "—"], ["Median until the fix", r.followed ? hoursLabel(r.medianHours) : "—"], ["Fixes naming the merge", r.followed ? `${fmt(r.named)} / ${fmt(r.followed)}` : "—"]])}
     ${table}
     <p class="note">A settled merge is one you opened that merged at least ${I.REWORK_HOURS / 24} days ago${r.merged > r.settled ? `; ${fmt(r.merged - r.settled)} newer ${r.merged - r.settled === 1 ? "one is" : "ones are"} left out` : ""}. It counts as followed when a loaded pull request in the same repository, titled as a fix or revert, opened within ${I.REWORK_HOURS / 24} days of it. A follow-up that names a merge by number or quoted title counts against that merge, any other against the nearest merge before it. Titles are a proxy, and fixes opened by people whose pull requests did not load are missed.
-      ${r.tested ? `Groups are compared once each side has four merges. ${fmt(r.tested)} ${r.tested === 1 ? "comparison ran" : "comparisons ran"} on the same merges, so each must be matched by fewer than ${esc(String(Number((r.bar * 100).toFixed(2))))}% of random regroupings to count as beyond chance.` : "Groups are compared once each side has four merges and two merges were followed."}</p>`;
+      ${r.tested ? `Groups are compared once each side has four merges. ${fmt(r.tested)} ${r.tested === 1 ? "comparison ran" : "comparisons ran"} on the same merges${budget ? `, and each shares the page's bar with the other ${fmt(budget.tested - r.tested)} chance ${budget.tested - r.tested === 1 ? "check" : "checks"}` : `, so each must be matched by fewer than ${esc(String(Number((r.bar * 100).toFixed(2))))}% of random regroupings to count as beyond chance`}.` : "Groups are compared once each side has four merges and two merges were followed."}</p>`;
 }
 
 // How much the user keeps open at once, and how open pull requests compare with their own merges.
-function openWorkCard(o) {
+function openWorkCard(o, chance) {
   if (!o) return noOutcomes();
   if (!o.authored) return `<p class="note">You opened no pull requests in the last ${AUTHORED_DAYS} days that this token can read.</p>`;
   const f = o.flow;
@@ -1208,7 +1339,7 @@ function openWorkCard(o) {
       <tbody><tr><th scope="row">${f.split.cut === 0 ? "None" : `${esc(count(f.split.cut))} or fewer`}</th><td>${fmt(f.split.quiet.n)}</td><td>${esc(hoursLabel(f.split.quiet.medianHours))}</td></tr>
         <tr><th scope="row">${f.split.cut === 0 ? "One or more" : `More than ${esc(count(f.split.cut))}`}</th><td>${fmt(f.split.busy.n)}</td><td>${esc(hoursLabel(f.split.busy.medianHours))}</td></tr></tbody></table>` : "";
   const load = f.load
-    ? `Open work against time to merge: rank correlation <strong>ρ ${esc(f.load.rho.toFixed(2))}</strong> across ${fmt(f.load.n)} merges, ${f.load.p < 0.05 ? "beyond chance" : "within chance"} (shuffles match it ${oftenPct(f.load.p)} of the time).`
+    ? `Open work against time to merge: rank correlation <strong>ρ ${esc(f.load.rho.toFixed(2))}</strong> across ${fmt(f.load.n)} merges, ${beyond(chance, "open-work", f.load.p) ? "beyond chance" : "within chance"} (shuffles match it ${oftenPct(f.load.p)} of the time).`
     : `A correlation between open work and time to merge needs 8 merges with differing counts; ${fmt(o.merged)} ${o.merged === 1 ? "is" : "are"} loaded.`;
   const l = o.late;
   const late = l && l.slow.n && l.quick.n
@@ -1425,7 +1556,26 @@ const SUGGESTION_STATUS = {
   clear: ["✓", "ok", "Nothing found"],
   short: ["…", "muted", "Not enough data"],
   unavailable: ["✕", "no", "Source unavailable"],
+  snoozed: ["◷", "muted", "Snoozed"],
+  dismissed: ["–", "muted", "Dismissed"],
 };
+const shortDate = (iso) => new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+
+// What a card's owner can do with it. Pinned cards (token access) offer nothing to set them aside.
+function cardActions(s) {
+  if (state.public || s.pinned) return "";
+  const metric = s.metric ? ` data-metric="1"` : "";
+  if (s.trying) {
+    const m = s.metric;
+    const then = s.trying.then && s.trying.now ? `. ${esc(m.label)}: ${esc(s.trying.then)} then, ${esc(s.trying.now)} now` : "";
+    return `<div class="card-actions"><span class="trying-since">Trying since ${esc(shortDate(s.trying.at))}${then}</span>
+      <button type="button" class="link" data-card="${esc(s.id)}" data-state="">Stop trying</button></div>`;
+  }
+  return `<div class="card-actions">
+    <button type="button" class="link" data-card="${esc(s.id)}" data-state="trying"${metric}>Trying this</button>
+    ${I.SNOOZE_DAYS.map((d) => `<button type="button" class="link" data-card="${esc(s.id)}" data-state="snoozed" data-days="${d}">Snooze ${d} days</button>`).join("")}
+    <button type="button" class="link" data-card="${esc(s.id)}" data-state="dismissed"${metric}>Dismiss</button></div>`;
+}
 const readingHost = (url) => new URL(url).hostname.replace(/^www\./, "");
 
 // Text segments are [text, ...reading ids]; each cited id becomes a numbered button that opens the source.
@@ -1445,19 +1595,81 @@ function suggestionCard(s) {
   const also = s.also.map((text) => `<p class="also">${esc(text)}</p>`).join("");
   const from = s.patterns.length ? `<p class="basis">From Patterns: ${s.patterns.map((f) =>
     `<button type="button" class="link" data-finding="${esc(f.id)}">${esc(f.title)}</button>`).join(" · ")}</p>` : "";
-  return `<article class="card suggestion ${esc(s.tone)}" id="suggestion-${esc(s.id)}" tabindex="-1">
+  const back = s.returned ? `<p class="returned">Back after you dismissed it on ${esc(shortDate(s.returned.at))}: ${esc(s.returned.label.toLowerCase())} was ${esc(s.returned.then)}, now ${esc(s.returned.now)}.</p>` : "";
+  return `<article class="card suggestion ${esc(s.tone)}${s.trying ? " is-trying" : ""}" id="suggestion-${esc(s.id)}" tabindex="-1">
     <div class="suggestion-tags"><span class="src area">${esc(s.area)}</span>${sourceTag(s.source)}${s.confirmed ? '<span class="src confirmed" title="The gap or correlation behind this suggestion passed its chance check.">Beyond chance</span>' : ""}</div>
     <h4>${esc(s.title)}</h4>
+    ${back}
     ${s.basis ? `<p class="basis">Based on ${esc(s.basis)}</p>` : ""}
     ${from}
     <dl class="suggestion-body">
       <dt>Seen</dt><dd>${esc(s.seen)}${also}</dd>
       ${s.why.length ? `<dt>Why</dt><dd>${citedText(s.why, numbers)}</dd>` : ""}
       <dt>Try</dt><dd>${citedText(s.act, numbers)}</dd>
-      ${s.targets.length ? `<dt>Where</dt><dd><ul class="targets">${s.targets.map((t) => `<li>${esc(t)}</li>`).join("")}</ul></dd>` : ""}
+      ${s.targets.length ? `<dt>Where</dt><dd><ul class="targets">${s.targets.map((t, i) => `<li>${whereLine(t, s.refs?.[i])}</li>`).join("")}</ul></dd>` : ""}
     </dl>
     ${reading ? `<h5>Further reading</h5><ol class="reading">${reading}</ol>` : ""}
+    ${cardActions(s)}
   </article>`;
+}
+
+// A Where line whose leading name opens on github.com: "owner/repo #12" or "owner/repo".
+// Lines that name a branch or a person stay text, apart from the repository they mention.
+function whereLine(text, ref) {
+  if (!ref) return esc(text);
+  const label = ref.number ? `${ref.repo} #${ref.number}` : ref.repo;
+  const at = text.indexOf(label);
+  if (at < 0) return esc(text);
+  const button = `<button type="button" class="link where-link" data-open-repo="${esc(ref.repo)}"${ref.number ? ` data-open-number="${ref.number}"` : ""} title="${esc(`Open ${label} on github.com`)}">${esc(label)}</button>`;
+  return `${esc(text.slice(0, at))}${button}${esc(text.slice(at + label.length))}`;
+}
+
+// Cards being tried, with the number each was measured by when you started and now.
+function tryingPanel(list) {
+  if (!list.length) return "";
+  const row = (t) => {
+    const change = t.then && t.now ? `${esc(t.label)}: ${esc(t.then)} → <strong>${esc(t.now)}</strong>${t.better == null ? "" : t.better ? " (lower)" : t.then === t.now ? " (no change)" : " (not lower yet)"}` : t.label ? `${esc(t.label)} is not measurable in the loaded data yet.` : "No number to follow for this card.";
+    const where = t.showing ? "" : ` <span class="muted small">· ${t.status === "clear" ? "No longer suggested" : esc(SUGGESTION_STATUS[t.status]?.[2] || "")}</span>`;
+    return `<li><div><div>${esc(t.title)}${where}</div><div class="d">Since ${esc(shortDate(t.at))}. ${change}</div></div>
+      <button type="button" class="link" data-card="${esc(t.id)}" data-state="">Stop</button></li>`;
+  };
+  return `<article class="card trying-panel"><h4>Trying</h4><ul class="cap">${list.map(row).join("")}</ul>
+    <p class="note">Each number covers the loaded window, the last ${AUTHORED_DAYS} days for pull requests, so a change you made shows up gradually as older work leaves the window.</p></article>`;
+}
+
+// Snoozed and dismissed cards, each with an undo.
+function setAsideList(snoozed, dismissed) {
+  const all = [...snoozed.map((x) => [x, `Snoozed until ${shortDate(x.until)}`]), ...dismissed.map((x) => [x, `Dismissed ${shortDate(x.dismissedAt)}`])];
+  if (!all.length) return "";
+  return `<details class="card set-aside"><summary>Set aside: ${fmt(all.length)}</summary><ul class="cap">${all.map(([x, label]) =>
+    `<li><div><div>${esc(x.title)} <span class="muted small">· ${esc(label)}</span></div></div><button type="button" class="link" data-card="${esc(x.id)}" data-state="">Show again</button></li>`).join("")}</ul>
+    <p class="note">A dismissed card comes back on its own when the number it was measured by gets clearly worse. The token-access warning cannot be set aside.</p></details>`;
+}
+
+// Saves a card's state in the main process. Trying and dismissing record the card's number now.
+async function setCardState(id, next, days) {
+  const account = state;
+  if (account.public) return;
+  const shown = computed().suggestions;
+  const item = shown.items.find((i) => i.id === id) || shown.checked.find((i) => i.id === id);
+  const input = next ? { state: next, ...(next === "snoozed" ? { days } : {}), ...(item?.metric ? { metric: item.metric } : {}) } : null;
+  let result;
+  try {
+    result = await window.desk.setCard(id, input);
+  } catch {
+    result = { ok: false, error: "The suggestion state could not be saved." };
+  }
+  if (account !== state) return;
+  if (result.ok) {
+    state.cards = result.cards;
+    delete state.errors.cards;
+  } else {
+    state.errors.cards = result.error;
+  }
+  renderAll();
+  // Keep keyboard focus near the card: on it if it is still shown, else on the Set aside list.
+  const target = document.getElementById(`suggestion-${id}`) || document.querySelector("#suggestions .set-aside summary");
+  if (target) target.focus({ preventScroll: false });
 }
 
 function renderSuggestions(c) {
@@ -1475,7 +1687,10 @@ function renderSuggestions(c) {
   $("suggestions").innerHTML = `
     ${notice ? `<p class="insight-notice">${esc(notice)}</p>` : ""}
     <p class="msg error" id="reading-status" role="status"></p>
+    ${state.errors.cards ? `<p class="insight-notice">${esc(state.errors.cards)}</p>` : ""}
+    ${tryingPanel(c.suggestions.trying || [])}
     ${items.length ? `<div class="grid suggestion-grid">${items.map(suggestionCard).join("")}</div>` : ""}
+    ${setAsideList(c.suggestions.snoozed || [], c.suggestions.dismissed || [])}
     <details class="card checked">
       <summary>What was checked: ${fmt(items.length)} of ${fmt(checked.length)} suggested</summary>
       <ul class="cap">${rows}</ul>
@@ -1573,7 +1788,7 @@ function renderMeta(c) {
 
 const OPERATION_LABELS = {
   profile: "Profile", events: "Activity stream", notifications: "Notifications", year: "Contribution year",
-  pullRequests: "Pull request details", authoredPullRequests: "Pull requests you opened", reviewedPullRequests: "Pull requests you reviewed",
+  pullRequests: "Pull request details", pullRequestCommits: "Last-commit times", authoredPullRequests: "Pull requests you opened", reviewedPullRequests: "Pull requests you reviewed",
   conversations: "Conversations", rateLimit: "Rate-limit budget", contributionHistory: "Contribution history",
   ownedRepos: "Repository list", traffic: "Repository traffic", stargazers: "Star dates",
 };
@@ -2242,6 +2457,8 @@ $("insights").addEventListener("click", (event) => {
 function jumpTo(selector) {
   const target = document.querySelector(selector);
   if (!target) return;
+  const folded = target.closest("details");
+  if (folded) folded.open = true;
   target.scrollIntoView({ block: "start" });
   target.focus({ preventScroll: true });
 }
@@ -2252,6 +2469,22 @@ $("insights").addEventListener("click", (event) => {
   jumpTo(`#suggestion-${CSS.escape(button.dataset.suggestion)}`);
 });
 $("suggestions").addEventListener("click", async (event) => {
+  const page = event.target.closest("[data-open-repo]");
+  if (page) {
+    const number = page.dataset.openNumber ? Number(page.dataset.openNumber) : null;
+    let opened = false;
+    try {
+      opened = (await window.desk.openGitHub(page.dataset.openRepo, number)).ok;
+    } catch { /* The system browser could not be opened. */ }
+    const status = $("reading-status");
+    if (status) status.textContent = opened ? "" : `Could not open ${page.textContent} in your browser.`;
+    return;
+  }
+  const card = event.target.closest("[data-card]");
+  if (card) {
+    await setCardState(card.dataset.card, card.dataset.state, Number(card.dataset.days) || 0);
+    return;
+  }
   const finding = event.target.closest("[data-finding]");
   if (finding) {
     state.insight = "patterns";

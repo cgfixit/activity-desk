@@ -474,3 +474,62 @@ test("suggests a limit on open work only when it tracks time to merge beyond cha
   // Open work that never varies has no correlation, and nothing to suggest.
   assert.equal(status(insights.summarizeOutcomes(Object.fromEntries(alone), "me", outcomeNow)), "clear");
 });
+
+test("holds every chance check on the page to one Holm bar", () => {
+  const prs = { agentGapP: 0.004, agentReviewP: 0.03, sizeVsTime: { p: 0.001, rho: 0.5, n: 20 } };
+  const outcomes = { flow: { load: { p: 0.2 } }, late: null, split: null, rework: { groups: [] } };
+  const chance = insights.chanceBudget({ prs, outcomes });
+  assert.equal(chance.tested, 4);
+  assert.deepEqual(chance.entries.map((t) => [t.key, t.clear]), [["size-time", true], ["agent-gap", true], ["agent-review", false], ["open-work", false]]);
+  // 0.03 passes alone at 5% but not at 5% / 2 after two smaller results.
+  assert.equal(chance.entries[2].bar, 0.025);
+  assert.match(insights.deriveObservations({ prs: { ...prs, agent: { count: 3, unreviewed: 3, medianHours: 1 }, other: { count: 3, unreviewed: 0, medianHours: 1 }, merged: 0 }, chance })
+    .find((o) => o.id === "agent-skip-review").detail, /does not clear the bar shared by every chance check/);
+});
+
+test("splits time to merge at the last commit and summarizes saved weeks", () => {
+  const info = {};
+  for (let i = 0; i < 6; i += 1) {
+    const created = Date.parse("2026-03-01T00:00:00Z") + i * 864e5;
+    info[`me/r#${i}`] = { title: `Change ${i}`, repo: "me/r", number: i + 1, author: "me", merged: true, state: "MERGED",
+      createdAt: new Date(created).toISOString(), mergedAt: new Date(created + 10 * 36e5).toISOString(),
+      // Work for 2 hours, then 8 hours waiting; the first one's last commit predates the pull request.
+      lastCommitAt: new Date(created + (i ? 2 : -5) * 36e5).toISOString(), additions: 1, deletions: 0, reviews: 0 };
+  }
+  const o = insights.summarizeOutcomes(info, "me", "2026-04-01T00:00:00Z");
+  assert.equal(o.split.n, 6);
+  assert.equal(o.split.workingHours, 2);
+  assert.equal(o.split.waitingHours, 8);
+  assert.equal(o.split.waitingShare, (8 * 5 + 10) / 60);
+  assert.ok(insights.deriveObservations({ outcomes: o }).some((f) => f.id === "merges-wait-after-work"));
+  const snap = insights.summarizeSnapshots({ "2026-02-02": { medianMergeHours: 30 }, "2026-03-02": { medianMergeHours: 20 }, junk: { merged: 1 } },
+    insights.snapshotOf(o), "2026-03-30");
+  const row = snap.rows.find((r) => r.key === "medianMergeHours");
+  assert.deepEqual([snap.weeks, row.first.value, row.back.value, row.latest.value], [3, 30, 20, 10]);
+});
+
+test("sorts suggestions by card state and brings a dismissed card back when its number gets worse", () => {
+  const item = (id, metric) => ({ id, title: id, metric, targets: [], refs: [], also: [], why: [], act: [] });
+  const suggestions = {
+    items: [item("a", { unit: "share", value: 0.2, label: "A" }), item("b", { unit: "share", value: 0.7, label: "B" }),
+      item("c", null), item("d", { unit: "count", value: 3, label: "D" }), item("fine-grained-token", null)],
+    checked: ["a", "b", "c", "d", "fine-grained-token", "e"].map((id) => ({ id, title: id, status: id === "e" ? "clear" : "shown",
+      metric: id === "e" ? { unit: "hours", value: 5, label: "E" } : undefined })),
+    links: { fa: { id: "c" }, fb: { id: "a" } },
+  };
+  const now = "2026-11-21T00:00:00Z";
+  const r = insights.applyCardStates(suggestions, {
+    a: { state: "trying", at: "2026-11-01T00:00:00Z", metric: { unit: "share", value: 0.4, label: "A" } },
+    b: { state: "dismissed", at: "2026-11-10T00:00:00Z", metric: { unit: "share", value: 0.3, label: "B" } }, // 30% → 70%: back
+    c: { state: "snoozed", at: "2026-11-20T00:00:00Z", until: "2026-11-27T00:00:00Z" },
+    d: { state: "dismissed", at: "2026-11-10T00:00:00Z", metric: { unit: "count", value: 2, label: "D" } }, // 2 → 3: not enough
+    e: { state: "trying", at: "2026-11-01T00:00:00Z", metric: { unit: "hours", value: 30, label: "E" } }, // no longer shown
+    "fine-grained-token": { state: "dismissed", at: "2026-11-10T00:00:00Z" },
+  }, now);
+  assert.deepEqual(r.items.map((i) => i.id), ["a", "b", "fine-grained-token"]);
+  assert.deepEqual([r.items[0].trying.then, r.items[0].trying.now], ["40%", "20%"]);
+  assert.deepEqual([r.items[1].returned.then, r.items[1].returned.now], ["30%", "70%"]);
+  assert.deepEqual([r.snoozed.map((x) => x.id), r.dismissed.map((x) => x.id)], [["c"], ["d"]]);
+  assert.deepEqual(r.trying.map((t) => [t.id, t.showing, t.then, t.now, t.better]), [["a", true, "40%", "20%", true], ["e", false, "30 h", "5.0 h", true]]);
+  assert.deepEqual(Object.keys(r.links), ["fb"]);
+});
