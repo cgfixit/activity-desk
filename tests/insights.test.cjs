@@ -309,3 +309,70 @@ test("joins what a fine-grained and a classic token each returned for one accoun
   assert.match(paired.title, /Narrow the classic token/);
   assert.equal(insights.deriveSuggestions({ token: { kind: "classic", write: [], paired: true } }).items.some((s) => s.id === "fine-grained-token"), false);
 });
+
+test("checks group gaps and size correlations against random regrouping", () => {
+  // Three tied values per group: a median gap would match every regrouping, so ranks are used.
+  const at = (h) => new Date(Date.parse("2026-03-01T00:00:00Z") + h * 36e5).toISOString();
+  const merged = (n, ref, hours, lines) => [`me/app#${n}`, { title: "t", repo: "me/app", number: n, merged: true, state: "MERGED", headRef: ref,
+    reviews: ref.startsWith("claude/") ? 0 : 1, createdAt: at(0), mergedAt: at(hours), additions: lines, deletions: 0 }];
+  const small = insights.summarizePrPatterns(Object.fromEntries([1, 2, 3].map((n) => merged(n, "claude/a", 1, 10)).concat([4, 5, 6].map((n) => merged(n, "fix/b", 10, 10)))));
+  assert.ok(small.agentGapP > 0.05 && small.agentGapP < 0.2, `3 v 3 separates in 2 of 20 splits, got ${small.agentGapP}`);
+  assert.match(insights.deriveObservations({ prs: small }).find((o) => o.title.startsWith("Agent-branch PRs merged")).detail, /may be chance/);
+  const wide = insights.summarizePrPatterns(Object.fromEntries(Array.from({ length: 16 }, (_, i) => merged(i + 1, i < 8 ? "codex/a" : "fix/b", i < 8 ? 1 + i / 10 : 20 + i, 10))));
+  assert.ok(wide.agentGapP < 0.01);
+
+  const steps = insights.summarizePrPatterns(Object.fromEntries(Array.from({ length: 10 }, (_, i) => merged(i + 1, "fix/x", 2 + i * 10, 20 + i * 100))));
+  assert.deepEqual([steps.sizeVsTime.rho, steps.sizeVsTime.n], [1, 10]);
+  assert.ok(steps.sizeVsTime.p < 0.01);
+  assert.equal(steps.largest[0].lines, 920);
+  assert.equal(insights.summarizePrPatterns(Object.fromEntries([1, 2, 3, 4, 5, 6, 7].map((n) => merged(n, "fix/x", n, n)))).sizeVsTime, null, "needs 8 merges");
+  assert.equal(insights.rankCorrelation([1, 1, 1, 1], [1, 2, 3, 4]), null, "no variation, no correlation");
+  assert.deepEqual([insights.quantile([1, 2, 3, 4], 0.75), insights.quantile([], 0.5)], [3.25, null]);
+});
+
+test("separates approvals from comment-only reviews and prefers searched outcomes", () => {
+  const at = (h) => new Date(Date.parse("2026-03-01T00:00:00Z") + h * 36e5).toISOString();
+  const rv = (login, h, state) => ({ login, at: at(h), state, bot: false });
+  const pr = (number, state, mergedH, reviewList, repo = "me/app") => [`${repo}#${number}`, { title: "t", repo, number, author: "me", createdAt: at(0),
+    state, merged: state === "MERGED", mergedAt: mergedH == null ? null : at(mergedH), mergedBy: "me", headRef: "fix/x", reviews: reviewList.length, reviewList }];
+  const prInfo = Object.fromEntries([
+    pr(1, "MERGED", 10, [rv("ana", 2, "approved")]),
+    pr(2, "MERGED", 10, [rv("ana", 3, "commented")]),
+    pr(3, "MERGED", 10, [rv("bo", 20, "approved")], "me/lib"), // approved only after the merge
+    pr(4, "MERGED", 10, [rv("bo", 4, "changes_requested"), rv("bo", 6, "approved")], "me/lib"),
+    pr(5, "MERGED", 10, []),
+    pr(6, "CLOSED", null, []), pr(7, "CLOSED", null, []), pr(8, "OPEN", null, []), pr(9, "CLOSED", null, []),
+  ]);
+  const flow = insights.summarizeReviewFlow(prInfo, "me");
+  assert.deepEqual([flow.states, flow.approvedBeforeMerge, flow.approved, flow.changesRequested, flow.noHuman], [true, 2, 3, 1, 1]);
+  assert.deepEqual(flow.outcomes, { merged: 5, closed: 3, open: 1 });
+  assert.deepEqual(flow.byRepo.map((r) => [r.repo, r.merged, r.noHuman, r.approved]), [["me/app", 3, 1, 1], ["me/lib", 2, 0, 1]]);
+  const titles = insights.deriveObservations({ review: flow }).map((o) => o.title);
+  assert.ok(titles.includes("2 of your 5 merges had a human review but no approval before merging"));
+  assert.ok(titles.includes("3 of 8 finished pull requests you opened were closed without merging"));
+  // Without review states, approval counts are unknown rather than zero.
+  const old = insights.summarizeReviewFlow({ "me/app#1": { ...prInfo["me/app#1"], reviewList: [{ login: "ana", at: at(2), bot: false, state: null }] } }, "me");
+  assert.deepEqual([old.states, old.approvedBeforeMerge], [false, null]);
+
+  // The searched outcomes (3 of 8 closed) outrank the feed's (0 of 4), and the card says which source it used.
+  const feed = { outcomes: { merged: 4, closed: 0, open: 0 }, closed: [], settled: 0, withoutPr: [] };
+  const agree = insights.deriveSuggestions({ login: "me", review: flow, follow: feed }).checked.find((c) => c.id === "agree-before-building");
+  assert.deepEqual([agree.status, agree.source], ["shown", "Pull requests you opened"]);
+  const onlyFeed = insights.deriveSuggestions({ login: "me", follow: { outcomes: { merged: 2, closed: 2, open: 0 }, closed: [{ repo: "me/app", number: 9, agent: true }], settled: 0, withoutPr: [] } });
+  const item = onlyFeed.items.find((s) => s.id === "agree-before-building");
+  assert.deepEqual([item.source, item.targets], ["Recent events", ["me/app #9 (agent branch)"]]);
+});
+
+test("suggests answering other people's pull requests within a day", () => {
+  const at = (h) => new Date(Date.parse("2026-03-01T00:00:00Z") + h * 36e5).toISOString();
+  const reviewed = (hours) => Object.fromEntries(hours.map((h, i) => [`org/x#${i}`, { title: "t", author: i % 2 ? "zed" : "yan", createdAt: at(0), myFirstReviewAt: at(h) }]));
+  const rule = (collab) => insights.deriveSuggestions({ login: "me", collab });
+  const status = (collab) => rule(collab).checked.find((c) => c.id === "answer-review-requests").status;
+  assert.equal(status(null), "unavailable");
+  assert.equal(status(insights.summarizeCollaboration({}, reviewed([30, 40, 50, 60]), "me")), "short", "needs 5 timed reviews");
+  assert.equal(status(insights.summarizeCollaboration({}, reviewed([2, 3, 4, 5, 30]), "me")), "clear");
+  const slow = rule(insights.summarizeCollaboration({}, reviewed([30, 40, 50, 60, 70, 80]), "me")).items.find((s) => s.id === "answer-review-requests");
+  assert.equal(slow.basis, "6 pull requests by other people that you reviewed");
+  assert.deepEqual(slow.targets, ["zed: median 3 days across 3", "yan: median 2 days across 3"]);
+  assert.deepEqual(slow.reading, ["google-speed"]);
+});
