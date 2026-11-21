@@ -474,3 +474,36 @@ test("suggests a limit on open work only when it tracks time to merge beyond cha
   // Open work that never varies has no correlation, and nothing to suggest.
   assert.equal(status(insights.summarizeOutcomes(Object.fromEntries(alone), "me", outcomeNow)), "clear");
 });
+
+test("holds every chance check on the page to one Holm bar", () => {
+  const prs = { agentGapP: 0.004, agentReviewP: 0.03, sizeVsTime: { p: 0.001, rho: 0.5, n: 20 } };
+  const outcomes = { flow: { load: { p: 0.2 } }, late: null, split: null, rework: { groups: [] } };
+  const chance = insights.chanceBudget({ prs, outcomes });
+  assert.equal(chance.tested, 4);
+  assert.deepEqual(chance.entries.map((t) => [t.key, t.clear]), [["size-time", true], ["agent-gap", true], ["agent-review", false], ["open-work", false]]);
+  // 0.03 passes alone at 5% but not at 5% / 2 after two smaller results.
+  assert.equal(chance.entries[2].bar, 0.025);
+  assert.match(insights.deriveObservations({ prs: { ...prs, agent: { count: 3, unreviewed: 3, medianHours: 1 }, other: { count: 3, unreviewed: 0, medianHours: 1 }, merged: 0 }, chance })
+    .find((o) => o.id === "agent-skip-review").detail, /does not clear the bar shared by every chance check/);
+});
+
+test("splits time to merge at the last commit and summarizes saved weeks", () => {
+  const info = {};
+  for (let i = 0; i < 6; i += 1) {
+    const created = Date.parse("2026-03-01T00:00:00Z") + i * 864e5;
+    info[`me/r#${i}`] = { title: `Change ${i}`, repo: "me/r", number: i + 1, author: "me", merged: true, state: "MERGED",
+      createdAt: new Date(created).toISOString(), mergedAt: new Date(created + 10 * 36e5).toISOString(),
+      // Work for 2 hours, then 8 hours waiting; the first one's last commit predates the pull request.
+      lastCommitAt: new Date(created + (i ? 2 : -5) * 36e5).toISOString(), additions: 1, deletions: 0, reviews: 0 };
+  }
+  const o = insights.summarizeOutcomes(info, "me", "2026-04-01T00:00:00Z");
+  assert.equal(o.split.n, 6);
+  assert.equal(o.split.workingHours, 2);
+  assert.equal(o.split.waitingHours, 8);
+  assert.equal(o.split.waitingShare, (8 * 5 + 10) / 60);
+  assert.ok(insights.deriveObservations({ outcomes: o }).some((f) => f.id === "merges-wait-after-work"));
+  const snap = insights.summarizeSnapshots({ "2026-02-02": { medianMergeHours: 30 }, "2026-03-02": { medianMergeHours: 20 }, junk: { merged: 1 } },
+    insights.snapshotOf(o), "2026-03-30");
+  const row = snap.rows.find((r) => r.key === "medianMergeHours");
+  assert.deepEqual([snap.weeks, row.first.value, row.back.value, row.latest.value], [3, 30, 20, 10]);
+});

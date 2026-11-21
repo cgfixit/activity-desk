@@ -366,3 +366,9 @@ input[type="search"] { width: 180px; }
 @media (max-width: 760px) {
   .suggestion-grid { grid-template-columns: minmax(0, 1fr); }
 }
+.more-findings { margin-top: 6px; }
+.more-findings > summary { cursor: pointer; color: var(--accent); font-size: 12px; padding: 4px 0; }
+.more-findings > summary:hover { color: var(--text); }
+.more-findings[open] > summary { margin-bottom: 4px; }
+.attention .src.confirmed { margin-left: 6px; }
+.compare .week { display: block; font-size: 11px; color: var(--muted); }

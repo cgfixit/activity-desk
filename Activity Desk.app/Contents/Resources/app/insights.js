@@ -183,12 +183,14 @@ function rankCorrelation(x, y) {
   return { rho, n: x.length, p: (asLarge + 1) / (CHANCE_SHUFFLES + 1) };
 }
 
-// Wording for a permutation p value: lead names the shuffle, thing the result it matched.
-function chanceNote(p, lead, thing) {
+// Wording for a permutation p value: lead names the shuffle, thing the result it matched. `clear` is
+// the verdict of the page's shared chance budget when there is one; without it, p is held to 5%.
+function chanceNote(p, lead, thing, clear = p != null && p < CHANCE_P) {
   if (p == null) return "";
   const often = share(p) === "0%" ? "under 1%" : share(p);
+  if (clear) return ` ${lead} match ${thing} ${often === "under 1%" ? often : `only ${often}`} of the time.`;
   return p < CHANCE_P
-    ? ` ${lead} match ${thing} ${often === "under 1%" ? often : `only ${often}`} of the time.`
+    ? ` ${lead} match ${thing} only ${often} of the time, which does not clear the bar shared by every chance check on this page.`
     : ` ${lead} match ${thing} ${often} of the time, so it may be chance.`;
 }
 const GROUP_CHANCE = ["Random regroupings of the same merges", "a gap this large"];
@@ -680,7 +682,7 @@ function summarizePrPatterns(prInfo, now) {
 }
 
 const TRAJECTORY_MIN_WEEKS = 6;
-const TRAJECTORY_SHUFFLES = 200;
+const TRAJECTORY_SHUFFLES = 999;
 const TRAJECTORY_MIN_CHANGE = 0.25;
 const FOLLOW_GRACE_DAYS = 2;
 
@@ -736,6 +738,9 @@ function summarizeTrajectory(year) {
       before: best.before,
       after: best.after,
       beaten: beaten / TRAJECTORY_SHUFFLES,
+      // How often a shuffled year splits at least as cleanly, counted like the other chance checks.
+      p: (TRAJECTORY_SHUFFLES - beaten + 1) / (TRAJECTORY_SHUFFLES + 1),
+      big: diff !== 0 && Math.abs(diff) / Math.max(best.before, best.after) >= TRAJECTORY_MIN_CHANGE,
       clear: diff !== 0 && beaten / TRAJECTORY_SHUFFLES >= 0.95 &&
         Math.abs(diff) / Math.max(best.before, best.after) >= TRAJECTORY_MIN_CHANGE,
     };
@@ -917,6 +922,7 @@ const REWORK_RATE = 0.2;
 const BASELINE_MIN_MERGES = 6;  // merges before the user's own merge times set a baseline
 const OVERDUE_FLOOR_HOURS = 24; // an open pull request younger than this is never called overdue
 const FLOW_PEAK = 5;            // open at once before the peak is worth a finding
+const SPLIT_MIN_MERGES = 6;     // merges with a last-commit time before work and waiting are split
 // A title that reads as a fix or a revert, allowing one leading [tag] and conventional "fix(scope):".
 const FIX_TITLE = /^\s*(?:\[[^\]]{1,40}\]\s*)?(?:fix(?:es|ed)?|hotfix|bugfix|revert(?:s|ed)?|roll\s?back)\b/i;
 
@@ -1049,8 +1055,86 @@ function summarizeOutcomes(prInfo, login, now) {
       p: slow.length >= REWORK_MIN_GROUP && quick.length >= REWORK_MIN_GROUP ? permutationP(won(slow), won(quick), rateGap) : null,
     };
   }
-  return { authored: mine.length, merged: merged.length, rework, flow, baseline, overdueAfterHours, overdue, late };
+
+  // ----- Working and waiting -----
+  // Time to merge, split at the last commit: open to last commit is work still landing, last commit to
+  // merge is finished work waiting. A last commit made before the pull request opened counts as no
+  // work time, since the work was done first. Only merges with a read commit time are counted.
+  const lastCommit = (pr) => Date.parse(pr.lastCommitAt);
+  const timedSplit = timedSpans.filter((s) => Number.isFinite(lastCommit(s.pr)));
+  const parts = timedSplit.map((s) => {
+    const done = Math.min(Math.max(lastCommit(s.pr), s.start), mergedAt(s.pr));
+    return { s, working: (done - s.start) / 36e5, waiting: (mergedAt(s.pr) - done) / 36e5 };
+  });
+  const totalHours = sum(parts.map((x) => x.working + x.waiting));
+  const split = parts.length >= SPLIT_MIN_MERGES ? {
+    n: parts.length,
+    missing: merged.length - parts.length,
+    workingHours: median(parts.map((x) => x.working)),
+    waitingHours: median(parts.map((x) => x.waiting)),
+    // Time-weighted: of all the hours these pull requests were open, the share after the last commit.
+    // Long pull requests weigh most, which is the point: it says where the time went.
+    waitingShare: totalHours > 0 ? sum(parts.map((x) => x.waiting)) / totalHours : null,
+    totalWaiting: sum(parts.map((x) => x.waiting)),
+    totalHours,
+    // The merges that sat longest after their last commit.
+    idle: parts.slice().sort((a, b) => b.waiting - a.waiting).slice(0, 3)
+      .map((x) => ({ repo: x.s.pr.repo, number: x.s.pr.number, waiting: x.waiting, working: x.working })),
+    // Whether open work tracks the waiting part, which is what the open-work finding predicts.
+    waitingLoad: parts.length >= CORRELATION_MIN_MERGES ? rankCorrelation(parts.map((x) => x.s.others), parts.map((x) => x.waiting)) : null,
+  } : null;
+  const commits = { asked: merged.length, read: parts.length };
+
+  return { authored: mine.length, merged: merged.length, rework, flow, baseline, overdueAfterHours, overdue, late, split, commits };
 }
+
+// ---------- Weekly snapshots ----------
+// A handful of outcome numbers, saved once a week in saved history, so a change in how you work can be
+// read against what came before. Each number covers the same rolling window as the summaries, so
+// neighbouring weeks share most of their pull requests and a real change shows up over several weeks.
+const SNAPSHOT_METRICS = [
+  { key: "medianMergeHours", label: "Median time to merge", format: (v) => durationLabel(v), better: "lower" },
+  { key: "reworkRate", label: "Merges followed by a fix", format: (v) => share(v), better: "lower" },
+  { key: "averageOpen", label: "Open at once, on average", format: (v) => formatCount(Math.round(v * 10) / 10), better: "lower" },
+  { key: "waitingShare", label: "Open hours after the last commit", format: (v) => share(v), better: "lower" },
+  { key: "merged", label: "Merges in the window", format: (v) => String(v), better: "" },
+];
+const SNAPSHOT_GAP_WEEKS = 4;
+
+// The numbers to save this week, each only once it has the minimum sample its finding uses.
+function snapshotOf(outcomes) {
+  if (!outcomes) return null;
+  const r = outcomes.rework;
+  return {
+    merged: outcomes.merged,
+    medianMergeHours: outcomes.baseline ? outcomes.baseline.medianHours : null,
+    reworkRate: r.settled >= REWORK_MIN_SETTLED ? r.rate : null,
+    averageOpen: outcomes.flow.averageOpen,
+    waitingShare: outcomes.split ? outcomes.split.waitingShare : null,
+  };
+}
+
+// Saved weeks, oldest first, with each number's first value, its value about four weeks back, and now.
+function summarizeSnapshots(saved, current, week) {
+  const weeks = Object.entries(saved || {}).filter(([w, v]) => DAY_KEY.test(w) && v && typeof v === "object")
+    .map(([w, v]) => ({ week: w, values: v }));
+  if (current && DAY_KEY.test(week || "")) {
+    const i = weeks.findIndex((w) => w.week === week);
+    if (i >= 0) weeks.splice(i, 1);
+    weeks.push({ week, values: current });
+  }
+  weeks.sort((a, b) => a.week.localeCompare(b.week));
+  const rows = SNAPSHOT_METRICS.map((m) => {
+    const points = weeks.filter((w) => Number.isFinite(w.values[m.key])).map((w) => ({ week: w.week, value: w.values[m.key] }));
+    if (points.length < 2) return { ...m, points, first: null, back: null, latest: points[0] || null };
+    const latest = points[points.length - 1];
+    const cutoff = new Date(Date.parse(latest.week) - SNAPSHOT_GAP_WEEKS * 7 * DAY_MS).toISOString().slice(0, 10);
+    const back = points.filter((p) => p.week <= cutoff).pop() || null;
+    return { ...m, points, first: points[0], back, latest };
+  });
+  return { weeks: weeks.length, first: weeks[0]?.week || null, latest: weeks[weeks.length - 1]?.week || null, rows };
+}
+const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
 
 // Review partners: who reviews the user's pull requests and whose pull requests the user reviews.
 // Both directions use the same window and the same clock as review turnaround: hours from creation
@@ -1151,20 +1235,64 @@ function summarizeCollaboration(prInfo, reviewed, login, { complete = false } = 
 
 const CORRELATION_MIN_RHO = 0.3;
 // One sentence on a rank correlation between size and time to merge.
-function correlationText(c) {
+function correlationText(c, clear) {
   if (!c) return "";
   const strength = Math.abs(c.rho) < 0.1 ? "no" : Math.abs(c.rho) < CORRELATION_MIN_RHO ? "a weak" : Math.abs(c.rho) < 0.6 ? "a moderate" : "a strong";
   const direction = Math.abs(c.rho) < 0.1 ? "" : c.rho > 0 ? " positive" : " negative";
-  return ` Across all ${plural(c.n, "timed merge")}, size and time to merge show ${strength}${direction} rank correlation (ρ ${c.rho.toFixed(2)}).${chanceNote(c.p, "Random pairings of the same sizes and times", "a correlation this strong")}`;
+  return ` Across all ${plural(c.n, "timed merge")}, size and time to merge show ${strength}${direction} rank correlation (ρ ${c.rho.toFixed(2)}).${chanceNote(c.p, "Random pairings of the same sizes and times", "a correlation this strong", clear)}`;
+}
+
+// ---------- One chance budget for the page ----------
+// Every chance check on the page runs at once, so with no real effect anywhere, ten checks at 5% each
+// would still call one "beyond chance" about two times in five. Holm's step-down method keeps that
+// risk at 5% for the page as a whole: sort the p values, hold the smallest to 5% divided by the number
+// of checks, the next to 5% divided by one fewer, and stop at the first that fails.
+function chanceBudget({ prs, outcomes, trajectory } = {}) {
+  const tests = [];
+  const add = (key, label, p) => { if (Number.isFinite(p)) tests.push({ key, label, p }); };
+  add("agent-gap", "Agent-branch merge times against other merges", prs?.agentGapP);
+  add("agent-review", "Agent-branch merges without review against other merges", prs?.agentReviewP);
+  add("size-time", "Size against time to merge", prs?.sizeVsTime?.p);
+  add("shift", "The clearest shift in weekly output", trajectory?.shift?.big ? trajectory.shift.p : null);
+  add("open-work", "Open work against time to merge", outcomes?.flow?.load?.p);
+  add("late", "Whether slow pull requests still merged", outcomes?.late?.p);
+  add("waiting", "Open work against time waiting after the last commit", outcomes?.split?.waitingLoad?.p);
+  for (const g of outcomes?.rework?.groups || []) {
+    add(`rework:${g.key}`, `Follow-up fixes: ${g.a.label.toLowerCase()} against ${g.b.label.toLowerCase()}`, g.p);
+  }
+  tests.sort((a, b) => a.p - b.p || a.key.localeCompare(b.key));
+  const cleared = {};
+  let open = true;
+  for (const [i, t] of tests.entries()) {
+    t.bar = CHANCE_P / (tests.length - i);
+    t.clear = open && t.p < t.bar;
+    if (!t.clear) open = false;
+    if (t.clear) cleared[t.key] = true;
+  }
+  return { tested: tests.length, method: "Holm", entries: tests, cleared };
+}
+
+// Whether a chance check passed: against the page budget when there is one, else against 5% alone.
+const passes = (chance, key, p) => (chance ? Boolean(chance.cleared[key]) : p != null && p < CHANCE_P);
+
+// The follow-up comparisons judged by the page budget instead of their own shared bar.
+function withBudget(outcomes, chance) {
+  if (!outcomes || !chance) return outcomes;
+  const groups = outcomes.rework.groups.map((g) => ({ ...g, clear: passes(chance, `rework:${g.key}`, g.p) }));
+  const rate = (side) => side.followed / side.n;
+  const standouts = groups.filter((g) => g.clear).sort((x, y) => x.p - y.p || Math.abs(rate(y.a) - rate(y.b)) - Math.abs(rate(x.a) - rate(x.b)));
+  return { ...outcomes, rework: { ...outcomes.rework, groups, standouts, page: chance.tested } };
 }
 
 // Plain-language findings. Each names its source, and each needs a minimum sample before it appears.
 // A finding that a suggestion acts on carries an id, which the suggestion rule names in `patterns`.
 // Warnings are kept for outcomes. A finding about how work was reviewed is a note unless the user's
 // own merges show the unreviewed ones needing fixes more often.
-function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review, outcomes }) {
+// `confirmed` marks a finding that rests on a chance check that passed, which ranks it above the rest.
+function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review, outcomes: raw, chance }) {
+  const outcomes = withBudget(raw, chance);
   const out = [];
-  const add = (tone, source, title, detail, id = "") => out.push({ tone, source, title, detail, id });
+  const add = (tone, source, title, detail, id = "", confirmed = false) => out.push({ tone, source, title, detail, id, confirmed });
   const YEAR = "Contribution year";
   const FEED = "Recent events";
   const PRS = "Pull requests";
@@ -1220,12 +1348,14 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review,
         const times = (x) => `${x >= 10 ? Math.round(x) : x.toFixed(1)}×`;
         if (ratio >= 2 || ratio <= 0.5) {
           add("info", PRS, `Agent-branch PRs merged ${ratio >= 2 ? `${times(ratio)} faster` : `${times(1 / ratio)} slower`} than other PRs`,
-            `Median ${durationLabel(agent.medianHours)} across ${agent.count} agent-branch merges, ${durationLabel(other.medianHours)} across ${other.count} others.${chanceNote(prs.agentGapP, ...GROUP_CHANCE)}`);
+            `Median ${durationLabel(agent.medianHours)} across ${agent.count} agent-branch merges, ${durationLabel(other.medianHours)} across ${other.count} others.${chanceNote(prs.agentGapP, ...GROUP_CHANCE, passes(chance, "agent-gap", prs.agentGapP))}`,
+            "", passes(chance, "agent-gap", prs.agentGapP));
         }
       }
       if (agent.unreviewed / agent.count - other.unreviewed / other.count >= 0.3 - RATIO_EPSILON) {
         add(backedByOutcomes(outcomes, "agent") ? "warn" : "info", PRS, "Agent-branch merges skip review more often",
-          `${agent.unreviewed} of ${agent.count} had zero recorded reviews, against ${other.unreviewed} of ${other.count} other merges.${chanceNote(prs.agentReviewP, ...GROUP_CHANCE)}`, "agent-skip-review");
+          `${agent.unreviewed} of ${agent.count} had zero recorded reviews, against ${other.unreviewed} of ${other.count} other merges.${chanceNote(prs.agentReviewP, ...GROUP_CHANCE, passes(chance, "agent-review", prs.agentReviewP))}`,
+          "agent-skip-review", passes(chance, "agent-review", prs.agentReviewP));
       }
     }
     if (prs.merged >= 3 && prs.mergedLines > 0 && prs.unreviewedLines / prs.mergedLines >= 0.5) {
@@ -1238,15 +1368,16 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review,
       // Size and branch type overlap, so say so instead of crediting size alone.
       const skew = Math.abs(larger.agent - smaller.agent) / larger.count >= 0.3
         ? ` Agent branches make up ${larger.agent} of the larger ${larger.count} and ${smaller.agent} of the smaller ${smaller.count}, so branch type may explain the gap.` : "";
-      const rank = correlationText(prs.sizeVsTime);
-      if (ratio >= 2) add("info", PRS, "Larger PRs took noticeably longer to merge", basis + skew + rank, "larger-slower");
+      const sized = passes(chance, "size-time", prs.sizeVsTime?.p);
+      const rank = correlationText(prs.sizeVsTime, sized);
+      if (ratio >= 2) add("info", PRS, "Larger PRs took noticeably longer to merge", basis + skew + rank, "larger-slower", sized && prs.sizeVsTime.rho >= CORRELATION_MIN_RHO);
       else if (ratio <= 1) add("info", PRS, "Larger PRs merged at least as fast as smaller ones", `${basis}${skew || " Time to merge is not scaling with size."}${rank}`);
     }
     // Without a halves finding, a clear rank correlation across every merge still says something.
     const c = prs.sizeVsTime;
-    if (!out.some((o) => o.title.startsWith("Larger PRs")) && c && c.p < CHANCE_P && Math.abs(c.rho) >= CORRELATION_MIN_RHO) {
+    if (!out.some((o) => o.title.startsWith("Larger PRs")) && c && passes(chance, "size-time", c.p) && Math.abs(c.rho) >= CORRELATION_MIN_RHO) {
       add("info", PRS, c.rho > 0 ? "Bigger pull requests took longer to merge" : "Bigger pull requests merged faster",
-        `Across ${plural(c.n, "timed merge")}, ranked by lines changed and by time to merge.${correlationText(c)}`, c.rho > 0 ? "larger-slower" : "");
+        `Across ${plural(c.n, "timed merge")}, ranked by lines changed and by time to merge.${correlationText(c, true)}`, c.rho > 0 ? "larger-slower" : "", true);
     }
     // With enough merges of the user's own, open pull requests are judged against those instead.
     if (prs.stale && !outcomes?.baseline) {
@@ -1256,11 +1387,12 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review,
     }
   }
   const perWeek = (x) => `${x >= 10 ? Math.round(x) : x.toFixed(1)} a week`;
-  if (trajectory?.shift?.clear) {
+  const shifted = trajectory?.shift && (chance ? trajectory.shift.big && passes(chance, "shift") : trajectory.shift.clear);
+  if (shifted) {
     const s = trajectory.shift;
     const up = s.after > s.before;
     add(up ? "good" : "info", YEAR, `Weekly output ${up ? "stepped up" : "dropped"} around the week of ${s.at}`,
-      `${perWeek(s.before)} across the ${s.weeksBefore} weeks before, ${perWeek(s.after)} across the ${s.weeksAfter} weeks since. This is the clearest single shift in the year's weekly totals.`);
+      `${perWeek(s.before)} across the ${s.weeksBefore} weeks before, ${perWeek(s.after)} across the ${s.weeksAfter} weeks since. This is the clearest single shift in the year's weekly totals.`, "", true);
   }
   if (trajectory?.afterActive && trajectory?.afterIdle) {
     const a = trajectory.afterActive.rate;
@@ -1332,14 +1464,14 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review,
     const { rework, flow, baseline, late } = outcomes;
     if (rework.settled >= REWORK_MIN_SETTLED && rework.followed >= 2 && rework.rate >= REWORK_RATE - RATIO_EPSILON) {
       add("warn", MINE, `${rework.followed} of your ${plural(rework.settled, "settled merge")} were followed by a fix within ${REWORK_HOURS / 24} days`,
-        `${reworkStandout(rework)} A follow-up is a pull request in the same repository whose title starts with fix or revert.`, "fixes-follow-merges");
+        `${reworkStandout(rework)} A follow-up is a pull request in the same repository whose title starts with fix or revert.`, "fixes-follow-merges", rework.standouts.length > 0);
     } else if (rework.settled >= 8 && rework.followed === 0) {
       add("good", MINE, `None of your ${plural(rework.settled, "settled merge")} was followed by a fix`,
         `No pull request titled as a fix or revert opened in the same repository within ${REWORK_HOURS / 24} days of any of them.`);
     }
     const load = flow.load;
-    if (load && load.p < CHANCE_P && load.rho >= CORRELATION_MIN_RHO && flow.split) {
-      add("info", MINE, "Pull requests opened beside other open work took longer to merge", flowText(flow), "open-work-slows-merges");
+    if (load && passes(chance, "open-work", load.p) && load.rho >= CORRELATION_MIN_RHO && flow.split) {
+      add("info", MINE, "Pull requests opened beside other open work took longer to merge", flowText(flow, true), "open-work-slows-merges", true);
     } else if (flow.peak && flow.peak.count >= FLOW_PEAK) {
       add("info", MINE, `You had ${flow.peak.count} pull requests open at once`,
         `The most at one time, reached on ${flow.peak.at}. When you open one, a median of ${formatCount(flow.typicalOthers)} of your others ${flow.typicalOthers === 1 ? "is" : "are"} already open.`);
@@ -1349,14 +1481,31 @@ function deriveObservations({ rhythm, sessions, prs, trajectory, follow, review,
       add("warn", MINE, `${plural(outcomes.overdue.length, "open pull request")} ${outcomes.overdue.length === 1 ? "has" : "have"} outlived your usual merge time`,
         `Open longer than ${durationLabel(outcomes.overdueAfterHours)}. 90% of your ${plural(baseline.n, "merge")} finished within ${durationLabel(baseline.p90Hours)}. Oldest is ${o.repo} #${o.number}, open ${plural(Math.floor(o.days), "day")}.`, "open-too-long");
     }
+    const split = outcomes.split;
+    if (split && split.waitingShare != null) {
+      const w = split.waitingLoad;
+      const tracks = w && passes(chance, "waiting", w.p) && w.rho >= CORRELATION_MIN_RHO;
+      const load = w ? ` With more of your others open, the waiting part ${tracks ? "grew" : "did not clearly grow"} (ρ ${w.rho.toFixed(2)}).${chanceNote(w.p, "Random pairings of the same counts and times", "a correlation this strong", passes(chance, "waiting", w.p))}` : "";
+      const basis = `Median ${durationLabel(split.workingHours)} from opening to the last commit, then ${durationLabel(split.waitingHours)} from the last commit to the merge, across ${plural(split.n, "merge")}.`;
+      if (split.waitingShare >= 0.5) {
+        const o = split.idle[0];
+        add("info", MINE, "Most of the time your pull requests spend open comes after the last commit",
+          `${share(split.waitingShare)} of all the hours your merged pull requests spent open came after their last commit. ${basis} Longest wait: ${o.repo} #${o.number}, ${durationLabel(o.waiting)} after its last commit.${load}`, "merges-wait-after-work", Boolean(tracks));
+      } else if (split.waitingShare <= 0.2) {
+        add("info", MINE, "Your pull requests merge soon after the last commit",
+          `Only ${share(split.waitingShare)} of the hours your merged pull requests spent open came after their last commit. ${basis}${load}`, "", Boolean(tracks));
+      }
+    }
     if (late && late.slow.n >= REWORK_MIN_GROUP && late.quick.n >= REWORK_MIN_GROUP &&
       late.slow.merged / late.slow.n <= 0.5 && late.quick.merged / late.quick.n - late.slow.merged / late.slow.n >= 0.3 - RATIO_EPSILON) {
-      add("info", MINE, `Pull requests still open after ${durationLabel(late.afterHours)} merged ${late.slow.merged} of ${late.slow.n} times`, lateText(late), "slow-rarely-merge");
+      const lateClear = passes(chance, "late", late.p);
+      add("info", MINE, `Pull requests still open after ${durationLabel(late.afterHours)} merged ${late.slow.merged} of ${late.slow.n} times`, lateText(late, lateClear), "slow-rarely-merge", lateClear);
     }
   }
 
+  // Warnings first, then findings that passed a chance check, then the rest in the order added.
   const rank = { warn: 0, good: 1, info: 1 };
-  return out.sort((a, b) => rank[a.tone] - rank[b.tone]);
+  return out.sort((a, b) => rank[a.tone] - rank[b.tone] || Number(b.confirmed) - Number(a.confirmed));
 }
 
 const formatCount = (x) => (Number.isInteger(x) ? String(x) : x.toFixed(1));
@@ -1370,7 +1519,10 @@ function reworkStandout(rework) {
   const [first, ...rest] = rework.standouts;
   if (first) {
     const bar = `${Number((rework.bar * 100).toFixed(2))}%`;
-    return `${pair(first)} Random regroupings match that gap ${oftenText(first.p)} of the time, under the ${bar} bar that ${plural(rework.tested, "comparison")} on the same merges must clear.${rest.map((g) => ` Also beyond chance: ${pair(g)}`).join("")}`;
+    const clears = rework.page
+      ? `which clears the bar shared by ${plural(rework.page, "chance check")} on this page`
+      : `under the ${bar} bar that ${plural(rework.tested, "comparison")} on the same merges must clear`;
+    return `${pair(first)} Random regroupings match that gap ${oftenText(first.p)} of the time, ${clears}.${rest.map((g) => ` Also beyond chance: ${pair(g)}`).join("")}`;
   }
   return rework.tested
     ? `No group stood apart beyond chance across ${plural(rework.tested, "comparison")} (branch type, size, review, merge speed, hour).`
@@ -1391,13 +1543,13 @@ function backedByOutcomes(outcomes, key) {
   const g = reworkGroup(outcomes, key);
   return Boolean(g && g.clear && g.a.followed / g.a.n > g.b.followed / g.b.n);
 }
-function flowText(flow) {
+function flowText(flow, clear) {
   const { split, load } = flow;
   const more = split.cut === 0 ? "at least one of your others already open" : `more than ${formatCount(split.cut)} of your others already open`;
-  return `Median ${durationLabel(split.busy.medianHours)} to merge across ${split.busy.n} opened with ${more}, ${durationLabel(split.quiet.medianHours)} across the other ${split.quiet.n}. Rank correlation ρ ${load.rho.toFixed(2)} across ${plural(load.n, "merge")}.${chanceNote(load.p, "Random pairings of the same counts and times", "a correlation this strong")}`;
+  return `Median ${durationLabel(split.busy.medianHours)} to merge across ${split.busy.n} opened with ${more}, ${durationLabel(split.quiet.medianHours)} across the other ${split.quiet.n}. Rank correlation ρ ${load.rho.toFixed(2)} across ${plural(load.n, "merge")}.${chanceNote(load.p, "Random pairings of the same counts and times", "a correlation this strong", clear)}`;
 }
-function lateText(late) {
-  return `Counting finished pull requests you opened that outlasted the slowest quarter of your merges. Of those that finished sooner, ${late.quick.merged} of ${late.quick.n} merged.${chanceNote(late.p, "Random regroupings of the same pull requests", "a gap this large")}`;
+function lateText(late, clear) {
+  return `Counting finished pull requests you opened that outlasted the slowest quarter of your merges. Of those that finished sooner, ${late.quick.merged} of ${late.quick.n} merged.${chanceNote(late.p, "Random regroupings of the same pull requests", "a gap this large", clear)}`;
 }
 
 // ---------- Suggestions ----------
@@ -1491,20 +1643,44 @@ const SUGGESTION_RULES = [
   {
     id: "limit-open-work", area: "Flow", source: "Pull requests you opened", patterns: ["open-work-slows-merges"],
     title: "Finish open pull requests before opening the next",
-    check: ({ outcomes }) => {
+    check: ({ outcomes, chance }) => {
       if (!outcomes) return { unavailable: "The search for pull requests you opened did not load." };
       const f = outcomes.flow;
       if (outcomes.merged < CORRELATION_MIN_MERGES) return { short: `Needs ${CORRELATION_MIN_MERGES} merged pull requests you opened; ${outcomes.merged} loaded.` };
       // No correlation exists when open work never varied, which is itself nothing to act on.
-      if (!f.load || !(f.load.p < CHANCE_P && f.load.rho >= CORRELATION_MIN_RHO) || !f.split) return null;
+      if (!f.load || !(passes(chance, "open-work", f.load.p) && f.load.rho >= CORRELATION_MIN_RHO) || !f.split) return null;
       const limit = Math.floor(f.split.cut) + 1;
       return {
         tone: "info", confirmed: true,
         basis: `${plural(f.load.n, "merged pull request")} you opened`,
         targets: f.openNow.slice(0, SUGGEST_TARGETS).map((o) => `${prLabel(o)}${o.draft ? " (draft)" : ""}: open ${plural(Math.floor(o.days), "day")}`),
-        seen: `${flowText(f)}${f.peak ? ` You had up to ${f.peak.count} open at once, on ${f.peak.at}.` : ""} Busy stretches can cause both, so this is a pattern to test, not a proven cause.`,
+        seen: `${flowText(f, true)}${f.peak ? ` You had up to ${f.peak.count} open at once, on ${f.peak.at}.` : ""} Busy stretches can cause both, so this is a pattern to test, not a proven cause.`,
         why: [["DORA's guidance for teams says that spreading people across several tasks makes tasks take longer to finish, and that its research shows limits on work in process help improve software delivery performance.", "dora-wip"]],
         act: [[`Try a limit of ${plural(limit, "open pull request")} for two weeks. At the limit, merge or close the oldest before you open another, then compare your time to merge here.`]],
+      };
+    },
+  },
+  {
+    id: "merge-finished-work", area: "Flow", source: "Pull requests you opened", patterns: ["merges-wait-after-work"], fold: "limit-open-work",
+    title: "Merge finished pull requests before they sit",
+    check: ({ outcomes, chance }) => {
+      if (!outcomes) return { unavailable: "The search for pull requests you opened did not load." };
+      const s = outcomes.split;
+      if (!s) {
+        return outcomes.merged >= SPLIT_MIN_MERGES && outcomes.commits.read === 0
+          ? { unavailable: "Last-commit times did not load, so time to merge cannot be split into work and waiting." }
+          : { short: `Needs ${SPLIT_MIN_MERGES} merged pull requests you opened with a last-commit time; ${outcomes.commits.read} loaded.` };
+      }
+      if (!(s.waitingShare >= 0.5)) return null;
+      const w = s.waitingLoad;
+      const tracks = Boolean(w && passes(chance, "waiting", w.p) && w.rho >= CORRELATION_MIN_RHO);
+      return {
+        tone: "info", confirmed: tracks,
+        basis: `${plural(s.n, "merged pull request")} you opened with a last-commit time`,
+        targets: s.idle.map((o) => `${prLabel(o)}: merged ${durationLabel(o.waiting)} after its last commit`),
+        seen: `${share(s.waitingShare)} of the hours your merged pull requests spent open came after their last commit. Per pull request, the median was ${durationLabel(s.workingHours)} from opening to the last commit and ${durationLabel(s.waitingHours)} from the last commit to the merge.${tracks ? ` The wait grew with the number of your other pull requests open (ρ ${w.rho.toFixed(2)}).` : ""} A last commit is not always the end of the work: a review can still ask for changes.`,
+        why: [["DORA's guidance for teams says that spreading people across several tasks makes tasks take longer to finish, and that its research shows limits on work in process help improve software delivery performance.", "dora-wip"]],
+        act: [["When the last commit of a pull request is in and its checks pass, merge it or ask for the review that day, before you start something new. The pull requests below waited longest."]],
       };
     },
   },
@@ -1546,7 +1722,7 @@ const SUGGESTION_RULES = [
   {
     id: "review-agent-branches", area: "Review", source: "Pull requests", patterns: ["agent-skip-review"], fold: "review-before-merge",
     title: "Review agent branches like a colleague's work",
-    check: ({ prPatterns: p, outcomes }) => {
+    check: ({ prPatterns: p, outcomes, chance }) => {
       if (!p) return { unavailable: "No pull request details loaded." };
       const a = p.agent;
       if (a.count < SUGGEST_MIN_MERGES) return { short: `Needs ${SUGGEST_MIN_MERGES} merged agent-branch pull requests; ${a.count} loaded.` };
@@ -1554,7 +1730,7 @@ const SUGGESTION_RULES = [
       const gap = o.count >= SUGGEST_MIN_MERGES && a.unreviewed / a.count - o.unreviewed / o.count >= 0.3 - RATIO_EPSILON;
       if (a.unreviewed / a.count < 0.5 && !gap) return null;
       return {
-        tone: backedByOutcomes(outcomes, "agent") ? "warn" : "info", confirmed: gap && p.agentReviewP != null && p.agentReviewP < CHANCE_P,
+        tone: backedByOutcomes(outcomes, "agent") ? "warn" : "info", confirmed: gap && passes(chance, "agent-review", p.agentReviewP),
         basis: `${plural(a.count, "agent-branch merge")}${o.count ? ` and ${plural(o.count, "other merge")}` : ""}`,
         targets: p.largestUnreviewedAgent.map((r) => `${prLabel(r)}: ${lines(r.lines)} lines, no recorded review`),
         seen: `${a.unreviewed} of ${plural(a.count, "agent-branch merge")} had no recorded review${o.count ? `, against ${o.unreviewed} of ${o.count} other merges` : ""}. Agent branches are matched by prefix, such as claude/ or codex/.${reworkNote(outcomes, "agent")}`,
@@ -1625,7 +1801,7 @@ const SUGGESTION_RULES = [
   {
     id: "smaller-prs", area: "Pull requests", source: "Pull requests", patterns: ["larger-slower"],
     title: "Split large pull requests",
-    check: ({ prPatterns: p, outcomes }) => {
+    check: ({ prPatterns: p, outcomes, chance }) => {
       if (!p) return { unavailable: "No pull request details loaded." };
       if (!p.smaller || !p.larger) return { short: `Needs 6 merged pull requests; ${p.merged} loaded.` };
       const { smaller: s, larger: l } = p;
@@ -1639,10 +1815,10 @@ const SUGGESTION_RULES = [
         : `Loaded merges changed a median of ${lines(p.all.medianSize)} lines.`;
       const c = p.sizeVsTime;
       return {
-        tone: "info", confirmed: Boolean(c && c.p < CHANCE_P && c.rho >= CORRELATION_MIN_RHO),
+        tone: "info", confirmed: Boolean(c && passes(chance, "size-time", c.p) && c.rho >= CORRELATION_MIN_RHO),
         basis: `${plural(p.merged, "merged pull request")}`,
         targets: p.largest.map((r) => `${prLabel(r)}: ${lines(r.lines)} lines`),
-        seen: seen + correlationText(c) + reworkNote(outcomes, "size"),
+        seen: seen + correlationText(c, Boolean(c) && passes(chance, "size-time", c.p)) + reworkNote(outcomes, "size"),
         why: [
           ["Google's review guide says small changes are reviewed more quickly and more thoroughly, and are less likely to introduce bugs.", "google-small-cls"],
           ["Across 100 open-source projects, though, pull request size was only weakly related to time to merge, so your own numbers are the better guide.", "kudrjavets-2022"],
@@ -1654,7 +1830,7 @@ const SUGGESTION_RULES = [
   {
     id: "settle-stale-prs", area: "Pull requests", source: "Pull requests you opened", patterns: ["open-too-long", "slow-rarely-merge"],
     title: "Settle pull requests that have been open for weeks",
-    check: ({ prInfo, outcomes }, { me, nowTime }) => {
+    check: ({ prInfo, outcomes, chance }, { me, nowTime }) => {
       if (!prInfo) return { unavailable: "The search for pull requests you opened did not load." };
       const act = [
         ["Decide each one: merge it, close it with a one-line reason, or convert it to a draft so it stops reading as ready.", "gh-draft"],
@@ -1668,9 +1844,9 @@ const SUGGESTION_RULES = [
         if (!over.length || (over.length < 2 && over[0].days < 7)) return null;
         const l = outcomes.late;
         const odds = l && l.slow.n >= REWORK_MIN_GROUP
-          ? ` Of ${plural(l.slow.n, "finished pull request")} that were still open after ${durationLabel(l.afterHours)}, ${l.slow.merged} merged, against ${l.quick.merged} of ${l.quick.n} that finished sooner.${chanceNote(l.p, "Random regroupings of the same pull requests", "a gap this large")}` : "";
+          ? ` Of ${plural(l.slow.n, "finished pull request")} that were still open after ${durationLabel(l.afterHours)}, ${l.slow.merged} merged, against ${l.quick.merged} of ${l.quick.n} that finished sooner.${chanceNote(l.p, "Random regroupings of the same pull requests", "a gap this large", passes(chance, "late", l.p))}` : "";
         return {
-          tone: "warn", confirmed: Boolean(l && l.p != null && l.p < CHANCE_P),
+          tone: "warn", confirmed: Boolean(l && passes(chance, "late", l.p)),
           title: "Settle pull requests that have outlived your usual merge time",
           basis: `${plural(b.n, "merged pull request")} you opened and ${plural(outcomes.flow.openNow.length, "open one")}`,
           targets: over.slice(0, SUGGEST_TARGETS).map(target),
@@ -1902,7 +2078,8 @@ const SUGGESTION_RULES = [
 // whether it was shown, folded into another, found nothing, lacked data, or lacked a source, so the
 // view can say what it checked. `links` maps a Patterns finding id to the suggestion that acts on it.
 function deriveSuggestions(input) {
-  const x = input || {};
+  // Follow-up comparisons are judged by the page's chance budget when the caller passes one.
+  const x = input ? { ...input, outcomes: withBudget(input.outcomes, input.chance) } : {};
   const me = String(x.login || "").toLowerCase();
   const nowTime = x.now == null ? Date.now() : new Date(x.now).getTime();
   const shown = new Map();
@@ -1928,7 +2105,7 @@ function deriveSuggestions(input) {
     if (!from || !into) continue;
     shown.delete(rule.id);
     into.also.push(from.seen);
-    into.why = [...into.why, ...from.why];
+    into.why = [...into.why, ...from.why.filter((w) => !into.why.some((v) => v[0] === w[0]))];
     into.more = [...into.more, ...from.more];
     if (from.targets.length) into.targets = [...into.targets.slice(0, SUGGEST_TARGETS - 1), from.targets[0]];
     into.patterns = [...new Set([...into.patterns, ...from.patterns])];
@@ -2633,6 +2810,10 @@ const api = {
   summarizeFollowThrough,
   summarizeReviewFlow,
   summarizeOutcomes,
+  chanceBudget,
+  snapshotOf,
+  summarizeSnapshots,
+  SNAPSHOT_METRICS,
   isBotLogin,
   flattenConversations,
   filterConversations,

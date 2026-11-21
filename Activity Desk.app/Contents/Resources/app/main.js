@@ -194,6 +194,8 @@ function resetSession() {
 // Daily repository traffic, star and fork counts, and referrer sightings, kept so trends can outlast
 // GitHub's 14-day traffic window. Only the main process writes it, and only from GitHub responses it
 // fetched itself for the signed-in account's own repositories. It is encrypted like the token.
+// It also keeps one snapshot a week of outcome numbers the window computed from those responses. The
+// main process accepts only the known keys, as bounded numbers, under a week it works out itself.
 const HISTORY_FILE = "history.enc";
 const HISTORY_ON = "history-on"; // present only after the user turned saved history on
 const HISTORY_VERSION = 1;
@@ -252,9 +254,36 @@ function repoHistory(account, repo) {
   return entry;
 }
 
+// Snapshot keys and the largest value each may take. Rates and shares are between 0 and 1.
+const SNAPSHOT_LIMITS = { merged: 100000, medianMergeHours: HISTORY_DAYS * 24, reworkRate: 1, averageOpen: 10000, waitingShare: 1 };
+const SNAPSHOT_WEEKS = 60;
+
+// The Monday that starts the current week, in UTC.
+function weekStart() {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+  return d.toISOString().slice(0, 10);
+}
+
+function cleanSnapshot(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const out = {};
+  for (const [key, limit] of Object.entries(SNAPSHOT_LIMITS)) {
+    const v = value[key];
+    if (v === null || v === undefined) continue;
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > limit) return null;
+    out[key] = key === "merged" ? Math.round(v) : Math.round(v * 1000) / 1000;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 function pruneHistory(store) {
   const oldest = new Date(Date.now() - HISTORY_DAYS * 864e5).toISOString().slice(0, 10);
   for (const account of Object.values(store.accounts)) {
+    if (account.snapshots) {
+      const weeks = Object.keys(account.snapshots).filter((w) => DAY.test(w) && w >= oldest).sort();
+      for (const w of Object.keys(account.snapshots)) if (!weeks.slice(-SNAPSHOT_WEEKS).includes(w)) delete account.snapshots[w];
+    }
     for (const [repo, entry] of Object.entries(account.repos)) {
       if (!entry.seen || entry.seen < oldest) { delete account.repos[repo]; continue; }
       for (const series of [entry.views, entry.clones, entry.counts]) {
@@ -326,9 +355,26 @@ handle("history", () => withHistory(async () => {
     await saveHistory();
     const account = store.accounts[String(sessionUser.id)];
     const file = readIfPresent(path.join(app.getPath("userData"), HISTORY_FILE));
-    return { ok: true, enabled: historyEnabled(), repos: account ? account.repos : {}, bytes: file ? file.length : 0, note: historyNote };
+    return { ok: true, enabled: historyEnabled(), repos: account ? account.repos : {}, snapshots: account?.snapshots || {}, week: weekStart(), bytes: file ? file.length : 0, note: historyNote };
   } catch {
     return { ok: false, error: "Saved history could not be read or saved." };
+  }
+}));
+
+// This week's outcome numbers for the signed-in account, replacing any saved earlier in the same week.
+handle("snapshot", (value) => withHistory(async () => {
+  if (!sessionUser) return { ok: false, error: signInFirst() };
+  if (!historyEnabled()) return { ok: false, error: "Saved history is off." };
+  const clean = cleanSnapshot(value);
+  if (!clean) return { ok: false, error: "Invalid snapshot." };
+  try {
+    const account = accountHistory(await loadHistory(), sessionUser);
+    const week = weekStart();
+    (account.snapshots || (account.snapshots = {}))[week] = clean;
+    scheduleHistorySave();
+    return { ok: true, week };
+  } catch {
+    return { ok: false, error: "The weekly snapshot could not be saved." };
   }
 }));
 
@@ -777,6 +823,9 @@ const PR_FIELDS = `title state merged isDraft createdAt mergedAt closedAt additi
   author { __typename login } mergedBy { login }
   reviews(first: 10) { totalCount nodes { submittedAt state author { __typename login } } }`;
 
+// When the last commit on a pull request was made, which splits time to merge into work and waiting.
+const COMMIT_FIELDS = "commits(last: 1) { nodes { commit { committedDate } } }";
+
 // Recent comments on issues and pull requests that involve the user, open or closed.
 // Search finds the threads; each thread's latest comments, reviews, and review comments are read live.
 // GitHub's issue search rejects a query without is:issue or is:pr, so issues and pull requests are
@@ -896,8 +945,11 @@ function githubRequest(operation, args) {
       }
       break;
     }
-    case "pullRequests": {
+    case "pullRequests":
+    case "pullRequestCommits": {
       if (!Array.isArray(args) || args.length === 0 || args.length > 40) break;
+      // Commit times are their own request, so a token that cannot read commits loses only them.
+      const fieldsFor = operation === "pullRequests" ? PR_FIELDS : COMMIT_FIELDS;
       const declarations = [];
       const fields = [];
       const variables = {};
@@ -907,7 +959,7 @@ function githubRequest(operation, args) {
         if (extra !== undefined || !REPO_NAME.test(owner) || !repo || !REPO_NAME.test(repo) ||
             !Number.isInteger(ref.number) || ref.number < 1 || ref.number > 2147483647) return null;
         declarations.push(`$o${i}: String!, $r${i}: String!, $n${i}: Int!`);
-        fields.push(`p${i}: repository(owner: $o${i}, name: $r${i}) { pullRequest(number: $n${i}) { ${PR_FIELDS} } }`);
+        fields.push(`p${i}: repository(owner: $o${i}, name: $r${i}) { pullRequest(number: $n${i}) { ${fieldsFor} } }`);
         Object.assign(variables, { [`o${i}`]: owner, [`r${i}`]: repo, [`n${i}`]: ref.number });
       }
       return { route: "/graphql", body: { query: `query (${declarations.join(", ")}) { ${fields.join("\n")} }`, variables } };
