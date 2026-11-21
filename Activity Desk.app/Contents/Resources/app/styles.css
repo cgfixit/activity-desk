@@ -384,3 +384,7 @@ input[type="search"] { width: 180px; }
 .set-aside > summary { cursor: pointer; }
 .trying-panel h4 { margin-top: 0; }
 .targets .where-link { color: var(--accent); padding: 0; font: inherit; }
+.scope-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin-bottom: 14px; }
+.scope-bar label { font-weight: 600; }
+.scope-bar select { font: inherit; padding: 4px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel, transparent); color: var(--text); }
+.scope-bar .note { flex-basis: 100%; margin: 0; }

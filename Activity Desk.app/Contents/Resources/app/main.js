@@ -570,8 +570,11 @@ handle("note-delete", (id) => withNotes(async () => {
 // plus the one number a card was measured by when the user acted, so "trying" can show then and now.
 const CARDS_FILE = "cards.enc";
 const CARDS_VERSION = 1;
-const CARDS_MAX = 100;
-const CARD_ID = /^[a-z0-9-]{1,60}$/;
+const CARDS_MAX = 300;
+// A rule id, or a rule id and the repository its card was scoped to: rule@owner/repo.
+const CARD_ID = /^[a-z0-9-]{1,60}(@[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100})?$/;
+const validCardId = (id) => typeof id === "string" && CARD_ID.test(id) &&
+  !id.split("@")[1]?.split("/").some((part) => part === "." || part === "..");
 const CARD_STATES = ["trying", "snoozed", "dismissed"];
 const CARD_UNITS = ["share", "hours", "lines", "count"];
 const SNOOZE_MAX_DAYS = 90;
@@ -619,7 +622,7 @@ async function loadCards() {
         if (!/^\d+$/.test(key) || !cards || typeof cards !== "object") continue;
         const clean = {};
         for (const [id, c] of Object.entries(cards).slice(0, CARDS_MAX)) {
-          const card = CARD_ID.test(id) ? cleanCard(c) : null;
+          const card = validCardId(id) ? cleanCard(c) : null;
           if (card) clean[id] = card;
         }
         store.accounts[key] = clean;
@@ -645,7 +648,7 @@ handle("cards", () => withCards(async () => {
 // Sets one card's state, or clears it with state null. The main process stamps the time itself.
 handle("card-set", (id, input) => withCards(async () => {
   if (!sessionUser) return { ok: false, error: signInFirst() };
-  if (typeof id !== "string" || !CARD_ID.test(id)) return { ok: false, error: "Invalid card." };
+  if (!validCardId(id)) return { ok: false, error: "Invalid card." };
   let card = null;
   if (input !== null) {
     if (!input || typeof input !== "object" || Array.isArray(input)) return { ok: false, error: "Invalid card state." };
