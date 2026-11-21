@@ -518,6 +518,112 @@ handle("note-delete", (id) => withNotes(async () => {
   }
 }));
 
+// ---------- Suggestion card states ----------
+// What the user said about each suggestion card: trying it, snoozed until a date, or dismissed. Kept
+// per account, encrypted like notes, and only after the user acts on a card. Rule ids and dates only,
+// plus the one number a card was measured by when the user acted, so "trying" can show then and now.
+const CARDS_FILE = "cards.enc";
+const CARDS_VERSION = 1;
+const CARDS_MAX = 100;
+const CARD_ID = /^[a-z0-9-]{1,60}$/;
+const CARD_STATES = ["trying", "snoozed", "dismissed"];
+const CARD_UNITS = ["share", "hours", "lines", "count"];
+const SNOOZE_MAX_DAYS = 90;
+let cardsStore = null;
+let cardsNote = "";
+let cardsQueue = Promise.resolve();
+
+function withCards(operation) {
+  const pending = cardsQueue.then(operation);
+  cardsQueue = pending.catch(() => {});
+  return pending;
+}
+
+// The number a card was measured by, or null. Shares are 0 to 1; the others are bounded counts.
+function cleanCardMetric(m) {
+  if (!m || typeof m !== "object" || !CARD_UNITS.includes(m.unit) || typeof m.value !== "number" ||
+      !Number.isFinite(m.value) || m.value < 0 || m.value > (m.unit === "share" ? 1 : 1e7) ||
+      typeof m.label !== "string" || m.label.length > 80) return null;
+  return { unit: m.unit, value: m.value, label: m.label };
+}
+
+function cleanCard(c, now = Date.now()) {
+  if (!c || !CARD_STATES.includes(c.state) || typeof c.at !== "string" || !ISO_TIME.test(c.at)) return null;
+  const out = { state: c.state, at: c.at };
+  if (c.state === "snoozed") {
+    const until = typeof c.until === "string" && ISO_TIME.test(c.until) ? Date.parse(c.until) : NaN;
+    if (!(until > Date.parse(c.at)) || until - Date.parse(c.at) > SNOOZE_MAX_DAYS * 864e5 + 6e4) return null;
+    if (until <= now) return null; // an expired snooze is dropped on the next save
+    out.until = c.until;
+  }
+  const metric = cleanCardMetric(c.metric);
+  if (metric) out.metric = metric;
+  return out;
+}
+
+async function loadCards() {
+  if (cardsStore) return cardsStore;
+  const store = { version: CARDS_VERSION, accounts: {} };
+  const encrypted = readIfPresent(path.join(app.getPath("userData"), CARDS_FILE));
+  if (encrypted) {
+    try {
+      const parsed = JSON.parse((await safeStorage.decryptStringAsync(encrypted)).result);
+      if (parsed?.version !== CARDS_VERSION || !parsed.accounts || typeof parsed.accounts !== "object") throw new Error("format");
+      for (const [key, cards] of Object.entries(parsed.accounts)) {
+        if (!/^\d+$/.test(key) || !cards || typeof cards !== "object") continue;
+        const clean = {};
+        for (const [id, c] of Object.entries(cards).slice(0, CARDS_MAX)) {
+          const card = CARD_ID.test(id) ? cleanCard(c) : null;
+          if (card) clean[id] = card;
+        }
+        store.accounts[key] = clean;
+      }
+    } catch {
+      cardsNote = "Saved suggestion states could not be read, so every card starts fresh.";
+    }
+  }
+  cardsStore = store;
+  return store;
+}
+
+handle("cards", () => withCards(async () => {
+  if (!sessionUser) return { ok: false, error: signInFirst() };
+  try {
+    const store = await loadCards();
+    return { ok: true, cards: { ...(store.accounts[String(sessionUser.id)] || {}) }, note: cardsNote };
+  } catch {
+    return { ok: false, error: "Saved suggestion states could not be opened." };
+  }
+}));
+
+// Sets one card's state, or clears it with state null. The main process stamps the time itself.
+handle("card-set", (id, input) => withCards(async () => {
+  if (!sessionUser) return { ok: false, error: signInFirst() };
+  if (typeof id !== "string" || !CARD_ID.test(id)) return { ok: false, error: "Invalid card." };
+  let card = null;
+  if (input !== null) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) return { ok: false, error: "Invalid card state." };
+    const at = new Date().toISOString();
+    const days = input.state === "snoozed" ? input.days : 0;
+    if (input.state === "snoozed" && !(Number.isInteger(days) && days >= 1 && days <= SNOOZE_MAX_DAYS)) return { ok: false, error: "Invalid snooze." };
+    card = cleanCard({ state: input.state, at, until: days ? new Date(Date.now() + days * 864e5).toISOString() : undefined, metric: input.metric });
+    if (!card) return { ok: false, error: "Invalid card state." };
+  }
+  try {
+    const store = await loadCards();
+    const key = String(sessionUser.id);
+    const cards = store.accounts[key] || (store.accounts[key] = {});
+    if (card) cards[id] = card; else delete cards[id];
+    for (const [old, c] of Object.entries(cards)) if (c.state === "snoozed" && Date.parse(c.until) <= Date.now()) delete cards[old];
+    if (Object.keys(cards).length > CARDS_MAX) return { ok: false, error: "Too many saved suggestion states." };
+    await writeEncrypted(CARDS_FILE, JSON.stringify(store));
+    cardsNote = "";
+    return { ok: true, cards: { ...cards } };
+  } catch {
+    return { ok: false, error: "The suggestion state could not be saved." };
+  }
+}));
+
 // ---------- Public view ----------
 // Without a token, a username shows what GitHub serves to anyone: the profile, public events, public
 // repositories, and star dates. These requests carry no credential and count against GitHub's limit
@@ -753,6 +859,26 @@ function readingUrl(id) {
 handle("open-reading", async (id) => {
   const url = readingUrl(id);
   if (!url) return { ok: false, status: 400, error: "Unknown reading link." };
+  await shell.openExternal(url);
+  return { ok: true };
+});
+
+// A repository, or an issue or pull request in it, on github.com. The window sends only a repository
+// name and an optional number; the URL is built here, on github.com only, and nothing else is accepted.
+// /issues/<n> also reaches a pull request: GitHub redirects it.
+function githubPageUrl(repo, number) {
+  if (typeof repo !== "string") return null;
+  const [owner, name, extra] = repo.split("/");
+  if (extra !== undefined || !REPO_NAME.test(owner || "") || !REPO_NAME.test(name || "") ||
+      [owner, name].some((part) => part === "." || part === "..")) return null;
+  if (number !== null && number !== undefined && !(Number.isInteger(number) && number >= 1 && number <= 2147483647)) return null;
+  const url = new URL(`https://github.com/${owner}/${name}${number ? `/issues/${number}` : ""}`);
+  return url.hostname === "github.com" && url.protocol === "https:" ? url.href : null;
+}
+
+handle("open-github", async (repo, number) => {
+  const url = githubPageUrl(repo, number);
+  if (!url) return { ok: false, status: 400, error: "Not a GitHub repository or number." };
   await shell.openExternal(url);
   return { ok: true };
 });
