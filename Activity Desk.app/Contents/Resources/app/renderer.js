@@ -763,7 +763,7 @@ function computed() {
     prPatterns: prsLoaded ? prPatterns : null, review: a ? review : null, prInfo: a ? state.prInfo : null,
     trajectory, notes, notesNote: state.errors.notifications || "", footprint, conversations: state.conversations, token,
     collab: state.reviewed ? collab : null, outcomes, observations, chance,
-  }), state.public ? {} : state.cards, state.refreshedAt);
+  }), state.public ? {} : state.cards, state.refreshedAt, null, snapshots);
   const scoped = scopedSuggestions({ ev, eventsLoaded, sessions, follow, prsLoaded, trajectory, notes, footprint, token });
   return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, outcomes, observations, footprint, suggestions, chance, snapshots, scoped };
 }
@@ -1656,16 +1656,27 @@ function whereLine(text, ref) {
 }
 
 // Cards being tried, with the number each was measured by when you started and now.
-function tryingPanel(list) {
+function tryingPanel(list, scope) {
   if (!list.length) return "";
   const row = (t) => {
-    const change = t.then && t.now ? `${esc(t.label)}: ${esc(t.then)} → <strong>${esc(t.now)}</strong>${t.better == null ? "" : t.better ? " (lower)" : t.then === t.now ? " (no change)" : " (not lower yet)"}` : t.label ? `${esc(t.label)} is not measurable in the loaded data yet.` : "No number to follow for this card.";
+    const series = t.series ? `Week by week ${t.series.before ? `from ${esc(shortDate(t.series.start))}, the last saved week before you started` : `since ${esc(shortDate(t.series.start))}`}: ${t.series.values.map((v) => (v ? esc(v.text) : "…")).join(" → ")}${t.series.same ? " (no change)" : t.series.better ? " (lower)" : " (not lower yet)"}` : "";
+    const change = series ? `${esc(t.label || "")}. ${series}` : t.then && t.now ? `${esc(t.label)}: ${esc(t.then)} → <strong>${esc(t.now)}</strong>${t.better == null ? "" : t.better ? " (lower)" : t.then === t.now ? " (no change)" : " (not lower yet)"}` : t.label ? `${esc(t.label)} is not measurable in the loaded data yet.` : "No number to follow for this card.";
     const where = t.showing ? "" : ` <span class="muted small">· ${t.status === "clear" ? "No longer suggested" : esc(SUGGESTION_STATUS[t.status]?.[2] || "")}</span>`;
     return `<li><div><div>${esc(t.title)}${where}</div><div class="d">Since ${esc(shortDate(t.at))}. ${change}</div></div>
       <button type="button" class="link" data-card="${esc(t.key)}" data-state="">Stop</button></li>`;
   };
   return `<article class="card trying-panel"><h4>Trying</h4><ul class="cap">${list.map(row).join("")}</ul>
-    <p class="note">Each number covers the loaded window, the last ${AUTHORED_DAYS} days for pull requests, so a change you made shows up gradually as older work leaves the window.</p></article>`;
+    <p class="note">Each number covers the loaded window, the last ${AUTHORED_DAYS} days for pull requests, so a change you made shows up gradually as older work leaves the window.${weeklyNote(list, scope)}</p></article>`;
+}
+
+// Says where a trial's numbers come from: the weekly snapshots when saved history has them, or the
+// number saved when the trial started.
+function weeklyNote(list, scope) {
+  if (scope && list.some((t) => I.TRIAL_SNAPSHOTS[t.id])) return " Week by week is saved for the whole account, so a trial in one repository compares with its number when it started.";
+  if (list.some((t) => t.series)) return " Where saved history has weekly snapshots, a trial reads them from the week it started.";
+  if (!list.some((t) => t.weekly)) return "";
+  return state.savedHistory?.enabled ? " A trial reads its weekly snapshots once two weeks are saved."
+    : " Turn on saved history and a trial will read its weekly snapshots once two weeks are saved.";
 }
 
 // Snoozed and dismissed cards, each with an undo.
@@ -1738,7 +1749,7 @@ function renderSuggestions(c) {
     <p class="msg error" id="reading-status" role="status"></p>
     ${state.errors.cards ? `<p class="insight-notice">${esc(state.errors.cards)}</p>` : ""}
     ${scopeBar(c)}
-    ${tryingPanel(view.trying || [])}
+    ${tryingPanel(view.trying || [], view.scope)}
     ${items.length ? `<div class="grid suggestion-grid">${items.map(suggestionCard).join("")}</div>` : ""}
     ${setAsideList(view.snoozed || [], view.dismissed || [])}
     <details class="card checked">

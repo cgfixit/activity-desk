@@ -2111,6 +2111,44 @@ function clearlyWorse(unit, then, now) {
   return Number.isFinite(then) && Number.isFinite(now) && now - then > (WORSE_FLOOR[unit] ?? 0) && now >= then * 1.25;
 }
 
+// A card being tried reads its weekly snapshots when saved history has them. Each rule maps to the
+// snapshot number that measures the same thing, in the same unit as SUGGESTION_METRICS.
+const TRIAL_SNAPSHOTS = {
+  "trace-follow-up-fixes": { key: "reworkRate", unit: "share" },
+  "limit-open-work": { key: "medianMergeHours", unit: "hours" },
+  "merge-finished-work": { key: "waitingShare", unit: "share" },
+};
+const TRIAL_POINTS = 6;
+// The UTC Monday of a time, the same week key the main process saves snapshots under.
+function weekOf(at) {
+  const t = Date.parse(at);
+  if (!Number.isFinite(t)) return null;
+  const d = new Date(t);
+  d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+  return d.toISOString().slice(0, 10);
+}
+// The weekly series for a trial: the last saved week at or before the trial started, then every week
+// since. Null unless at least two weeks are known, so a single number never reads as a trend. Long
+// series keep the start and the latest weeks.
+function trialSeries(id, at, snapshots) {
+  const map = TRIAL_SNAPSHOTS[id];
+  const start = weekOf(at);
+  if (!map || !start || !snapshots?.rows) return null;
+  const points = snapshots.rows.find((r) => r.key === map.key)?.points || [];
+  const before = points.filter((p) => p.week <= start).pop();
+  const after = points.filter((p) => p.week > start);
+  const series = before ? [before, ...after] : after;
+  if (series.length < 2) return null;
+  const shown = series.length > TRIAL_POINTS ? [series[0], null, ...series.slice(-(TRIAL_POINTS - 2))] : series;
+  const text = (v) => metricText({ unit: map.unit }, v);
+  return {
+    key: map.key, start: series[0].week, before: series[0].week < start, weeks: series.length,
+    values: shown.map((p) => (p ? { week: p.week, text: text(p.value) } : null)),
+    better: series[series.length - 1].value < series[0].value,
+    same: series[series.length - 1].value === series[0].value,
+  };
+}
+
 // ---------- One repository at a time ----------
 // Rules that read the Events feed, the contribution calendar, notifications, conversations, traffic, or
 // the token describe the whole account, so a repository view shows them unchanged and says so.
@@ -2144,7 +2182,8 @@ const cardKey = (id, scope) => (scope && !ACCOUNT_RULES.has(id) ? `${id}@${scope
 
 // Sorts suggestions by what the user said about each card: trying, snoozed until a date, or
 // dismissed. `states` maps a card key to { state, at, until, metric } as the main process saved it.
-function applyCardStates(suggestions, allStates, now, scope = null) {
+// `snapshots` is summarizeSnapshots' result. It is account-wide, so a repository view ignores it.
+function applyCardStates(suggestions, allStates, now, scope = null, snapshots = null) {
   const nowTime = now == null ? Date.now() : new Date(now).getTime();
   const all = allStates && typeof allStates === "object" ? allStates : {};
   // This view's states, by rule id. A key for another view is left alone.
@@ -2193,6 +2232,8 @@ function applyCardStates(suggestions, allStates, now, scope = null) {
       now: metric ? metricText(metric, metric.value) : null,
       label: metric?.label || st.metric?.label || null,
       better: st.metric && metric ? metric.value < st.metric.value : null,
+      series: scope ? null : trialSeries(id, st.at, snapshots),
+      weekly: !scope && Boolean(TRIAL_SNAPSHOTS[id]),
     });
   }
   for (const c of checked) {
@@ -2973,6 +3014,8 @@ const api = {
   deriveObservations,
   deriveSuggestions,
   applyCardStates,
+  trialSeries,
+  TRIAL_SNAPSHOTS,
   scopeRepos,
   SUGGEST_MIN_MERGES,
   scopePullRequests,

@@ -550,3 +550,20 @@ test("scopes suggestions to one repository and keys card states per view", () =>
   assert.deepEqual(insights.applyCardStates(suggestions, states, "2026-11-21T00:00:00Z").items.map((i) => i.key), ["smaller-prs"]);
   assert.deepEqual(insights.applyCardStates(suggestions, states, "2026-11-21T00:00:00Z", "me/c").items.map((i) => i.key), ["smaller-prs@me/c"]);
 });
+
+test("reads a trial's weekly snapshots from the week it started", () => {
+  const snaps = insights.summarizeSnapshots({
+    "2026-10-26": { medianMergeHours: 30, waitingShare: 0.5 },
+    "2026-11-02": { medianMergeHours: 28 },
+    "2026-11-09": { medianMergeHours: 18 },
+  }, { medianMergeHours: 9 }, "2026-11-16");
+  const s = insights.trialSeries("limit-open-work", "2026-11-05T12:00:00Z", snaps);
+  assert.deepEqual([s.start, s.values.map((v) => v.text), s.better], ["2026-11-02", ["28 h", "18 h", "9.0 h"], true]);
+  // One saved week is not a series, an unmapped rule has none, and a repository view ignores account weeks.
+  assert.equal(insights.trialSeries("merge-finished-work", "2026-11-05T12:00:00Z", snaps), null);
+  assert.equal(insights.trialSeries("smaller-prs", "2026-11-05T12:00:00Z", snaps), null);
+  const sug = { items: [], checked: [{ id: "limit-open-work", title: "L", status: "clear", metric: { unit: "hours", value: 9, label: "M" } }], links: {} };
+  const st = { at: "2026-11-05T12:00:00Z", state: "trying", metric: { unit: "hours", value: 28, label: "M" } };
+  assert.equal(insights.applyCardStates(sug, { "limit-open-work": st }, null, null, snaps).trying[0].series.weeks, 3);
+  assert.equal(insights.applyCardStates(sug, { "limit-open-work@me/a": st }, null, "me/a", snaps).trying[0].series, null);
+});
