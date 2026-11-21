@@ -2111,11 +2111,48 @@ function clearlyWorse(unit, then, now) {
   return Number.isFinite(then) && Number.isFinite(now) && now - then > (WORSE_FLOOR[unit] ?? 0) && now >= then * 1.25;
 }
 
+// ---------- One repository at a time ----------
+// Rules that read the Events feed, the contribution calendar, notifications, conversations, traffic, or
+// the token describe the whole account, so a repository view shows them unchanged and says so.
+const ACCOUNT_RULES = new Set(["agree-before-building", "branches-without-prs", "answer-waiting-threads", "batch-by-repo",
+  "re-entry-notes", "late-night-review", "ci-notifications", "labels-not-prefixes", "readme-first-screen", "fine-grained-token"]);
+const SCOPE_MIN_MERGES = SUGGEST_MIN_MERGES;
+
+// Repositories where you merged enough loaded pull requests to scope Suggestions to, busiest first.
+function scopeRepos(prInfo, login) {
+  const me = String(login || "").toLowerCase();
+  const counts = new Map();
+  for (const pr of Object.values(prInfo || {})) {
+    if (!pr?.repo || String(pr.author || "").toLowerCase() !== me) continue;
+    const c = counts.get(pr.repo) || { repo: pr.repo, opened: 0, merged: 0 };
+    c.opened += 1;
+    if (pr.merged) c.merged += 1;
+    counts.set(pr.repo, c);
+  }
+  return [...counts.values()].filter((c) => c.merged >= SCOPE_MIN_MERGES)
+    .sort((a, b) => b.merged - a.merged || a.repo.localeCompare(b.repo));
+}
+
+// The loaded pull requests in one repository, keyed as before, for running the same summaries on.
+function scopePullRequests(prInfo, repo) {
+  return Object.fromEntries(Object.entries(prInfo || {}).filter(([, pr]) => pr?.repo === repo));
+}
+
+// A card's state is kept per view: the rule id in the account view, rule@owner/repo in a repository
+// view. Account-wide rules keep one state in every view, since they show the same thing in each.
+const cardKey = (id, scope) => (scope && !ACCOUNT_RULES.has(id) ? `${id}@${scope}` : id);
+
 // Sorts suggestions by what the user said about each card: trying, snoozed until a date, or
-// dismissed. `states` maps rule id to { state, at, until, metric } as the main process saved it.
-function applyCardStates(suggestions, states, now) {
+// dismissed. `states` maps a card key to { state, at, until, metric } as the main process saved it.
+function applyCardStates(suggestions, allStates, now, scope = null) {
   const nowTime = now == null ? Date.now() : new Date(now).getTime();
-  const saved = states && typeof states === "object" ? states : {};
+  const all = allStates && typeof allStates === "object" ? allStates : {};
+  // This view's states, by rule id. A key for another view is left alone.
+  const saved = {};
+  for (const [key, st] of Object.entries(all)) {
+    const id = key.split("@")[0];
+    if (cardKey(id, scope) === key) saved[id] = st;
+  }
   const byId = new Map(suggestions.items.map((i) => [i.id, i]));
   const items = [];
   const trying = [];
@@ -2151,7 +2188,7 @@ function applyCardStates(suggestions, states, now) {
     if (!check) continue;
     const metric = (shown || byId.get(id))?.metric || check.metric || null;
     trying.push({
-      id, title: check.title, at: st.at, showing: Boolean(shown), status: check.status,
+      id, key: cardKey(id, scope), title: check.title, at: st.at, showing: Boolean(shown), status: check.status,
       then: st.metric && metric ? metricText(metric, st.metric.value) : null,
       now: metric ? metricText(metric, metric.value) : null,
       label: metric?.label || st.metric?.label || null,
@@ -2168,7 +2205,8 @@ function applyCardStates(suggestions, states, now) {
   items.sort((a, b) => Number(Boolean(b.trying)) - Number(Boolean(a.trying)));
   const showing = new Set(items.map((i) => i.id));
   const links = Object.fromEntries(Object.entries(suggestions.links || {}).filter(([, l]) => showing.has(l.id)));
-  return { ...suggestions, items, trying, snoozed, dismissed, checked, links };
+  const keyed = (x) => ({ ...x, key: cardKey(x.id, scope) });
+  return { ...suggestions, items: items.map(keyed), trying, snoozed: snoozed.map(keyed), dismissed: dismissed.map(keyed), checked, links, scope };
 }
 
 // Where lines as text, with an aligned list of what each one names on github.com (or null).
@@ -2192,10 +2230,11 @@ function deriveSuggestions(input) {
     const result = rule.check(x, { me, nowTime });
     const measured = SUGGESTION_METRICS[rule.id]?.(x);
     const metric = measured && Number.isFinite(measured.value) ? measured : null;
-    const base = { id: rule.id, area: rule.area, source: result?.source || rule.source, title: rule.title, metric, pinned: PINNED_SUGGESTIONS.has(rule.id) };
+    const accountWide = Boolean(x.scope) && ACCOUNT_RULES.has(rule.id);
+    const base = { id: rule.id, area: rule.area, source: result?.source || rule.source, title: rule.title, metric, pinned: PINNED_SUGGESTIONS.has(rule.id), accountWide };
     if (!result) checked.push({ ...base, status: "clear" });
     else if (result.unavailable) checked.push({ ...base, status: "unavailable", detail: result.unavailable });
-    else if (result.short) checked.push({ ...base, status: "short", detail: result.short });
+    else if (result.short) checked.push({ ...base, status: "short", detail: x.scope && !accountWide ? `${result.short} Counted in ${x.scope} only.` : result.short });
     else {
       shown.set(rule.id, { ...base, title: result.title || rule.title, tone: result.tone, seen: result.seen, why: result.why || [], act: result.act || [],
         more: result.more || [], basis: result.basis || "", ...whereLines(result.targets),
@@ -2934,6 +2973,11 @@ const api = {
   deriveObservations,
   deriveSuggestions,
   applyCardStates,
+  scopeRepos,
+  SUGGEST_MIN_MERGES,
+  scopePullRequests,
+  cardKey,
+  ACCOUNT_RULES,
   SNOOZE_DAYS,
   READING,
   REWORK_HOURS,

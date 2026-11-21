@@ -533,3 +533,20 @@ test("sorts suggestions by card state and brings a dismissed card back when its 
   assert.deepEqual(r.trying.map((t) => [t.id, t.showing, t.then, t.now, t.better]), [["a", true, "40%", "20%", true], ["e", false, "30 h", "5.0 h", true]]);
   assert.deepEqual(Object.keys(r.links), ["fb"]);
 });
+
+test("scopes suggestions to one repository and keys card states per view", () => {
+  const pr = (repo, number, merged) => [`${repo}#${number}`, { title: "T", repo, number, author: "me", merged, state: merged ? "MERGED" : "OPEN" }];
+  const info = Object.fromEntries([pr("me/a", 1, true), pr("me/a", 2, true), pr("me/a", 3, true), pr("me/a", 4, false),
+    pr("me/b", 1, true), pr("me/b", 2, true), pr("me/c", 1, true), pr("me/c", 2, true), pr("me/c", 3, true), pr("me/c", 4, true)]);
+  assert.deepEqual(insights.scopeRepos(info, "me").map((r) => [r.repo, r.merged, r.opened]), [["me/c", 4, 4], ["me/a", 3, 4]]);
+  assert.deepEqual(Object.keys(insights.scopePullRequests(info, "me/b")), ["me/b#1", "me/b#2"]);
+  assert.equal(insights.cardKey("smaller-prs", "me/a"), "smaller-prs@me/a");
+  assert.equal(insights.cardKey("late-night-review", "me/a"), "late-night-review");
+  const item = (id) => ({ id, title: id, metric: null, targets: [], refs: [], also: [], why: [], act: [] });
+  const suggestions = { items: [item("smaller-prs"), item("late-night-review")], checked: [], links: {} };
+  const states = { "smaller-prs@me/a": { state: "dismissed", at: "2026-11-20T00:00:00Z" }, "late-night-review": { state: "dismissed", at: "2026-11-20T00:00:00Z" } };
+  // In me/a both are set aside; in the account view only the account-wide one is; in me/c the same.
+  assert.deepEqual(insights.applyCardStates(suggestions, states, "2026-11-21T00:00:00Z", "me/a").items.map((i) => i.key), []);
+  assert.deepEqual(insights.applyCardStates(suggestions, states, "2026-11-21T00:00:00Z").items.map((i) => i.key), ["smaller-prs"]);
+  assert.deepEqual(insights.applyCardStates(suggestions, states, "2026-11-21T00:00:00Z", "me/c").items.map((i) => i.key), ["smaller-prs@me/c"]);
+});

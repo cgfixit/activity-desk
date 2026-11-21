@@ -50,6 +50,7 @@ const initialState = {
   prLookup: { authored: null, referenced: { total: 0, covered: 0, asked: 0, found: 0 }, commits: null },
   snapshotSaved: false,
   cards: {},
+  suggestScope: "",
   rateLimit: null,
   tokenMeta: null,
   footprint: null,
@@ -763,7 +764,37 @@ function computed() {
     trajectory, notes, notesNote: state.errors.notifications || "", footprint, conversations: state.conversations, token,
     collab: state.reviewed ? collab : null, outcomes, observations, chance,
   }), state.public ? {} : state.cards, state.refreshedAt);
-  return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, outcomes, observations, footprint, suggestions, chance, snapshots };
+  const scoped = scopedSuggestions({ ev, eventsLoaded, sessions, follow, prsLoaded, trajectory, notes, footprint, token });
+  return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, outcomes, observations, footprint, suggestions, chance, snapshots, scoped };
+}
+
+// Suggestions for one repository: the pull request rules run on that repository's pull requests,
+// with their own chance budget, while feed, calendar, traffic, and token rules stay account-wide.
+// Null in the account view, or when the chosen repository no longer has enough loaded merges.
+function scopedSuggestions({ ev, eventsLoaded, sessions, follow, prsLoaded, trajectory, notes, footprint, token }) {
+  const login = state.user && state.user.login;
+  const repos = I.scopeRepos(state.prInfo, login);
+  const repo = state.suggestScope;
+  if (!repo || !repos.some((r) => r.repo === repo)) return null;
+  const a = state.prLookup.authored;
+  const prInfo = I.scopePullRequests(state.prInfo, repo);
+  const prPatterns = I.summarizePrPatterns(prInfo, state.refreshedAt);
+  const review = I.summarizeReviewFlow(prInfo, login);
+  const reviewed = state.reviewed ? I.scopePullRequests(state.reviewed.info, repo) : null;
+  const complete = Boolean(a && state.reviewed && !a.capped && !state.reviewed.capped);
+  const collab = I.summarizeCollaboration(prInfo, reviewed, login, { complete });
+  const outcomes = a ? I.summarizeOutcomes(prInfo, login, state.refreshedAt) : null;
+  // The trajectory belongs to the whole account, so the repository's budget leaves it out.
+  const chance = I.chanceBudget({ prs: prPatterns, outcomes });
+  const result = I.deriveSuggestions({
+    login, now: state.refreshedAt, scope: repo,
+    ev: eventsLoaded ? ev : null, sessions: eventsLoaded ? sessions : null,
+    follow: eventsLoaded && prsLoaded ? follow : null,
+    prPatterns: prsLoaded ? prPatterns : null, review: a ? review : null, prInfo: a ? prInfo : null,
+    trajectory, notes, notesNote: state.errors.notifications || "", footprint, conversations: state.conversations, token,
+    collab: state.reviewed ? collab : null, outcomes, observations: [], chance,
+  });
+  return { ...I.applyCardStates(result, state.public ? {} : state.cards, state.refreshedAt, repo), chance, repo: repos.find((r) => r.repo === repo) };
 }
 
 function renderOverview(c) {
@@ -1569,12 +1600,12 @@ function cardActions(s) {
     const m = s.metric;
     const then = s.trying.then && s.trying.now ? `. ${esc(m.label)}: ${esc(s.trying.then)} then, ${esc(s.trying.now)} now` : "";
     return `<div class="card-actions"><span class="trying-since">Trying since ${esc(shortDate(s.trying.at))}${then}</span>
-      <button type="button" class="link" data-card="${esc(s.id)}" data-state="">Stop trying</button></div>`;
+      <button type="button" class="link" data-card="${esc(s.key)}" data-state="">Stop trying</button></div>`;
   }
   return `<div class="card-actions">
-    <button type="button" class="link" data-card="${esc(s.id)}" data-state="trying"${metric}>Trying this</button>
-    ${I.SNOOZE_DAYS.map((d) => `<button type="button" class="link" data-card="${esc(s.id)}" data-state="snoozed" data-days="${d}">Snooze ${d} days</button>`).join("")}
-    <button type="button" class="link" data-card="${esc(s.id)}" data-state="dismissed"${metric}>Dismiss</button></div>`;
+    <button type="button" class="link" data-card="${esc(s.key)}" data-state="trying"${metric}>Trying this</button>
+    ${I.SNOOZE_DAYS.map((d) => `<button type="button" class="link" data-card="${esc(s.key)}" data-state="snoozed" data-days="${d}">Snooze ${d} days</button>`).join("")}
+    <button type="button" class="link" data-card="${esc(s.key)}" data-state="dismissed"${metric}>Dismiss</button></div>`;
 }
 const readingHost = (url) => new URL(url).hostname.replace(/^www\./, "");
 
@@ -1597,7 +1628,7 @@ function suggestionCard(s) {
     `<button type="button" class="link" data-finding="${esc(f.id)}">${esc(f.title)}</button>`).join(" · ")}</p>` : "";
   const back = s.returned ? `<p class="returned">Back after you dismissed it on ${esc(shortDate(s.returned.at))}: ${esc(s.returned.label.toLowerCase())} was ${esc(s.returned.then)}, now ${esc(s.returned.now)}.</p>` : "";
   return `<article class="card suggestion ${esc(s.tone)}${s.trying ? " is-trying" : ""}" id="suggestion-${esc(s.id)}" tabindex="-1">
-    <div class="suggestion-tags"><span class="src area">${esc(s.area)}</span>${sourceTag(s.source)}${s.confirmed ? '<span class="src confirmed" title="The gap or correlation behind this suggestion passed its chance check.">Beyond chance</span>' : ""}</div>
+    <div class="suggestion-tags"><span class="src area">${esc(s.area)}</span>${sourceTag(s.source)}${s.accountWide ? '<span class="src" title="The same in every repository view.">Account-wide</span>' : ""}${s.confirmed ? '<span class="src confirmed" title="The gap or correlation behind this suggestion passed its chance check.">Beyond chance</span>' : ""}</div>
     <h4>${esc(s.title)}</h4>
     ${back}
     ${s.basis ? `<p class="basis">Based on ${esc(s.basis)}</p>` : ""}
@@ -1631,7 +1662,7 @@ function tryingPanel(list) {
     const change = t.then && t.now ? `${esc(t.label)}: ${esc(t.then)} → <strong>${esc(t.now)}</strong>${t.better == null ? "" : t.better ? " (lower)" : t.then === t.now ? " (no change)" : " (not lower yet)"}` : t.label ? `${esc(t.label)} is not measurable in the loaded data yet.` : "No number to follow for this card.";
     const where = t.showing ? "" : ` <span class="muted small">· ${t.status === "clear" ? "No longer suggested" : esc(SUGGESTION_STATUS[t.status]?.[2] || "")}</span>`;
     return `<li><div><div>${esc(t.title)}${where}</div><div class="d">Since ${esc(shortDate(t.at))}. ${change}</div></div>
-      <button type="button" class="link" data-card="${esc(t.id)}" data-state="">Stop</button></li>`;
+      <button type="button" class="link" data-card="${esc(t.key)}" data-state="">Stop</button></li>`;
   };
   return `<article class="card trying-panel"><h4>Trying</h4><ul class="cap">${list.map(row).join("")}</ul>
     <p class="note">Each number covers the loaded window, the last ${AUTHORED_DAYS} days for pull requests, so a change you made shows up gradually as older work leaves the window.</p></article>`;
@@ -1642,20 +1673,22 @@ function setAsideList(snoozed, dismissed) {
   const all = [...snoozed.map((x) => [x, `Snoozed until ${shortDate(x.until)}`]), ...dismissed.map((x) => [x, `Dismissed ${shortDate(x.dismissedAt)}`])];
   if (!all.length) return "";
   return `<details class="card set-aside"><summary>Set aside: ${fmt(all.length)}</summary><ul class="cap">${all.map(([x, label]) =>
-    `<li><div><div>${esc(x.title)} <span class="muted small">· ${esc(label)}</span></div></div><button type="button" class="link" data-card="${esc(x.id)}" data-state="">Show again</button></li>`).join("")}</ul>
+    `<li><div><div>${esc(x.title)} <span class="muted small">· ${esc(label)}</span></div></div><button type="button" class="link" data-card="${esc(x.key)}" data-state="">Show again</button></li>`).join("")}</ul>
     <p class="note">A dismissed card comes back on its own when the number it was measured by gets clearly worse. The token-access warning cannot be set aside.</p></details>`;
 }
 
 // Saves a card's state in the main process. Trying and dismissing record the card's number now.
-async function setCardState(id, next, days) {
+async function setCardState(key, next, days) {
   const account = state;
   if (account.public) return;
-  const shown = computed().suggestions;
-  const item = shown.items.find((i) => i.id === id) || shown.checked.find((i) => i.id === id);
+  const c = computed();
+  const shown = c.scoped || c.suggestions;
+  const id = key.split("@")[0];
+  const item = shown.items.find((i) => i.key === key) || shown.checked.find((i) => i.id === id);
   const input = next ? { state: next, ...(next === "snoozed" ? { days } : {}), ...(item?.metric ? { metric: item.metric } : {}) } : null;
   let result;
   try {
-    result = await window.desk.setCard(id, input);
+    result = await window.desk.setCard(key, input);
   } catch {
     result = { ok: false, error: "The suggestion state could not be saved." };
   }
@@ -1672,8 +1705,24 @@ async function setCardState(id, next, days) {
   if (target) target.focus({ preventScroll: false });
 }
 
+// The repository picker, and what a repository view counts and leaves account-wide.
+function scopeBar(c) {
+  const repos = I.scopeRepos(state.prInfo, state.user && state.user.login);
+  if (!repos.length) return "";
+  const options = [`<option value="">All repositories</option>`, ...repos.map((r) =>
+    `<option value="${esc(r.repo)}"${r.repo === state.suggestScope ? " selected" : ""}>${esc(r.repo)} (${fmt(r.merged)} ${r.merged === 1 ? "merge" : "merges"})</option>`)];
+  const s = c.scoped;
+  const passed = s ? s.chance.entries.filter((t) => t.clear).length : 0;
+  const note = s
+    ? `Pull request suggestions count only the ${fmt(s.repo.opened)} pull ${s.repo.opened === 1 ? "request" : "requests"} you opened in ${esc(s.repo.repo)} that loaded, ${fmt(s.repo.merged)} of them merged, so more cards read Not enough data than in the full view. ${s.chance.tested ? `This view runs its own ${fmt(s.chance.tested)} chance ${s.chance.tested === 1 ? "check" : "checks"} under its own shared bar, and ${fmt(passed)} passed.` : "No chance check has enough merges in this repository."} Cards tagged Account-wide come from the Events feed, the contribution calendar, notifications, conversations, traffic, or the token, and are the same in every view. Trying, snoozing, and dismissing here apply to this repository only, except on Account-wide cards. From Patterns links appear in the All repositories view, since Patterns describes the whole account.`
+    : `Choose a repository with at least ${fmt(I.SUGGEST_MIN_MERGES)} loaded merges of yours to see its suggestions alone.`;
+  return `<div class="card scope-bar"><label for="suggest-scope">Suggestions for</label>
+    <select id="suggest-scope">${options.join("")}</select><p class="note">${note}</p></div>`;
+}
+
 function renderSuggestions(c) {
-  const { items, checked } = c.suggestions;
+  const view = c.scoped || c.suggestions;
+  const { items, checked } = view;
   $("suggestion-count").textContent = items.length ? String(items.length) : "";
   $("suggestions-caption").textContent = items.length
     ? `${items.length} ${items.length === 1 ? "change" : "changes"} to try, each triggered by a pattern in the loaded data. Each card says what it saw and what to try. Where it gives a reason, each claim links to its source. Warnings rest on an outcome in your own data or on access. Advice about review stays a note unless your merges back it.`
@@ -1688,9 +1737,10 @@ function renderSuggestions(c) {
     ${notice ? `<p class="insight-notice">${esc(notice)}</p>` : ""}
     <p class="msg error" id="reading-status" role="status"></p>
     ${state.errors.cards ? `<p class="insight-notice">${esc(state.errors.cards)}</p>` : ""}
-    ${tryingPanel(c.suggestions.trying || [])}
+    ${scopeBar(c)}
+    ${tryingPanel(view.trying || [])}
     ${items.length ? `<div class="grid suggestion-grid">${items.map(suggestionCard).join("")}</div>` : ""}
-    ${setAsideList(c.suggestions.snoozed || [], c.suggestions.dismissed || [])}
+    ${setAsideList(view.snoozed || [], view.dismissed || [])}
     <details class="card checked">
       <summary>What was checked: ${fmt(items.length)} of ${fmt(checked.length)} suggested</summary>
       <ul class="cap">${rows}</ul>
@@ -2467,6 +2517,12 @@ $("insights").addEventListener("click", (event) => {
   if (!button) return;
   showTab("suggestions");
   jumpTo(`#suggestion-${CSS.escape(button.dataset.suggestion)}`);
+});
+$("suggestions").addEventListener("change", (event) => {
+  if (event.target.id !== "suggest-scope") return;
+  state.suggestScope = event.target.value;
+  renderAll();
+  $("suggest-scope")?.focus();
 });
 $("suggestions").addEventListener("click", async (event) => {
   const page = event.target.closest("[data-open-repo]");
