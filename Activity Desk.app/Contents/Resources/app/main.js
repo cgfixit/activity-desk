@@ -738,9 +738,34 @@ function publicRequest(operation, args, login) {
       if (!validRepo(args?.repo) || !mine(args.repo.split("/")[0])) break;
       return { route: `/repos/${args.repo}/stargazers?per_page=100`, accept: "application/vnd.github.star+json" };
     }
+    // Public pull requests the username opened in the authored window, by GitHub's issue search. Search has
+    // its own limit without a token, 10 requests a minute, apart from the 60 an hour for other reads.
+    case "authoredPullRequests": {
+      const { login: asked, page } = args || {};
+      if (!mine(asked) || !Number.isInteger(page) || page < 1 || page > 3) break;
+      const since = new Date(Date.now() - AUTHORED_DAYS * 864e5).toISOString().slice(0, 10);
+      const q = encodeURIComponent(`author:${login} is:pr is:public created:>=${since}`);
+      return { route: `/search/issues?q=${q}&sort=created&order=desc&per_page=100&page=${page}` };
+    }
     case "rateLimit": return { route: "/rate_limit" };
   }
   return null;
+}
+
+// A public search page reduced to what a pull request record needs. Search returns no reviews, sizes,
+// branches, or commits, so the window marks those unknown rather than zero.
+function shapePublicSearch(body) {
+  const data = JSON.parse(body);
+  const repoOf = (url) => {
+    const match = typeof url === "string" ? /^https:\/\/api\.github\.com\/repos\/([^/]+\/[^/]+)$/.exec(url) : null;
+    return match && validRepo(match[1]) ? match[1] : null;
+  };
+  const items = (Array.isArray(data?.items) ? data.items : []).filter((i) => i?.pull_request && Number.isInteger(i.number) && repoOf(i.repository_url)).map((i) => ({
+    repo: repoOf(i.repository_url), number: i.number, title: typeof i.title === "string" ? i.title : "", state: i.state === "open" ? "open" : "closed",
+    draft: Boolean(i.draft), createdAt: i.created_at, closedAt: i.closed_at || null, mergedAt: i.pull_request.merged_at || null,
+    author: typeof i.user?.login === "string" ? i.user.login : null, authorType: typeof i.user?.type === "string" ? i.user.type : null,
+  }));
+  return JSON.stringify({ total: Number.isInteger(data?.total_count) ? data.total_count : items.length, incomplete: Boolean(data?.incomplete_results), items });
 }
 
 async function publicRead(operation, args, login, signal) {
@@ -762,8 +787,10 @@ async function publicRead(operation, args, login, signal) {
       const { id, login: name, name: display, created_at: createdAt, followers, public_repos: publicRepos } = JSON.parse(body);
       body = JSON.stringify({ id, login: name, name: display, createdAt, followers, publicRepos });
       if (!signal.aborted && Number.isSafeInteger(id) && typeof name === "string" && LOGIN.test(name)) publicUser = { id, login: name };
+    } else if (operation === "authoredPullRequests") {
+      body = shapePublicSearch(body);
     } else {
-      body = shapeBody(operation, body);
+      body = shapeBody(operation, body, { search: true });
     }
     return { ok: true, status: response.status, body, link: response.headers.get("link"), remaining, via: "public" };
   } catch {
@@ -1160,7 +1187,8 @@ const tokenInfo = (response) => ({
 });
 
 // Reduces a response to the fields the renderer uses, the same way with or without a token.
-function shapeBody(operation, body) {
+// `search` keeps the search limit too, which only the public view spends.
+function shapeBody(operation, body, { search = false } = {}) {
   if (operation === "ownedRepos") {
     const repos = JSON.parse(body);
     return JSON.stringify((Array.isArray(repos) ? repos : []).filter((r) => validRepo(r?.full_name)).map((r) => ({
@@ -1175,7 +1203,7 @@ function shapeBody(operation, body) {
   if (operation === "rateLimit") {
     const resources = JSON.parse(body)?.resources || {};
     const kept = {};
-    for (const name of RATE_RESOURCES) {
+    for (const name of search ? [...RATE_RESOURCES, "search"] : RATE_RESOURCES) {
       const r = resources[name];
       if (r && [r.limit, r.remaining, r.used, r.reset].every(Number.isFinite)) {
         kept[name] = { limit: r.limit, remaining: r.remaining, used: r.used, reset: r.reset };

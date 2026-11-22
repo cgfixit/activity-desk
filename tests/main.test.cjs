@@ -352,6 +352,20 @@ test("the public view sends no credential, reads only public routes for one user
   assert.deepEqual(routes(), ["/users/fixture", "/users/fixture/events/public?per_page=100&page=1",
     "/users/fixture/repos?type=owner&sort=pushed&per_page=100", "/repos/fixture/example/stargazers?per_page=100", "/rate_limit"]);
 
+  // Public pull requests come from issue search, for this username only, shaped to the fields a record needs.
+  const searchStart = calls.length;
+  const found = await invoke("github", "authoredPullRequests", { login: "fixture", page: 1 });
+  assert.equal(found.ok, true);
+  const searched = new URL(calls[searchStart].url);
+  assert.equal(searched.pathname, "/search/issues");
+  assert.match(searched.searchParams.get("q"), /^author:fixture is:pr is:public created:>=\d{4}-\d{2}-\d{2}$/);
+  assert.deepEqual([searched.searchParams.get("sort"), searched.searchParams.get("per_page"), searched.searchParams.get("page")], ["created", "100", "1"]);
+  assert.deepEqual(JSON.parse(found.body), { total: 0, incomplete: false, items: [] });
+  for (const args of [{ login: "someone", page: 1 }, { login: "fixture", page: 4 }, { login: "fixture" }]) {
+    assert.equal((await invoke("github", "authoredPullRequests", args)).ok, false);
+  }
+  routes();
+
   // Anything outside the public allowlist, or about another account, stops in the main process.
   for (const [operation, args, slot] of [["notifications"], ["year"], ["conversations", { login: "fixture" }], ["traffic", { repo: "fixture/example", kind: "views" }],
     ["events", { login: "someone", page: 1 }], ["stargazers", { repo: "someone/example" }], ["profile", undefined, "classic"]]) {

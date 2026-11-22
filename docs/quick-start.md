@@ -14,6 +14,6 @@ You can also sign in with a classic token first and add a fine-grained one later
 
 ## Without a token
 
-To look before you create a token, type a GitHub username under **GitHub username, without a token** on the sign-in screen and select **View public activity**. Activity Desk shows that account's public events, public repositories, and stars. Everything else needs a token, and you can add one later in **Data & access** without starting over. See [Viewing without a token](user-guide.md#viewing-without-a-token).
+To look before you create a token, type a GitHub username under **GitHub username, without a token** on the sign-in screen and select **View public activity**. Activity Desk shows that account's public events, public repositories, stars, and the public pull requests it opened in the last 90 days, with merge times, follow-up fixes, and open work. Everything else needs a token, and you can add one later in **Data & access** without starting over. See [Viewing without a token](user-guide.md#viewing-without-a-token).
 
 For a local build, see [Development and releases](development.md).

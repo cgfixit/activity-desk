@@ -638,3 +638,31 @@ test("lists review requests and threads that wait on you, oldest first", () => {
   assert.deepEqual(card.refs.slice(0, 2), [{ repo: "t/o", number: 51 }, { repo: "t/o", number: 52 }]);
   assert.equal(insights.deriveSuggestions({ login: "me", now, requests }).checked.find((c) => c.id === "answer-review-requests").status, "short");
 });
+
+test("reads public search records as unknown where search has no reviews, sizes, or branches", () => {
+  const H = 36e5;
+  const now = Date.parse("2026-11-20T12:00:00Z");
+  const iso = (t) => new Date(t).toISOString();
+  const item = (number, daysAgo, hours, extra = {}) => ({ repo: "me/r", number, title: `Change ${number}`, state: "closed", draft: false, author: "me", authorType: "User",
+    createdAt: iso(now - daysAgo * 24 * H), closedAt: iso(now - daysAgo * 24 * H + hours * H), mergedAt: iso(now - daysAgo * 24 * H + hours * H), ...extra });
+  const items = [...Array.from({ length: 8 }, (_, i) => item(i + 1, 60 - i * 5, 5 + i * 4)),
+    item(20, 30, 10, { mergedAt: null }), item(21, 3, 0, { state: "open", closedAt: null, mergedAt: null }), { repo: "me/r", number: 22, title: "x", createdAt: "bad" }];
+  const info = Object.fromEntries(items.map(insights.normalizeSearchPullRequest).filter(Boolean).map((pr) => [insights.prKey(pr.repo, pr.number), pr]));
+  assert.equal(Object.keys(info).length, 10);
+  assert.deepEqual(["MERGED", "CLOSED", "OPEN"].map((st) => Object.values(info).filter((p) => p.state === st).length), [8, 1, 1]);
+  const pr = insights.summarizePullRequests(info, "me");
+  // Unknown is not zero: no merge reads as unreviewed, and no size is reported.
+  assert.deepEqual([pr.unreviewed.length, pr.medianSize, pr.largest.length], [0, null, 0]);
+  const patterns = insights.summarizePrPatterns(info, now);
+  assert.deepEqual([patterns.smaller, patterns.sizeVsTime, patterns.mergedLines, patterns.sizedMerged], [null, null, 0, 0]);
+  const outcomes = insights.summarizeOutcomes(info, "me", now);
+  assert.ok(outcomes.rework.groups.every((g) => ["speed", "late"].includes(g.key)));
+  assert.equal(outcomes.baseline.n, 8);
+  assert.deepEqual(insights.summarizeReviewFlow(info, "me").outcomes, { merged: 8, closed: 1, open: 1 });
+  const checked = insights.deriveSuggestions({ login: "me", now, prPatterns: patterns, prInfo: info, outcomes, publicView: true }).checked;
+  for (const id of ["smaller-prs", "review-before-merge", "merge-finished-work", "branches-without-prs"]) {
+    const c = checked.find((x) => x.id === id);
+    assert.equal(c.status, "unavailable", id);
+    assert.match(c.detail, /^Needs a token\./, id);
+  }
+});

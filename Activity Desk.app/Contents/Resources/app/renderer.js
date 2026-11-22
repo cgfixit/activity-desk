@@ -27,7 +27,7 @@ const PUBLIC_STAR_REPOS = 3; // star dates read without a token, to stay inside 
 const NEEDS_TOKEN = {
   year: "The contribution calendar needs a token.",
   years: "Contribution history needs a token.",
-  authored: "Pull request details need a token.",
+  authored: "Reviews, sizes, and branches of pull requests need a token. Public pull requests load by search.",
   reviewed: "Pull requests you reviewed need a token.",
   conversations: "Conversations need a token.",
   requests: "Review requests need a token.",
@@ -44,6 +44,7 @@ const initialState = {
   tokens: {}, // slot → kind for each saved token
   tokenUse: null, // with two tokens: what each one added to the merged sources
   answered: {}, // operation → slots that answered it in this refresh
+  ledger: {}, // operation → requests sent to GitHub in this refresh, counting a retry with the other token
   user: null,
   viewer: null,
   events: [],
@@ -181,6 +182,8 @@ async function api(account, operation, args, slot) {
   if (account !== state) throw new Error("Session changed.");
   const result = await window.desk.github(operation, args, slot);
   if (account !== state) throw new Error("Session changed.");
+  // A request the main process refused before sending (status 400 without a response) costs nothing.
+  if (result.via != null || result.status === 0) account.ledger[operation] = (account.ledger[operation] || 0) + 1 + (result.skipped?.length || 0);
   if (result.remaining != null) account.remaining = result.remaining;
   const accepted = recordToken(account, operation, result);
   if (result.ok && SLOTS.includes(result.via)) (account.answered[operation] || (account.answered[operation] = new Set())).add(result.via);
@@ -504,12 +507,48 @@ function tokenPhrase(slots) {
   return slots.length > 1 ? "with either token" : `with the ${slots[0]} token`;
 }
 
-// The public view: a username and no token. It loads what GitHub serves to anyone, which is the
-// profile, public events, public repositories, and a few star dates, and marks the rest as locked.
+// Public pull requests the username opened in the last AUTHORED_DAYS days, from GitHub's issue search
+// without a token. Up to AUTHORED_PAGES pages of 100, newest first. Search has its own limit without a
+// token, 10 requests a minute, so a refresh never spends the 60-an-hour budget on it.
+const PUBLIC_SEARCH_LIMIT = "GitHub's search limit without a token, 10 searches a minute, was reached. Refresh again in a minute.";
+async function loadPublicPullRequests(account, login) {
+  const info = {};
+  let total = 0;
+  let issue = "";
+  let more = false;
+  let incomplete = false;
+  for (let page = 1; page <= AUTHORED_PAGES; page += 1) {
+    let data;
+    try {
+      ({ data } = await api(account, "authoredPullRequests", { login, page }));
+      if (!Array.isArray(data?.items)) throw new Error("GitHub did not return a usable pull request search.");
+    } catch (error) {
+      const message = error.status === 403 || error.status === 429 ? PUBLIC_SEARCH_LIMIT : error.message;
+      if (page === 1) throw Object.assign(new Error(message), { status: error.status });
+      issue = `Public pull requests page ${page} did not load. ${message}`;
+      break;
+    }
+    total = Number.isInteger(data.total) ? data.total : total;
+    incomplete = incomplete || data.incomplete;
+    for (const item of data.items) {
+      const pr = I.normalizeSearchPullRequest(item);
+      if (pr) info[I.prKey(pr.repo, pr.number)] = pr;
+    }
+    more = data.items.length === 100 && page * 100 < total;
+    if (!more) break;
+  }
+  const loaded = Object.keys(info).length;
+  return { info, loaded, total: Math.max(total, loaded), capped: more || Boolean(issue), partial: incomplete, issue, days: AUTHORED_DAYS, public: true };
+}
+
+// The public view: a username and no token. It loads what GitHub serves to anyone: the profile, public
+// events, public pull requests by search, public repositories, and a few star dates, and marks the rest
+// as locked.
 async function refreshPublic() {
   const account = state;
   account.tokenMeta = null;
   account.answered = {};
+  account.ledger = {};
   setBusy("Loading the public profile…");
   try {
     const { data: user } = await api(account, "profile");
@@ -519,7 +558,8 @@ async function refreshPublic() {
     if (account !== state) return;
     const events = [...new Map(feed.events.map((e) => [e.id, e])).values()]
       .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
-    const [footprint] = await Promise.allSettled([loadFootprint(account)]);
+    setBusy("Loading public pull requests and repositories…");
+    const [footprint, authored] = await Promise.allSettled([loadFootprint(account), loadPublicPullRequests(account, user.login)]);
     if (account !== state) return;
     const rate = await api(account, "rateLimit").catch(() => null);
     if (account !== state) return;
@@ -535,8 +575,22 @@ async function refreshPublic() {
       errors.footprint = `${NEEDS_TOKEN.footprint} Some star dates did not load: ${fp.issues.slice(0, 3).join("; ")}${fp.issues.length > 3 ? "; …" : ""}`;
       locked.delete("footprint");
     }
+    const mine = authored.value || null;
+    locked.delete("authored");
+    delete errors.authored;
+    if (!mine) errors.authored = `Public pull requests did not load. ${authored.reason?.message || ""}`.trim();
+    else {
+      const parts = [];
+      if (mine.issue) parts.push(mine.issue);
+      if (mine.capped) parts.push(`Loaded the newest ${fmt(mine.loaded)} of ${fmt(mine.total)} public pull requests opened in the last ${AUTHORED_DAYS} days.`);
+      if (mine.partial) parts.push("GitHub marked the search incomplete, so some public pull requests may be missing.");
+      if (parts.length) errors.authored = parts.join(" ");
+    }
     const count = (n) => (Number.isFinite(n) ? { totalCount: n } : null);
     Object.assign(account, {
+      prInfo: mine ? mine.info : {},
+      prLookup: { authored: mine && { loaded: mine.loaded, total: mine.total, capped: mine.capped, partial: mine.partial, days: mine.days, public: true },
+        referenced: { total: 0, covered: 0, asked: 0, found: 0 }, commits: null },
       user, events, errors, locked, footprint: fp, refreshedAt: new Date(),
       viewer: { createdAt: user.createdAt, followers: count(user.followers), repositories: count(user.publicRepos) },
       rateLimit: rate ? { resources: I.summarizeRateLimit(rate.data), at: new Date() } : null,
@@ -566,6 +620,7 @@ async function refresh() {
   const account = state;
   account.tokenMeta = null;
   account.answered = {};
+  account.ledger = {};
   setBusy("Loading your profile…");
   try {
     const { data: user } = await api(account, "profile");
@@ -791,7 +846,9 @@ function computed() {
   const waiting = I.summarizeWaiting({ requests, conversations: state.conversations, prInfo: a ? state.prInfo : null, login: state.user && state.user.login, now: state.refreshedAt });
   // One chance budget across every check on the page, which findings and suggestions both use.
   const chance = I.chanceBudget({ prs: prPatterns, outcomes, trajectory });
-  const observations = [...I.deriveObservations({ rhythm, sessions, prs: prPatterns, trajectory, follow, review, outcomes, chance }), ...collab.findings];
+  // Public search records carry no branch names, so a branch cannot be matched to its pull request there,
+  // and every branch would read as having none.
+  const observations = [...I.deriveObservations({ rhythm, sessions, prs: prPatterns, trajectory, follow: state.public ? null : follow, review, outcomes, chance }), ...collab.findings];
   const h = state.savedHistory;
   const snapshots = h?.enabled ? I.summarizeSnapshots(h.snapshots, state.snapshotSaved ? I.snapshotOf(outcomes) : null, h.week) : null;
   const footprint = state.footprint ? I.summarizeFootprint(state.footprint, state.savedHistory, state.refreshedAt) : null;
@@ -807,10 +864,11 @@ function computed() {
   const suggestions = I.applyCardStates(I.deriveSuggestions({
     login: state.user && state.user.login, now: state.refreshedAt,
     ev: eventsLoaded ? ev : null, sessions: eventsLoaded ? sessions : null,
-    follow: eventsLoaded && prsLoaded ? follow : null,
+    // Public search records carry no branch names, so branches cannot be matched to pull requests there.
+    follow: eventsLoaded && prsLoaded && !state.public ? follow : null,
     prPatterns: prsLoaded ? prPatterns : null, review: a ? review : null, prInfo: a ? state.prInfo : null,
     trajectory, notes, notesNote: state.errors.notifications || "", footprint, conversations: state.conversations, token,
-    collab: state.reviewed ? collab : null, requests, outcomes, observations, chance,
+    collab: state.reviewed ? collab : null, requests, outcomes, observations, chance, publicView: state.public,
   }), state.public ? {} : state.cards, state.refreshedAt, null, snapshots);
   const scoped = scopedSuggestions({ ev, eventsLoaded, sessions, follow, prsLoaded, trajectory, notes, footprint, token, requests });
   return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, outcomes, observations, footprint, suggestions, chance, snapshots, scoped, requests, waiting };
@@ -837,10 +895,10 @@ function scopedSuggestions({ ev, eventsLoaded, sessions, follow, prsLoaded, traj
   const result = I.deriveSuggestions({
     login, now: state.refreshedAt, scope: repo,
     ev: eventsLoaded ? ev : null, sessions: eventsLoaded ? sessions : null,
-    follow: eventsLoaded && prsLoaded ? follow : null,
+    follow: eventsLoaded && prsLoaded && !state.public ? follow : null,
     prPatterns: prsLoaded ? prPatterns : null, review: a ? review : null, prInfo: a ? prInfo : null,
     trajectory, notes, notesNote: state.errors.notifications || "", footprint, conversations: state.conversations, token,
-    collab: state.reviewed ? collab : null, outcomes, observations: [], chance,
+    collab: state.reviewed ? collab : null, outcomes, observations: [], chance, publicView: state.public,
     requests: requests && { ...requests, items: requests.items.filter((r) => r.repo === repo) },
   });
   return { ...I.applyCardStates(result, state.public ? {} : state.cards, state.refreshedAt, repo), chance, repo: repos.find((r) => r.repo === repo) };
@@ -865,6 +923,11 @@ function waitingGroup(title, list, empty, detail) {
 function renderWaiting(c) {
   const w = c.waiting;
   const r = c.requests;
+  if (state.public) {
+    $("waiting-caption").textContent = "";
+    $("waiting").innerHTML = '<p class="note waiting-note">Needs a token. Review requests, conversations, and review verdicts are not public, so nothing here can show what waits on you.</p>';
+    return;
+  }
   const reviewDetail = (x) => [x.direct ? "Asked by name" : "Asked through a team", x.since === "request" ? "" : "no request time recorded, so timed from opening",
     `by ${x.author}`, x.draft ? "draft" : "", x.lines ? `${fmt(x.lines)} lines` : ""].filter(Boolean).join(" · ");
   const replyDetail = (x) => `${x.author} ${x.kind === "review" ? "reviewed" : "replied"} on ${x.yours ? "your" : x.isPr ? "a" : "an"} ${x.isPr ? "pull request" : "issue"}${x.yours ? "" : " you wrote in"}`;
@@ -873,7 +936,8 @@ function renderWaiting(c) {
   $("waiting").innerHTML = [
     waitingGroup("Review requests", r ? w.reviews : null, r ? "No open pull request asks you for a review." : unavailable, reviewDetail),
     waitingGroup("Replies to answer", w.replies, state.conversations ? "No open thread you opened or wrote in ends with someone else's reply." : (state.public ? NEEDS_TOKEN.conversations : state.errors.conversations || "Conversations did not load."), replyDetail),
-    waitingGroup("Changes requested on your pull requests", state.prLookup.authored ? w.changes : null, state.prLookup.authored ? "No open pull request of yours has changes requested as its latest verdict." : (state.public ? NEEDS_TOKEN.authored : state.errors.authored || "Pull requests you opened did not load."), changeDetail),
+    waitingGroup("Changes requested on your pull requests", state.prLookup.authored && !state.public ? w.changes : null, state.public ? "Review verdicts need a token. GitHub's public search lists pull requests without their reviews."
+      : state.prLookup.authored ? "No open pull request of yours has changes requested as its latest verdict." : state.errors.authored || "Pull requests you opened did not load.", changeDetail),
   ].join("");
   const notes = [];
   if (r) notes.push(`Review requests come from GitHub's search for open pull requests that ask you, by name or through a team, and are timed from the latest ask. GitHub drops a request from the search once you review.${state.errors.requests ? ` ${state.errors.requests}` : ""}`);
@@ -904,12 +968,12 @@ function renderOverview(c) {
 
   // Waiting on you replaces the streak: a streak rewards activity for its own sake, while the queue
   // says what someone is blocked on. The streak stays in the contribution year's line.
-  const waitingParts = [w.reviews && `${fmt(w.reviews.length)} reviews`, w.replies && `${fmt(w.replies.length)} replies`, state.prLookup.authored && `${fmt(w.changes.length)} changes requested`].filter(Boolean);
+  const waitingParts = [w.reviews && `${fmt(w.reviews.length)} reviews`, w.replies && `${fmt(w.replies.length)} replies`, state.prLookup.authored && !state.public && `${fmt(w.changes.length)} changes requested`].filter(Boolean);
   const base = outcomes?.baseline;
   const kpis = [
     ["Contribution year", year ? fmt(year.total) : "—", year ? `${fmt(year.activeDays)} active days of ${fmt(year.dayCount)} · streak ${fmt(year.currentStreak)} d` : esc(state.errors.year || "")],
     ["Waiting on you", waitingParts.length ? fmt(w.count) : "—", waitingParts.length ? esc(waitingParts.join(" · ")) : esc(state.public ? "Needs a token." : "Sources did not load.")],
-    ["Time to merge", base ? esc(I.durationLabel(base.medianHours)) : "—", base ? `Median of ${fmt(base.n)} merges in ${AUTHORED_DAYS} days · slowest quarter past ${esc(I.durationLabel(base.p75Hours))}` : esc(state.public ? "Needs pull request details." : "Needs six merges of yours.")],
+    ["Time to merge", base ? esc(I.durationLabel(base.medianHours)) : "—", base ? `Median of ${fmt(base.n)} ${state.public ? "public " : ""}merges in ${AUTHORED_DAYS} days · slowest quarter past ${esc(I.durationLabel(base.p75Hours))}` : "Needs six merges of yours."],
     ["Agent signals", ev.total ? pct(ev.agentShare) : "—", ev.agents.length ? ev.agents.slice(0, 3).map(([n, k]) => `${esc(n)} ${k}`).join(" · ") : "No matches in loaded events"],
   ];
   $("kpis").innerHTML = kpis.map(([label, value, sub]) =>
@@ -930,10 +994,10 @@ function renderOverview(c) {
   if (others.length) items.push(["info", `${others.length}${overdue.length ? " other" : ""} open pull request${others.length === 1 ? "" : "s"} of yours`, `${base ? "Within your usual merge time. " : ""}${others.slice(0, 4).map((p) => `${shortRepo(p.repo)} #${p.number}${p.isDraft ? " (draft)" : ""}`).join(", ")}`]);
   if (pr.unreviewed.length) items.push(["info", `${pr.unreviewed.length} of ${pr.merged} loaded merges have no recorded review`, `${pr.unreviewed.slice(0, 3).map((p) => `${shortRepo(p.repo)} #${p.number}`).join(", ")}. A note, not a warning: see Suggestions for whether your own merges back a second look.`]);
   if (notes && notes.missed.length) items.push(["warn", `${notes.missed.length} unread notification${notes.missed.length === 1 ? "" : "s"} flagged`, "Includes review requests, mentions, and failed checks."]);
-  if (state.public) items.push(["warn", "Public view, without a token", `Showing what GitHub serves to anyone for @${state.user.login}: public events, public repositories, and stars. The contribution calendar, pull request details, conversations, notifications, repository traffic, and notes need a token. Add one in Data & access.`]);
+  if (state.public) items.push(["warn", "Public view, without a token", `Showing what GitHub serves to anyone for @${state.user.login}: public events, public pull requests found by search, public repositories, and stars. The contribution calendar, reviews and sizes of pull requests, conversations, review requests, notifications, repository traffic, and notes need a token. Data & access lists what a token would add.`]);
   // Sources the public view cannot load are covered by the item above, not listed one by one.
   const coverage = Object.entries(state.errors).filter(([key]) => !state.locked?.has(key)).map(([, text]) => text);
-  if (coverage.length) items.push(["warn", "Some data is missing or limited", coverage.join(" ")]);
+  if (coverage.length) items.push(["warn", "Some data is missing or limited", `${coverage.join(" ")} Data & access → What to change says what to do about each.`]);
   else if (!items.length) items.push(["good", "Nothing flagged in the loaded data", `Open PRs and review counts cover pull requests you opened in the last ${AUTHORED_DAYS} days plus those referenced in recent events.`]);
   $("attention").innerHTML = items.map(([cls, t, d]) =>
     `<li class="${cls}"><span class="dot"></span><div><div class="t">${esc(t)}</div><div class="d">${esc(d)}</div></div></li>`).join("");
@@ -1322,14 +1386,14 @@ function pullRequestInsights(pr) {
     ${pr.total ? `<div class="grid insights">
       <article class="card">
         <h4>Merge activity</h4>
-        ${stats([["Merged", fmt(pr.merged)], ["Median time to merge", hoursLabel(pr.medianHoursToMerge)], ["Zero recorded reviews", pr.merged ? `${fmt(pr.unreviewed.length)} / ${fmt(pr.merged)}` : "—"]])}
-        <p class="note">${fmt(pr.selfMerged)} merged by the PR author. Review counts reflect the loaded PR details.</p>
+        ${stats([["Merged", fmt(pr.merged)], ["Median time to merge", hoursLabel(pr.medianHoursToMerge)], ["Zero recorded reviews", state.public ? "Needs a token" : pr.merged ? `${fmt(pr.unreviewed.length)} / ${fmt(pr.merged)}` : "—"]])}
+        <p class="note">${state.public ? `Public pull requests you opened in the last ${AUTHORED_DAYS} days, found by search. ${PUBLIC_PR_GAP}` : `${fmt(pr.selfMerged)} merged by the PR author. Review counts reflect the loaded PR details.`}</p>
       </article>
       <article class="card">
         <h4>Current status and size</h4>
         ${stats([["Open", fmt(pr.open.length)], ["Open drafts", fmt(pr.drafts)], ["Median lines changed", fmt(pr.medianSize)]])}
         ${bars(pr.largest.map((p) => [`${shortRepo(p.repo)} #${p.number}`, p.additions + p.deletions]))}
-        <p class="note">Largest loaded changes by additions plus deletions. ${fmt(pr.agentBranches)} loaded PRs had a known agent branch prefix.</p>
+        <p class="note">${state.public ? "Sizes and branch names need a token." : `Largest loaded changes by additions plus deletions. ${fmt(pr.agentBranches)} loaded PRs had a known agent branch prefix.`}</p>
       </article>
     </div>` : ""}`);
 }
@@ -1460,6 +1524,7 @@ const oftenPct = (p) => (p < 0.01 ? "under 1%" : pct(p));
 
 // Time to merge split at the last commit: work still landing, then finished work waiting.
 function workWaitCard(o, chance) {
+  if (state.public) return `<p class="note">Working and waiting needs a token. ${PUBLIC_PR_GAP}</p>`;
   if (!o) return noOutcomes();
   const c = state.prLookup.commits;
   if (!o.merged) return `<p class="note">You merged no pull requests in the last ${AUTHORED_DAYS} days that this token can read.</p>`;
@@ -1559,6 +1624,7 @@ function trajectoryCard(t) {
 }
 
 function followCard(f) {
+  if (state.public) return `<p class="note">Follow-through needs a token. GitHub's public search lists pull requests without their branch names, so a branch cannot be matched to its pull request. After the merge and Open work, below, cover what happened to your public pull requests.</p>`;
   if (!f.branches && !f.opened) return '<p class="note">No branches created or pull requests opened in the loaded events.</p>';
   const o = f.outcomes;
   const list = f.withoutPr.slice(0, 4).map((b) => `<li><code>${esc(b.ref)}</code> · ${esc(shortRepo(b.repo))} · ${fmt(Math.floor(b.days))} d</li>`).join("");
@@ -1570,6 +1636,7 @@ function followCard(f) {
 }
 
 function reviewCard(r, pr) {
+  if (state.public) return `<p class="note">Review turnaround needs a token. ${PUBLIC_PR_GAP}</p>`;
   if (!pr.total) return '<p class="note">No pull request details are loaded.</p>';
   if (!r.authored) return `<p class="note">${state.prLookup.authored ? `You opened no pull requests in the last ${AUTHORED_DAYS} days that this token can read, so there is no review wait to measure.` : "The search for pull requests you opened did not load, and none of the other loaded pull requests were authored by you."}</p>`;
   const people = r.reviewers.slice(0, 5);
@@ -1598,7 +1665,11 @@ function clockNote(clocks, missing) {
 const PARTNER_ROWS = 8;
 const REVIEW_REPO_ROWS = 6;
 const PARTNER_KINDS = { mutual: "Both ways", "reviews-you": "Reviews you", "you-review": "You review" };
+// What a public search record lacks, for cards that need it.
+const PUBLIC_PR_GAP = "GitHub's public search lists pull requests without their reviews, sizes, branches, or commit times, so this needs a token.";
+
 function partnersCard(c) {
+  if (state.public) return `<p class="note">Review partners need a token. ${PUBLIC_PR_GAP}</p>`;
   const a = state.prLookup.authored;
   const r = state.reviewed;
   if (!a && !r) return '<p class="note">Neither pull request search loaded, so there are no review partners to show.</p>';
@@ -1622,7 +1693,7 @@ function partnersCard(c) {
 function pullRequestCaption() {
   const { authored, referenced } = state.prLookup;
   const parts = [];
-  if (authored) parts.push(`${fmt(authored.loaded)}${authored.capped ? ` of ${fmt(authored.total)}` : ""} you opened in the last ${authored.days} days`);
+  if (authored) parts.push(`${fmt(authored.loaded)}${authored.capped ? ` of ${fmt(authored.total)}` : ""}${authored.public ? " public" : ""} you opened in the last ${authored.days} days`);
   if (referenced.total) {
     const others = referenced.asked ? `, ${fmt(referenced.found)} of ${fmt(referenced.asked)} others loaded` : "";
     parts.push(`${fmt(referenced.total)} referenced in the feed${referenced.covered ? `, ${fmt(referenced.covered)} already among yours` : ""}${others}`);
@@ -1928,11 +1999,8 @@ function renderMeta(c) {
   const range = dateRange(ev.oldest, ev.newest);
   const cards = [];
 
-  cards.push(`<article class="card"><h3>How far back the stream goes</h3>
-    <p class="big"><strong>${fmt(ev.total)}</strong> events loaded${range ? ` · ${range}` : ""}.</p>
-    <div class="callout">${esc(state.errors.events || (state.public ? "The stream covers the public events GitHub returns without a token. GitHub limits the feed to 300 recent events." : "The stream covers the events returned by GitHub for this token. GitHub limits the feed to 300 recent events."))}</div>
-    <p class="note">GitHub can delay events. Insights shows the loaded date range for each source.</p>
-  </article>`);
+  cards.push(fixCard(c));
+  cards.push(coverageCard(c));
 
   const use = state.tokenUse;
   const both = dual(state);
@@ -1945,7 +2013,9 @@ function renderMeta(c) {
   caps.push(year ? ["ok", "Contribution year", `${fmt(year.total)} contributions.${use?.year ? ` Read with the ${esc(use.year)} token, which hides the fewest contributions.` : ""}`] : ["no", "Contribution year", esc(state.errors.year || "")]);
   const { authored, referenced } = state.prLookup;
   caps.push(authored
-    ? [state.errors.authored ? "part" : "ok", "Pull requests you opened", esc((state.errors.authored || `${fmt(authored.loaded)} from the last ${fmt(authored.days)} days, found by search.`) + onlyNote(use?.authored, "pull request", "pull requests"))]
+    ? [state.errors.authored ? "part" : "ok", authored.public ? "Public pull requests you opened" : "Pull requests you opened", esc((state.errors.authored || (authored.public
+      ? `${fmt(authored.loaded)} from the last ${fmt(authored.days)} days, found by GitHub's public search. Reviews, sizes, branches, and commit times need a token.`
+      : `${fmt(authored.loaded)} from the last ${fmt(authored.days)} days, found by search.`)) + onlyNote(use?.authored, "pull request", "pull requests"))]
     : ["no", "Pull requests you opened", esc(state.errors.authored || "Not available.")]);
   const rv = state.reviewed;
   caps.push(rv
@@ -1977,7 +2047,7 @@ function renderMeta(c) {
   if (state.errors.account) caps.push(["part", "Account details", esc(state.errors.account)]);
   const kinds = savedSlots(state).map((slot) => `a <strong>${esc(state.tokens[slot])}</strong> token`);
   cards.push(`<article class="card"><h3>${state.public ? "What the public view can see" : both ? "What these tokens can see" : "What this token can see"}</h3>
-    <p class="big">${state.public ? `Showing <strong>@${esc(state.user?.login)}</strong> without a token. GitHub allows 60 requests an hour without one, counted for your network address, and a refresh uses up to ${5 + PUBLIC_STAR_REPOS}.` : `Signed in with ${kinds.join(" and ") || "a <strong>GitHub</strong> token"}.`}${both ? " Activity, pull requests, and conversations are read with both and joined. Other sources use the fine-grained token first." : ""}</p>
+    <p class="big">${state.public ? `Showing <strong>@${esc(state.user?.login)}</strong> without a token. GitHub allows 60 requests an hour without one, counted for your network address, and a refresh uses up to ${5 + PUBLIC_STAR_REPOS}. Public pull requests come from search, which has its own limit of 10 requests a minute, and a refresh uses up to ${AUTHORED_PAGES}.` : `Signed in with ${kinds.join(" and ") || "a <strong>GitHub</strong> token"}.`}${both ? " Activity, pull requests, and conversations are read with both and joined. Other sources use the fine-grained token first." : ""}</p>
     <ul class="cap">${caps.map(([s, t, d]) => `<li><span class="${s}">${s === "ok" ? "✓" : s === "no" ? "✕" : "!"}</span><div><div>${esc(t)}</div><div class="d">${d}</div></div></li>`).join("")}</ul>
   </article>`);
 
@@ -2012,6 +2082,147 @@ function renderMeta(c) {
   </article>`);
 
   $("meta").innerHTML = cards.join("");
+}
+
+// ---------- Data & access: what to change, what each source covers, and what a refresh cost ----------
+// Concrete changes that would fill a gap in this refresh, most useful first. Each names what is missing,
+// why, and what to do, with a button where the app can take the first step: GitHub's token forms open
+// from the main process's fixed links, and saved history turns on here.
+function fixList(c) {
+  const out = [];
+  const add = (tone, title, detail, action) => out.push({ tone, title, detail, action });
+  const fine = Boolean(state.tokens["fine-grained"]);
+  if (state.public) {
+    const locked = (c.suggestions?.checked || []).filter((x) => x.status === "unavailable").length;
+    add("fix", "Add a token to load the rest", `A read-only fine-grained token adds the contribution calendar and every past year, reviews, sizes, branches, and commit times for your pull requests, review requests, conversations, repository traffic, and notes. ${locked ? `${fmt(locked)} suggestion checks are waiting on it. ` : ""}Paste it under Token check above; the dashboard reloads for that account.`, { focus: "add-token", label: "Add a token" });
+  }
+  for (const w of tokenWarnings().filter((t) => !/rate limit/.test(t.title))) {
+    const kind = /classic/.test(w.title) ? "classic" : "fine-grained";
+    add("fix", w.title, `${w.detail}${/can make changes/.test(w.title) ? " Create one with only the notifications scope, save it here, then revoke the old one on GitHub." : ""}`, { page: kind, label: `Create a ${kind} token` });
+  }
+  for (const slot of savedSlots(state)) {
+    for (const [op, sets] of Object.entries(state.tokenMeta?.[slot]?.denied || {})) {
+      add("fix", `${OPERATION_LABELS[op] || op}: GitHub denied the ${state.tokens[slot]} token`,
+        `GitHub accepts ${sets.map((set) => set.join(" with ")).join(", or ")} for this read. Add it as a read permission to the token in GitHub's settings (Settings → Developer settings → Personal access tokens), or create a new token with it and save that here.`,
+        { page: slot, label: `Create a ${state.tokens[slot]} token` });
+    }
+  }
+  const fp = state.footprint;
+  if (!state.public && fp?.denied && !savedSlots(state).some((slot) => state.tokenMeta?.[slot]?.denied?.traffic)) {
+    add("fix", "Repository traffic is not readable", "Footprint's views, visitors, clones, and referring sites need read access to Administration on repositories you own: the fine-grained permission Administration: read, or a classic token with access to them. Read access cannot change anything.", { page: "fine-grained", label: "Create a fine-grained token" });
+  }
+  if (!state.public && !state.tokens.classic) {
+    add("tip", "Unread notifications need a classic token", "GitHub serves the unread inbox only to classic tokens. A classic token with only the notifications scope cannot change anything. Save it beside the fine-grained token and Activity Desk reads the inbox with it.", { page: "classic", label: "Create a classic token" });
+  }
+  if (!state.public && fine && c.ev.total && !c.ev.privateEvents) {
+    add("tip", "No private events are visible", "If you work in private repositories, give the fine-grained token the account permission Events: read. Without it, the stream and the work-session findings cover public activity only.", { page: "fine-grained", label: "Create a fine-grained token" });
+  }
+  if (!state.public && state.savedHistory?.enabled === false) {
+    add("tip", "Saved history is off", "GitHub keeps 14 days of traffic. Saved history keeps daily traffic and one weekly snapshot of your merge time, follow-up fixes, open work, and waiting on this Mac, encrypted, so Footprint and Week by week can show more than the latest window.", { history: "history-on", label: "Turn on saved history" });
+  }
+  if (state.errors.commits) add("tip", "Some last-commit times are missing", `${state.errors.commits} Working and waiting counts only merges with a commit time. GitHub did not name a missing permission for this read.`);
+  for (const r of state.rateLimit?.resources || []) {
+    if (r.low) add("fix", `The ${r.label} limit is nearly spent`, `${fmt(r.remaining)} of ${fmt(r.limit)} left. Wait until ${r.resetAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} before refreshing, or reads will start to fail.`);
+  }
+  const failed = Object.entries(state.errors).filter(([key, text]) => !state.locked?.has(key) && /did not load|did not refresh|did not complete/.test(text)).map(([key]) => key);
+  if (failed.length) add("fix", `${fmt(failed.length)} ${failed.length === 1 ? "source" : "sources"} did not load this time`, "A source that failed on a network error or a timeout usually loads on the next refresh. What this token can see, below, gives each one's reason.");
+  return out;
+}
+
+function fixCard(c) {
+  const list = fixList(c);
+  const button = (a) => !a ? "" : a.page ? `<button type="button" class="btn ghost small-btn" data-token-page="${esc(a.page)}">${esc(a.label)}</button>`
+    : a.history ? `<button type="button" class="btn ghost small-btn" data-action="${esc(a.history)}">${esc(a.label)}</button>`
+    : `<button type="button" class="btn ghost small-btn" data-focus="${esc(a.focus)}">${esc(a.label)}</button>`;
+  return `<article class="card fix-card"><h3>What to change</h3>
+    ${list.length ? `<ul class="cap fixes">${list.map((f) => `<li><span class="${f.tone === "fix" ? "part" : "muted"}" aria-hidden="true">${f.tone === "fix" ? "!" : "+"}</span><div><div>${esc(f.title)}</div><div class="d">${esc(f.detail)}</div>${button(f.action)}</div></li>`).join("")}</ul>`
+      : '<p class="big">Nothing to change. Every source loaded with what it needs.</p>'}
+    <p class="note">Changes marked ! fill a gap in this refresh. Those marked + would add data you may want. Activity Desk opens only GitHub's token forms and never changes a token itself.</p>
+  </article>`;
+}
+
+// How far back each source looks, on one axis of the last year. Each source covers its own window, which
+// is why one number can differ from another, or from your profile page. Every bar's dates are also
+// written beside it, so the chart never carries the information alone.
+const COVERAGE_DAYS = 365;
+function coverageRows(c) {
+  const now = state.refreshedAt ? state.refreshedAt.getTime() : Date.now();
+  const days = (n) => now - n * 864e5;
+  const rows = [];
+  const row = (name, from, to, text, partial) => { if (Number.isFinite(from) && Number.isFinite(to) && to >= from) rows.push({ name, from, to, text, partial }); };
+  const span = (from, to) => `${dateRange(from, to) || ""} · ${fmt(Math.max(1, Math.round((to - from) / 864e5)))} days`;
+  const year = c.year;
+  if (year?.days?.length) row("Contribution year", Date.parse(`${year.days[0].date}T00:00:00Z`), now, `GitHub's rolling year, ${fmt(year.total)} contributions`);
+  const a = state.prLookup.authored;
+  if (a) row(a.public ? "Public pull requests" : "Pull requests you opened", days(a.days), now, `${fmt(a.loaded)}${a.capped ? ` of ${fmt(a.total)}` : ""} opened in the last ${a.days} days`, a.capped);
+  if (state.reviewed) row("Pull requests you reviewed", days(state.reviewed.days), now, `${fmt(state.reviewed.loaded)} by others, opened in the last ${state.reviewed.days} days`, state.reviewed.capped);
+  if (c.ev.total) row("Recent events", c.ev.oldest, c.ev.newest, `${fmt(c.ev.total)} events, ${span(c.ev.oldest, c.ev.newest)}${state.errors.events ? ". GitHub's feed stops at 300 events or 30 days" : ""}`, Boolean(state.errors.events));
+  if (state.conversations) row("Conversations", days(30), now, `${fmt(state.conversations.threads)} threads updated in the last 30 days`);
+  const asked = c.requests?.items || [];
+  if (asked.length) row("Review requests", Date.parse(asked[0].at), now, `${fmt(asked.length)} open, the oldest asked ${I.durationLabel(asked[0].hours)} ago`);
+  if (state.footprint && !state.footprint.denied && Object.keys(state.footprint.traffic).length) row("Repository traffic", days(14), now, "The 14 days GitHub keeps");
+  const h = state.savedHistory;
+  if (h?.enabled) {
+    const saved = new Set();
+    for (const r of Object.values(h.repos || {})) for (const series of [r.views, r.clones, r.counts]) for (const d of Object.keys(series || {})) saved.add(d);
+    for (const w of Object.keys(h.snapshots || {})) saved.add(w);
+    const first = [...saved].sort()[0];
+    if (first) row("Saved history", Date.parse(`${first}T00:00:00Z`), now, `Kept on this Mac since ${first}`);
+  }
+  return rows;
+}
+
+function coverageCard(c) {
+  const rows = coverageRows(c);
+  const now = state.refreshedAt ? state.refreshedAt.getTime() : Date.now();
+  const start = now - COVERAGE_DAYS * 864e5;
+  const at = (t) => Math.min(100, Math.max(0, ((t - start) / (now - start)) * 100));
+  const tick = (daysAgo, label) => `<span style="left:${at(now - daysAgo * 864e5).toFixed(2)}%">${esc(label)}</span>`;
+  return `<article class="card coverage-card"><h3>What each source covers</h3>
+    <p class="big">Each source looks back its own distance, so a count from one is not comparable with a count from another.</p>
+    ${rows.length ? `<ul class="coverage">${rows.map((r) => {
+      const left = at(r.from);
+      const clipped = r.from < start;
+      return `<li><span class="name">${esc(r.name)}</span>
+        <span class="span-track" aria-hidden="true"><span class="span-fill${r.partial ? " partial" : ""}${clipped ? " clipped" : ""}" style="left:${left.toFixed(2)}%;width:${Math.max(0.8, at(r.to) - left).toFixed(2)}%" title="${esc(`${r.name}: ${r.text}`)}"></span></span>
+        <span class="when">${esc(r.text)}</span></li>`;
+    }).join("")}</ul>
+    <div class="coverage-axis" aria-hidden="true">${tick(COVERAGE_DAYS, "A year ago")}${tick(182, "6 months")}${tick(90, "90 days")}${tick(0, "Now")}</div>` : '<p class="note">No source loaded a time window.</p>'}
+    <p class="note">${state.public ? "Without a token, the window for pull requests is the public search's." : "All years reaches back further than this axis, to each calendar year GitHub lists, up to 20."} A lighter bar was cut short by a cap, such as GitHub's 300 events or the newest 300 pull requests. Unread notifications have no window: they are whatever is unread now.</p>
+  </article>`;
+}
+
+// Which limit each read draws on. GitHub does not count the rate-limit read itself.
+const OPERATION_BUCKETS = {
+  profile: "core", events: "core", notifications: "core", ownedRepos: "core", traffic: "core", stargazers: "core", rateLimit: "free",
+  year: "graphql", contributionHistory: "graphql", pullRequests: "graphql", pullRequestCommits: "graphql", authoredPullRequests: "graphql",
+  reviewedPullRequests: "graphql", conversations: "graphql", reviewRequests: "graphql",
+};
+const bucketOf = (op) => (state.public && op === "authoredPullRequests" ? "search" : OPERATION_BUCKETS[op] || "core");
+const BUCKET_LABELS = { core: "REST", graphql: "GraphQL", search: "Search", free: "Free" };
+
+// What this refresh sent to GitHub, by read and by limit, and how many more refreshes the REST budget allows.
+function ledgerSection() {
+  // Grouped by the limit each read draws on, then busiest first, then by name.
+  const order = ["core", "search", "graphql", "free"];
+  const entries = Object.entries(state.ledger || {}).filter(([, n]) => n > 0).sort((a, b) => order.indexOf(bucketOf(a[0])) - order.indexOf(bucketOf(b[0])) ||
+    b[1] - a[1] || String(OPERATION_LABELS[a[0]] || a[0]).localeCompare(String(OPERATION_LABELS[b[0]] || b[0])));
+  if (!entries.length) return "";
+  const totals = {};
+  for (const [op, n] of entries) totals[bucketOf(op)] = (totals[bucketOf(op)] || 0) + n;
+  const sent = entries.reduce((n, [, k]) => n + k, 0);
+  const core = (state.rateLimit?.resources || []).find((r) => r.name === "core");
+  const used = totals.core || 0;
+  const fit = core && used ? Math.floor(core.remaining / used) : null;
+  const time = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const lines = [`This refresh sent ${fmt(sent)} ${sent === 1 ? "request" : "requests"}: ${["core", "graphql", "search"].filter((b) => totals[b]).map((b) => `${fmt(totals[b])} ${BUCKET_LABELS[b]}`).join(", ")}${totals.free ? ", plus the free rate-limit read" : ""}.`];
+  if (fit != null) lines.push(`At ${fmt(used)} REST ${used === 1 ? "request" : "requests"} a refresh, about ${fmt(fit)} more ${fit === 1 ? "refresh fits" : "refreshes fit"} before the REST limit resets at ${time(core.resetAt)}.`);
+  if (totals.search) lines.push(`Search allows 10 requests a minute without a token, apart from the hourly limit, so refreshing more than ${fmt(Math.max(1, Math.floor(10 / totals.search)))} ${Math.floor(10 / totals.search) === 1 ? "time" : "times"} a minute can hit it.`);
+  if (totals.graphql) lines.push("GraphQL charges points by the size of each query, so the GraphQL bar above moves by points, not requests.");
+  return `<h4>This refresh</h4>
+    <table class="compare ledger"><thead><tr><th scope="col">Read</th><th scope="col">Limit</th><th scope="col">Requests</th></tr></thead>
+    <tbody>${entries.map(([op, n]) => `<tr><th scope="row">${esc(OPERATION_LABELS[op] || op)}</th><td>${esc(BUCKET_LABELS[bucketOf(op)])}</td><td>${fmt(n)}</td></tr>`).join("")}</tbody></table>
+    <p class="note">${esc(lines.join(" "))} A read retried with the other token counts twice.</p>`;
 }
 
 const OPERATION_LABELS = {
@@ -2130,12 +2341,13 @@ function historyCard() {
 function rateCard() {
   const r = state.rateLimit;
   if (!r || !r.resources.length) {
-    return `<article class="card"><h3>Rate-limit budget</h3><p class="note">GitHub did not return rate-limit details for this token.</p></article>`;
+    return `<article class="card"><h3>Rate-limit budget</h3><p class="note">GitHub did not return rate-limit details for this token.</p>${ledgerSection()}</article>`;
   }
   const time = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   return `<article class="card"><h3>Rate-limit budget</h3>
     <ul class="bars">${r.resources.map((x) => `<li class="bar"><span class="name">${esc(x.label)}</span><span class="track" aria-hidden="true"><span class="fill" style="width:${((x.share ?? 0) * 100).toFixed(1)}%"></span></span><span class="num">${esc(fmt(x.remaining))} / ${esc(fmt(x.limit))}</span></li>`).join("")}</ul>
     <p class="note">${r.resources.map((x) => `${esc(x.label)}: ${esc(fmt(x.used))} used, resets at ${esc(time(x.resetAt))}.`).join(" ")} Read at ${esc(time(r.at))}, after this refresh. Checking the budget does not count against it. GraphQL charges points by query size, so one GraphQL request can use more than one point.</p>
+    ${ledgerSection()}
   </article>`;
 }
 
@@ -2662,6 +2874,19 @@ async function historyAction(event) {
   if (action === "history-on") refresh();
 }
 $("meta").addEventListener("click", historyAction);
+// What to change: GitHub's token forms, and the token field above the cards.
+$("meta").addEventListener("click", (event) => {
+  const page = event.target.closest("[data-token-page]");
+  if (page) {
+    openTokenPage(page.dataset.tokenPage, tokenMessage);
+    return;
+  }
+  const focus = event.target.closest("[data-focus]");
+  if (focus) {
+    $("add-token").scrollIntoView({ block: "center" });
+    $("add-token").focus();
+  }
+});
 $("insights").addEventListener("click", historyAction);
 document.querySelectorAll(".nav").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
 $("insight-nav").addEventListener("click", (event) => {

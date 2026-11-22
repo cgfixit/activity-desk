@@ -348,15 +348,19 @@ function summarizeEvents(events, options) {
 }
 
 // ---------- Pull requests looked up from the feed ----------
+// Whether a record knows its size and its reviews. Records from the public search know neither.
+const sized = (pr) => Number.isFinite(pr.additions) && Number.isFinite(pr.deletions);
+const reviewsKnown = (pr) => Number.isInteger(pr.reviews);
 function summarizePullRequests(prInfo, login) {
   const rows = Object.values(prInfo || {}).filter((pr) => pr?.title);
   const merged = rows.filter((pr) => pr.merged);
-  const unreviewed = merged.filter((pr) => !pr.reviews);
+  // Public search records carry no reviews or sizes; those are unknown, not zero, and are left out.
+  const unreviewed = merged.filter((pr) => pr.reviews === 0);
   const selfMerged = merged.filter((pr) => pr.author && pr.mergedBy && pr.author === pr.mergedBy);
   const hoursToMerge = merged
     .map((pr) => (Date.parse(pr.mergedAt) - Date.parse(pr.createdAt)) / 36e5)
     .filter((h) => Number.isFinite(h) && h >= 0);
-  const sizes = rows.map((pr) => (pr.additions || 0) + (pr.deletions || 0));
+  const sizes = rows.filter(sized).map((pr) => pr.additions + pr.deletions);
   const open = rows.filter((pr) => pr.state === "OPEN");
   const agentBranches = rows.filter((pr) => agentFromBranch(pr.headRef));
   const mine = login ? open.filter((pr) => pr.author === login) : open;
@@ -367,7 +371,7 @@ function summarizePullRequests(prInfo, login) {
     selfMerged: selfMerged.length,
     medianHoursToMerge: median(hoursToMerge),
     medianSize: median(sizes),
-    largest: rows.slice().sort((a, b) => (b.additions + b.deletions) - (a.additions + a.deletions)).slice(0, 3),
+    largest: rows.filter(sized).sort((a, b) => (b.additions + b.deletions) - (a.additions + a.deletions)).slice(0, 3),
     open,
     openMine: mine,
     agentBranches: agentBranches.length,
@@ -628,11 +632,13 @@ function summarizePrPatterns(prInfo, now) {
     count: list.length,
     medianHours: median(timedHours(list)),
     p75Hours: list.length >= 4 ? quantile(timedHours(list), 0.75) : null,
-    unreviewed: list.filter((pr) => !pr.reviews).length,
-    medianSize: median(list.map(size)),
+    unreviewed: list.filter((pr) => pr.reviews === 0).length,
+    medianSize: median(list.filter(sized).map(size)),
     agent: list.filter((pr) => agentFromBranch(pr.headRef)).length,
   });
   const merged = rows.filter((pr) => pr.merged);
+  // Size and review comparisons use only the merges that know them.
+  const mergedSized = merged.filter(sized);
   const agentMerged = merged.filter((pr) => agentFromBranch(pr.headRef));
   const otherMerged = merged.filter((pr) => !agentFromBranch(pr.headRef));
   const agentHours = timedHours(agentMerged);
@@ -640,9 +646,9 @@ function summarizePrPatterns(prInfo, now) {
   const timed = merged.filter((pr) => Number.isFinite(toMerge(pr)) && toMerge(pr) >= 0);
   const ref = (pr) => ({ repo: pr.repo, number: pr.number, lines: size(pr), agent: Boolean(agentFromBranch(pr.headRef)) });
   const bySizeDesc = (list) => list.slice().sort((a, b) => size(b) - size(a) || String(a.repo).localeCompare(String(b.repo)) || a.number - b.number);
-  const bySize = merged.slice().sort((a, b) => size(a) - size(b));
+  const bySize = mergedSized.slice().sort((a, b) => size(a) - size(b));
   const half = Math.floor(bySize.length / 2);
-  const mergedLines = sum(merged.map(size));
+  const mergedLines = sum(mergedSized.map(size));
   const nowTime = now == null ? Date.now() : new Date(now).getTime();
   const open = rows.filter((pr) => pr.state === "OPEN")
     .map((pr) => ({ repo: pr.repo, number: pr.number, days: (nowTime - Date.parse(pr.createdAt)) / DAY_MS }))
@@ -662,19 +668,22 @@ function summarizePrPatterns(prInfo, now) {
       return permutationP(r.slice(0, agentHours.length), r.slice(agentHours.length), (x, y) => mean(x) - mean(y));
     })() : null,
     // The same check for the share of merges with zero recorded reviews.
-    agentReviewP: agentMerged.length >= 3 && otherMerged.length >= 3 ? permutationP(
-      agentMerged.map((pr) => (pr.reviews ? 0 : 1)), otherMerged.map((pr) => (pr.reviews ? 0 : 1)),
+    agentReviewP: agentMerged.filter(reviewsKnown).length >= 3 && otherMerged.filter(reviewsKnown).length >= 3 ? permutationP(
+      agentMerged.filter(reviewsKnown).map((pr) => (pr.reviews ? 0 : 1)), otherMerged.filter(reviewsKnown).map((pr) => (pr.reviews ? 0 : 1)),
       (x, y) => sum(x) / x.length - sum(y) / y.length) : null,
     // Size against time to merge across every timed merge, by rank.
-    sizeVsTime: timed.length >= CORRELATION_MIN_MERGES ? rankCorrelation(timed.map(size), timed.map(toMerge)) : null,
-    largest: bySizeDesc(merged).slice(0, 3).map(ref),
-    largestUnreviewed: bySizeDesc(merged.filter((pr) => !pr.reviews)).slice(0, 3).map(ref),
-    largestUnreviewedAgent: bySizeDesc(agentMerged.filter((pr) => !pr.reviews)).slice(0, 3).map(ref),
+    sizeVsTime: timed.filter(sized).length >= CORRELATION_MIN_MERGES ? rankCorrelation(timed.filter(sized).map(size), timed.filter(sized).map(toMerge)) : null,
+    largest: bySizeDesc(mergedSized).slice(0, 3).map(ref),
+    largestUnreviewed: bySizeDesc(mergedSized.filter((pr) => pr.reviews === 0)).slice(0, 3).map(ref),
+    largestUnreviewedAgent: bySizeDesc(agentMerged.filter((pr) => sized(pr) && pr.reviews === 0)).slice(0, 3).map(ref),
     // An odd middle PR is left out so both halves hold the same number.
     smaller: half >= 3 ? group(bySize.slice(0, half)) : null,
     larger: half >= 3 ? group(bySize.slice(-half)) : null,
     mergedLines,
-    unreviewedLines: sum(merged.filter((pr) => !pr.reviews).map(size)),
+    unreviewedLines: sum(mergedSized.filter((pr) => pr.reviews === 0).map(size)),
+    // How many merges know their size and their reviews. Public search records know neither.
+    sizedMerged: mergedSized.length,
+    reviewedKnown: merged.filter(reviewsKnown).length,
     open: open.length,
     oldestOpen: open[0] || null,
     stale: open.filter((pr) => pr.days >= STALE_PR_DAYS).length,
@@ -818,6 +827,8 @@ function summarizeReviewFlow(prInfo, login) {
   const me = String(login || "").toLowerCase();
   const rows = Object.values(prInfo || {}).filter((pr) => pr?.title && Array.isArray(pr.reviewList));
   const authored = rows.filter((pr) => me && String(pr.author || "").toLowerCase() === me);
+  // Outcomes need no reviews, so they count every pull request you opened, public search records too.
+  const opened = Object.values(prInfo || {}).filter((pr) => pr?.title && me && String(pr.author || "").toLowerCase() === me);
   const firstHuman = (pr) => pr.reviewList
     .filter((r) => !r.bot && r.login && r.login.toLowerCase() !== String(pr.author || "").toLowerCase() && Number.isFinite(Date.parse(r.at)))
     .sort((a, b) => Date.parse(a.at) - Date.parse(b.at))[0];
@@ -874,7 +885,7 @@ function summarizeReviewFlow(prInfo, login) {
   const selfMerged = merged.filter((pr) => pr.mergedBy && pr.mergedBy.toLowerCase() === me);
   // Current state of every pull request you opened that loaded. The authored search covers the whole
   // window, so this is a fuller sample than pull requests opened inside the Events feed.
-  const closedUnmerged = authored.filter((pr) => !pr.merged && pr.state === "CLOSED");
+  const closedUnmerged = opened.filter((pr) => !pr.merged && pr.state === "CLOSED");
   const byRepo = [...repos.values()].map(({ waits: w, ...r }) => ({ ...r, timed: w.length, medianFirstReviewHours: median(w) }))
     .sort((a, b) => b.merged - a.merged || b.authored - a.authored || a.repo.localeCompare(b.repo));
 
@@ -906,7 +917,7 @@ function summarizeReviewFlow(prInfo, login) {
     medianFirstApprovalHours: states ? median(approvalWaits) : null,
     approvedBeforeMerge: states ? approvedBeforeMerge : null,
     changesRequested: states ? changesRequested : null,
-    outcomes: { merged: merged.length, closed: closedUnmerged.length, open: authored.filter((pr) => pr.state === "OPEN").length },
+    outcomes: { merged: opened.filter((pr) => pr.merged).length, closed: closedUnmerged.length, open: opened.filter((pr) => pr.state === "OPEN").length },
     closed: closedUnmerged.map((pr) => ({ repo: pr.repo, number: pr.number, agent: Boolean(agentFromBranch(pr.headRef)) })),
     byRepo,
     merged: merged.length,
@@ -973,9 +984,10 @@ function summarizeOutcomes(prInfo, login, now) {
   const followed = settled.filter(isFollowed);
   const flag = (pr) => (isFollowed(pr) ? 1 : 0);
   const rateGap = (x, y) => sum(x) / x.length - sum(y) / y.length;
-  const compare = (key, aLabel, bLabel, inA) => {
-    const a = settled.filter(inA);
-    const b = settled.filter((pr) => !inA(pr));
+  // `known` limits a comparison to the merges that carry what it splits on, such as size or reviews.
+  const compare = (key, aLabel, bLabel, inA, known = () => true) => {
+    const a = settled.filter((pr) => known(pr) && inA(pr));
+    const b = settled.filter((pr) => known(pr) && !inA(pr));
     return {
       key,
       a: { label: aLabel, n: a.length, followed: a.filter(isFollowed).length },
@@ -984,12 +996,12 @@ function summarizeOutcomes(prInfo, login, now) {
         ? permutationP(a.map(flag), b.map(flag), rateGap) : null,
     };
   };
-  const midSize = median(settled.map(size));
+  const midSize = median(settled.filter(sized).map(size));
   const midHours = median(settled.map(hours));
   const groups = [
-    compare("agent", "Agent branches", "Other branches", (pr) => Boolean(agentFromBranch(pr.headRef))),
-    compare("size", "Larger half by lines", "Smaller half", (pr) => size(pr) > midSize),
-    compare("review", "No recorded review", "Reviewed", (pr) => !pr.reviews),
+    compare("agent", "Agent branches", "Other branches", (pr) => Boolean(agentFromBranch(pr.headRef)), (pr) => typeof pr.headRef === "string"),
+    compare("size", "Larger half by lines", "Smaller half", (pr) => size(pr) > midSize, sized),
+    compare("review", "No recorded review", "Reviewed", (pr) => !pr.reviews, reviewsKnown),
     compare("speed", "Faster than your median merge", "Slower or at the median", (pr) => hours(pr) < midHours),
     compare("late", "Merged midnight to 4am", "Merged at other hours", (pr) => new Date(mergedAt(pr)).getHours() < 4),
   ].filter((g) => g.a.n && g.b.n);
@@ -1008,7 +1020,7 @@ function summarizeOutcomes(prInfo, login, now) {
     medianHours: median(followed.map((pr) => hit.get(prKey(pr.repo, pr.number)).hours)),
     examples: followed.slice().sort((a, b) => mergedAt(b) - mergedAt(a)).map((pr) => {
       const by = hit.get(prKey(pr.repo, pr.number));
-      return { repo: pr.repo, number: pr.number, lines: size(pr), agent: Boolean(agentFromBranch(pr.headRef)), by: by.number, hours: by.hours, named: by.named };
+      return { repo: pr.repo, number: pr.number, lines: sized(pr) ? size(pr) : null, agent: Boolean(agentFromBranch(pr.headRef)), by: by.number, hours: by.hours, named: by.named };
     }),
     groups, tested, bar, standouts,
   };
@@ -1654,7 +1666,7 @@ const SUGGESTION_RULES = [
       return {
         tone: "warn", confirmed: r.standouts.length > 0,
         basis: `${plural(r.settled, "merged pull request")} you opened, each at least ${REWORK_HOURS / 24} days old`,
-        targets: r.examples.map((e) => ref(`${prLabel(e)} (${lines(e.lines)} lines${e.agent ? ", agent branch" : ""}): #${e.by} followed after ${durationLabel(e.hours)}`, e.repo, e.number)),
+        targets: r.examples.map((e) => ref(`${prLabel(e)}${e.lines != null || e.agent ? ` (${[e.lines != null ? `${lines(e.lines)} lines` : "", e.agent ? "agent branch" : ""].filter(Boolean).join(", ")})` : ""}: #${e.by} followed after ${durationLabel(e.hours)}`, e.repo, e.number)),
         why: [["DORA measures the instability of software delivery partly by change fail rate: the share of deployments that need immediate intervention afterwards, likely a rollback or a hotfix.", "dora-metrics"]],
         seen: `${r.followed} of your ${plural(r.settled, "settled merge")} were followed within ${REWORK_HOURS / 24} days by a pull request in the same repository titled as a fix or revert${r.named ? `, ${r.named} of them naming the merge` : ""}. ${reworkStandout(r)} A title is a proxy: a fix that opens after a merge is not always a fix for it, and a merge is not a deployment.`,
         act: [
@@ -2293,6 +2305,20 @@ function whereLines(list) {
   };
 }
 
+// In the public view, pull requests come from GitHub's public search, which leaves out what these rules
+// read, and some sources are never public. These rules say what they need instead of reading as "not
+// enough data" or as a source that failed.
+const SEARCH_LACKS = (what) => `Needs a token. GitHub's public search lists pull requests without ${what}.`;
+const PUBLIC_NEEDS = {
+  "review-before-merge": SEARCH_LACKS("reviews"), "review-agent-branches": SEARCH_LACKS("branch names and reviews"),
+  "faster-first-review": SEARCH_LACKS("reviews"), "answer-review-requests": SEARCH_LACKS("your reviews of other people's pull requests"),
+  "spread-reviews": SEARCH_LACKS("reviews"), "smaller-prs": SEARCH_LACKS("pull request sizes"), "merge-finished-work": SEARCH_LACKS("commit times"),
+  "branches-without-prs": `${SEARCH_LACKS("branch names")} A branch cannot be matched to its pull request.`,
+  "answer-waiting-threads": "Needs a token. Conversations are read only with one.",
+  "re-entry-notes": "Needs a token. GitHub's API returns the contribution calendar only to a signed-in request.",
+  "readme-first-screen": "Needs a token. Repository traffic is never public.",
+};
+
 function deriveSuggestions(input) {
   // Follow-up comparisons are judged by the page's chance budget when the caller passes one.
   const x = input ? { ...input, outcomes: withBudget(input.outcomes, input.chance) } : {};
@@ -2301,7 +2327,7 @@ function deriveSuggestions(input) {
   const shown = new Map();
   const checked = [];
   for (const rule of SUGGESTION_RULES) {
-    const result = rule.check(x, { me, nowTime });
+    const result = x.publicView && PUBLIC_NEEDS[rule.id] ? { unavailable: PUBLIC_NEEDS[rule.id] } : rule.check(x, { me, nowTime });
     const measured = SUGGESTION_METRICS[rule.id]?.(x);
     const metric = measured && Number.isFinite(measured.value) ? measured : null;
     const accountWide = Boolean(x.scope) && ACCOUNT_RULES.has(rule.id);
@@ -2644,6 +2670,20 @@ function normalizePullRequest(pr, repo, number, source) {
   };
 }
 
+// A pull request from the public search, shaped by the main process. Search has no reviews, sizes,
+// branch, merger, or commits, so those stay null and every summary treats them as unknown.
+function normalizeSearchPullRequest(item) {
+  if (!item || typeof item.repo !== "string" || !Number.isInteger(item.number) || typeof item.title !== "string" || !validTime(item.createdAt)) return null;
+  const merged = validTime(item.mergedAt);
+  return {
+    repo: item.repo, number: item.number, source: "public-search", title: item.title,
+    state: item.state === "open" ? "OPEN" : merged ? "MERGED" : "CLOSED", merged, isDraft: Boolean(item.draft),
+    createdAt: item.createdAt, mergedAt: merged ? item.mergedAt : null, closedAt: validTime(item.closedAt) ? item.closedAt : null,
+    author: item.author, authorBot: item.authorType === "Bot" || isBotLogin(item.author), mergedBy: null,
+    additions: null, deletions: null, headRef: null, reviews: null, reviewList: null, readyAt: null, requests: null,
+  };
+}
+
 // When review could start on a pull request: the first time a draft was marked ready, and each review
 // request with its time and the requested login (null for a team). Null when the timeline was not read.
 const validTime = (at) => typeof at === "string" && Number.isFinite(Date.parse(at));
@@ -2818,7 +2858,7 @@ function pickContributionYear(reads) {
   return best;
 }
 
-const RATE_LABELS = { core: "REST", graphql: "GraphQL" };
+const RATE_LABELS = { core: "REST", graphql: "GraphQL", search: "Search" };
 const RATE_LOW_SHARE = 0.1;
 function summarizeRateLimit(data) {
   const resources = data?.resources || {};
@@ -3187,6 +3227,7 @@ const api = {
   filterEvents,
   isMinor,
   normalizePullRequest,
+  normalizeSearchPullRequest,
   parseAcceptedPermissions,
   parseTokenExpiry,
   tokenExpiryStatus,

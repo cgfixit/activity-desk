@@ -8,7 +8,7 @@ Activity Desk gives you one place to review GitHub activity across the repositor
 - **Stream** has three sources. **Your events** filters your loaded events by type, repository, and search text. Clear **Hide routine changes** to include events such as PR label changes. Comment, review, and agent rows show what was written. See [Reading comment text](#reading-comment-text). Several pushes to one branch within an hour appear as one row, with the number of pushes and commits and the time span. The day heading still counts each event. Select a row's repository, or its issue or pull request number, to open it on github.com. **Conversations** lists comments, reviews, and review comments on issues and pull requests that involve you, open or closed, including replies from other people. **Awaiting reply** shows open threads you opened or wrote in where the latest comment from a person is someone else's. **Mark all seen** updates a timestamp for your account on this Mac, and both sources mark newer items as **New**. **Notes** holds sticky notes you write. See [Using Notes](#using-notes).
 - **Insights** shows your contribution calendar, an event heatmap, and merge timing, recorded reviews, and change sizes for loaded pull requests. In **Recent events**, select a repository to open its events in Stream. **Patterns** derives findings the other views do not state: how concentrated your output is, where the last four weeks rank in the year, how events group into work sessions, how agent-branch merges compare with the rest, whether weekly output shifted, how often branches reach a merge, how long your pull requests wait for a person to review them, and who you review with in each direction. **Footprint** shows traffic to the repositories you own. See [Reading Footprint](#reading-footprint). **All years** compares calendar years. See [Reading All years](#reading-all-years).
 - **Suggestions** turns patterns in the loaded data into specific changes to try, each with its evidence and sources. See [Reading Suggestions](#reading-suggestions).
-- **Data & access** shows which sources loaded and flags limits, missing data, and permission errors. **Token check** and **Rate-limit budget** describe each saved token. See [Checking your tokens](#checking-your-tokens) and [Using two tokens](#using-two-tokens).
+- **Data & access** shows which sources loaded and flags limits, missing data, and permission errors. **What to change** lists fixes for the gaps, **What each source covers** shows how far back each source looks, and **Token check** and **Rate-limit budget** describe each saved token and what the refresh sent. See [Reading Data & access](#reading-data--access), [Checking your tokens](#checking-your-tokens), and [Using two tokens](#using-two-tokens).
 
 ![Recent events and repository filters using fictional activity](screenshots/recent-events.png)
 
@@ -175,13 +175,14 @@ Pull request suggestions use the pull requests you opened in the last 90 days pl
 | --- | --- |
 | [Recent events](https://docs.github.com/en/rest/activity/events) | Up to 300 recent events from the past 30 days. GitHub can delay events, and token permissions affect what appears. |
 | [Pull requests you opened](https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests#search-by-author) | Every pull request you opened in the last 90 days that the token can read, found by search, newest first and capped at 300. Each includes the author and time of its first 10 reviews, and its first 10 ready-for-review and review-request events. |
+| [Public pull requests](https://docs.github.com/en/rest/search/search#search-issues-and-pull-requests) | Without a token: public pull requests the username opened in the last 90 days, newest first and capped at 300, from GitHub's issue search. Each has its state, creation, merge, and close times, title, and draft flag. Search returns no reviews, sizes, branch names, or commit times. |
 | [Pull requests you reviewed](https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests#search-by-pull-request-review-status-and-reviewer) | Pull requests by other people that you reviewed, opened in the last 90 days, found by search, newest first and capped at 300. Each includes the time of your first review. Used only by **Review partners**, not by the pull request summaries about your own work. |
 | Last-commit times | The time of the last commit on each of up to 120 of your newest merged pull requests, read as its own request so a token that cannot read commits loses only **Working and waiting**. |
 | Other pull requests in events | Details for up to 40 more distinct PRs referenced in the loaded events, such as pull requests you reviewed. Pull requests the search already returned are not requested again. Review counts reflect records visible at refresh time. |
 | [Contribution history](https://docs.github.com/en/graphql/reference/objects#contributionscollection) | Each calendar year GitHub lists for the account, up to the latest 20, with daily counts and contribution totals by type. |
 | [Repository traffic](https://docs.github.com/en/rest/metrics/traffic) | Views, unique visitors, clones, and up to 10 referring sites for the last 14 days, for up to 10 repositories you own. Star dates for those with up to 100 stars. |
 | Saved history | Off by default. When turned on, daily views and clones, star and fork counts, and referring-site sightings saved on this Mac from each refresh, for up to 400 days, and one snapshot a week of the numbers in **Week by week**. |
-| [Rate-limit budget](https://docs.github.com/en/rest/rate-limit/rate-limit) | REST and GraphQL limits read after each refresh. GitHub does not count this read against the limit. |
+| [Rate-limit budget](https://docs.github.com/en/rest/rate-limit/rate-limit) | REST and GraphQL limits, and without a token the search limit, read after each refresh, with the requests that refresh sent. GitHub does not count this read against the limit. |
 | [Contribution year](https://docs.github.com/en/graphql/reference/users#contributionscollection) | GitHub's rolling contribution calendar and up to 10 repository totals for commit contributions. The 30-day comparison includes today. |
 | [Review requests](https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests#search-by-pull-request-review-status-and-reviewer) | Up to 50 open pull requests that ask you for a review, by name or through a team, oldest first, each with its latest 10 review-request events. |
 | [Conversations](https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests#search-by-a-user-thats-involved-in-an-issue-or-pull-request) | Up to 25 issues and 25 pull requests that involve you and were updated in the last 30 days. Each shows its latest 10 comments, latest 10 reviews, and up to 5 review comments per review. |
@@ -215,20 +216,49 @@ On the sign-in screen, enter a username under **GitHub username, without a token
 
 | View | Without a token |
 | --- | --- |
-| Overview | Agent signals from public events. The contribution figures, the calendar, and unread notifications need a token. One item under **Needs a look** lists what is missing. |
+| Overview | Time to merge from public pull requests, agent signals from public events, and the outcome warnings Patterns finds in public pull requests. **Waiting on you**, the contribution figures, the calendar, and unread notifications need a token. One item under **Needs a look** lists what is missing. |
 | Stream → Your events | Up to 300 public events. Private events never appear. |
 | Stream → Conversations, Notes | Need a token. Notes stay closed because a username alone does not show whose notes to open. |
 | Insights → Recent events, and the event-based cards in Patterns | Work from the public events. |
-| Insights → Contribution year, All years, Pull requests | Need a token. |
+| Insights → Pull requests | Public pull requests you opened in the last 90 days, found by GitHub's issue search: how many merged, the median time to merge, and how many are open. Reviews, sizes, and branch names need a token. |
+| Insights → Patterns | The event-based cards, plus **After the merge**, **Open work**, and the merge-time comparisons from public pull requests. Comparisons that split on size, reviews, or agent branches are left out, never counted as zero. **Follow-through**, **Working and waiting**, **Review turnaround**, and **Review partners** need a token: search has no branch names, commit times, or reviews. |
+| Insights → Contribution year, All years | Need a token. |
 | Insights → Footprint | Public repositories with star and fork counts, and star dates for up to three of them. Views, clones, and referring sites are never public. |
-| Suggestions | Only the checks that read events can apply. **What was checked** marks the rest as source unavailable. |
-| Data & access | What loaded, the remaining request budget, and the form to add a token. |
+| Suggestions | The checks that read events, and the pull request checks that need only dates, titles, and state: follow-up fixes, open work, pull requests past your usual merge time, and pull requests closed without merging. **What was checked** marks the rest as source unavailable, with "Needs a token" and what is missing. **Suggestions for** narrows them to one repository. Trying, snoozing, and dismissing need a token. |
+| Data & access | What to change, what each source covers, what loaded, what the refresh sent and the remaining request budget, and the form to add a token. |
 
-GitHub allows 60 requests an hour without a token, counted for your network address, so other people or tools on the same network share it. A refresh uses up to eight: the profile, up to three pages of events, the repository list, and up to three star-date reads. When the limit is reached, Activity Desk says so and keeps the last loaded data.
+GitHub allows 60 requests an hour without a token, counted for your network address, so other people or tools on the same network share it. A refresh uses up to eight of them: the profile, up to three pages of events, the repository list, and up to three star-date reads. Public pull requests come from GitHub's issue search, which has its own limit without a token of 10 requests a minute. A refresh uses up to three, one per 100 pull requests, so refreshing about three times in a minute can reach it. When either limit is reached, Activity Desk says which and keeps the last loaded data. **Data & access → Rate-limit budget** shows what the last refresh sent and both limits.
+
+![Suggestions in the public view, from public pull requests, for a fictional account](screenshots/public-suggestions.png)
 
 ![The public view of a fictional account, without a token](screenshots/public-view.png)
 
 Only the username is saved, in a plain file in the app's data folder, so the view reopens next time. **Sign out** removes it. To load the rest, paste a token into **Data & access → Add a token to load everything else**. The public view ends and the dashboard reloads for the account the token belongs to.
+
+## Reading Data & access
+
+**What to change** comes first. It lists what would fill a gap in this refresh, marked **!**, and what would add data you may want, marked **+**. Each item says what is missing and why, and where the app can take the first step it has a button. The buttons open GitHub's token forms, focus the token field, or turn on saved history. Activity Desk never changes a token itself. The list covers:
+
+- in the public view, what a token would add;
+- tokens that expired, were rejected, expire soon, or have a scope that allows writes;
+- each read GitHub denied, with the permission GitHub named for it in the `X-Accepted-GitHub-Permissions` header;
+- repository traffic without Administration access;
+- the unread inbox without a classic token;
+- no private events with a fine-grained token;
+- saved history turned off;
+- missing last-commit times;
+- a rate limit close to running out;
+- sources that did not load this time.
+
+When nothing applies, it says so.
+
+**What each source covers** draws each source's time window on one axis covering the last year: the contribution year, pull requests you opened (or public pull requests), pull requests you reviewed, the loaded events, conversations, open review requests, repository traffic, and saved history. The dates are written beside each bar, so the chart is never the only place they appear. A lighter bar was cut short by a cap, such as GitHub's 300 events. Each source looks back a different distance, which is why a count from one does not match a count from another, or your profile page. All years reaches further back than the axis, and unread notifications have no window.
+
+**Rate-limit budget** ends with **This refresh**: every request the refresh sent, by read, and the limit each drew on (REST, GraphQL, or, without a token, search). It counts a read retried with the other token twice, because GitHub received both. From the REST requests it estimates how many more refreshes fit before the limit resets. GraphQL limits are charged in points by query size, so the GraphQL bar moves by points, not by requests.
+
+![What to change and what each source covers, for a fictional account](screenshots/data-access.png)
+
+![The requests one refresh sent, by read and limit, for a fictional account](screenshots/request-ledger.png)
 
 ## Checking your tokens
 
