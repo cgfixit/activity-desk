@@ -948,9 +948,15 @@ const YEAR_QUERY = `query {
 }`;
 
 const REPO_NAME = /^[A-Za-z0-9_.-]{1,100}$/;
+// When each review clock starts: a draft marked ready for review, and who was asked to review and when.
+// Only a requested user's login is read. A team request is known by its type alone, since team details
+// can need organization access the token may not have.
+const REQUEST_FIELDS = "createdAt requestedReviewer { __typename ... on User { login } }";
 const PR_FIELDS = `title state merged isDraft createdAt mergedAt closedAt additions deletions headRefName
   author { __typename login } mergedBy { login }
-  reviews(first: 10) { totalCount nodes { submittedAt state author { __typename login } } }`;
+  reviews(first: 10) { totalCount nodes { submittedAt state author { __typename login } } }
+  timelineItems(first: 10, itemTypes: [READY_FOR_REVIEW_EVENT, REVIEW_REQUESTED_EVENT]) { totalCount nodes {
+    __typename ... on ReadyForReviewEvent { createdAt } ... on ReviewRequestedEvent { ${REQUEST_FIELDS} } } }`;
 
 // When the last commit on a pull request was made, which splits time to merge into work and waiting.
 const COMMIT_FIELDS = "commits(last: 1) { nodes { commit { committedDate } } }";
@@ -991,6 +997,18 @@ const REVIEWED_QUERY = `query ($q: String!, $after: String, $login: String!) {
     pageInfo { hasNextPage endCursor }
     nodes { __typename ... on PullRequest { number repository { nameWithOwner } ${PR_FIELDS}
       myReviews: reviews(first: 1, author: $login) { nodes { submittedAt } } } }
+  }
+}`;
+// Open pull requests that ask the user for a review, directly or through a team. Search drops a pull
+// request once the requested person has reviewed it. The latest request events say when each ask came.
+const REQUESTED_THREADS = 50;
+const REQUESTED_QUERY = `query ($q: String!) {
+  search(query: $q, type: ISSUE, first: ${REQUESTED_THREADS}) {
+    issueCount
+    nodes { __typename ... on PullRequest { number title isDraft createdAt additions deletions repository { nameWithOwner }
+      author { __typename login }
+      reviewRequests(first: 10) { nodes { requestedReviewer { __typename ... on User { login } } } }
+      timelineItems(last: 10, itemTypes: [REVIEW_REQUESTED_EVENT]) { nodes { ... on ReviewRequestedEvent { ${REQUEST_FIELDS} } } } } }
   }
 }`;
 const CURSOR = /^[A-Za-z0-9+/=_:-]{1,256}$/;
@@ -1034,6 +1052,11 @@ function githubRequest(operation, args) {
       if (after !== undefined && (typeof after !== "string" || !CURSOR.test(after))) break;
       const since = new Date(Date.now() - AUTHORED_DAYS * 864e5).toISOString().slice(0, 10);
       return { route: "/graphql", body: { query: REVIEWED_QUERY, variables: { q: `reviewed-by:${login} -author:${login} is:pr created:>=${since} sort:created-desc`, after: after ?? null, login } } };
+    }
+    case "reviewRequests": {
+      const login = args?.login;
+      if (typeof login !== "string" || !LOGIN.test(login)) break;
+      return { route: "/graphql", body: { query: REQUESTED_QUERY, variables: { q: `is:pr is:open archived:false review-requested:${login} sort:created-asc` } } };
     }
     case "rateLimit": return { route: "/rate_limit" };
     case "contributionHistory": {

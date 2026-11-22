@@ -73,6 +73,7 @@
 
     <main id="content" class="content" tabindex="-1">
       <div class="loading hidden" id="loading"><span class="spinner"></span><span id="loading-text">Loading…</span></div>
+      <p class="msg error" id="open-status" role="status"></p>
 
       <section data-view="overview" class="view">
         <header class="view-head">
@@ -80,10 +81,17 @@
           <p class="lede" id="summary"></p>
         </header>
         <div class="kpis" id="kpis"></div>
+        <article class="card waiting-card">
+          <div class="card-head">
+            <h3>Waiting on you</h3>
+            <span class="small muted" id="waiting-caption"></span>
+          </div>
+          <div class="waiting" id="waiting"></div>
+        </article>
         <div class="grid two">
           <article class="card">
             <h3>Needs a look</h3>
-            <p class="small muted">Review requests, open pull requests, and gaps in the loaded data.</p>
+            <p class="small muted">Outcomes in your pull requests, token access, and gaps in the loaded data.</p>
             <ul class="attention" id="attention"></ul>
           </article>
           <article class="card">

@@ -388,3 +388,22 @@ input[type="search"] { width: 180px; }
 .scope-bar label { font-weight: 600; }
 .scope-bar select { font: inherit; padding: 4px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel, transparent); color: var(--text); }
 .scope-bar .note { flex-basis: 100%; margin: 0; }
+
+/* Overview: what waits on you */
+.waiting { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px 20px; margin-top: 8px; }
+.waiting-group h4 { margin: 0 0 6px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.waiting-group h4 .n { margin-left: 4px; color: var(--accent); }
+.waiting-group .note { margin-top: 4px; }
+.waiting-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.waiting-list li { display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 10px; padding: 8px 10px; border-radius: 9px; background: var(--surface-2); font-size: 13px; }
+.waiting-list .t { overflow-wrap: anywhere; }
+.waiting-list .t .link { padding: 0; color: var(--text); font-weight: 600; }
+.waiting-list .t .link:hover { color: var(--accent); }
+.waiting-list .d { color: var(--muted); font-size: 12px; }
+.waiting-list .age { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--muted); padding-top: 1px; }
+.waiting-list .age.late { color: var(--warn); font-weight: 600; }
+.waiting-note { grid-column: 1 / -1; }
+.row .push-count { font-variant-numeric: tabular-nums; }
+#open-status:empty { display: none; }
+.meta .open-link { padding: 0; font: inherit; color: inherit; text-decoration: none; }
+.meta .open-link:hover { color: var(--accent); text-decoration: underline; }

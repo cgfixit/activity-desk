@@ -17,7 +17,8 @@ const HISTORY_YEARS = 20; // matches the batched year limit in main.js // star d
 const TRAFFIC_CONCURRENCY = 4;
 const GLYPHS = { PushEvent: "↑", PullRequestEvent: "⇄", IssuesEvent: "◉", IssueCommentEvent: "✎", CreateEvent: "+", DeleteEvent: "−", PullRequestReviewEvent: "✓", ReleaseEvent: "◆", WatchEvent: "★", ForkEvent: "⑂" };
 const CHIPS = [["all", "All"], ["push", "Pushes"], ["pr", "Pull requests"], ["issue", "Issues"], ["comment", "Comments"], ["branch", "Branches"], ["agent", "Agents"]];
-const CONVERSATION_CHIPS = [["all", "All"], ["others", "From others"], ["mine", "Yours"], ["reviews", "Reviews"], ["bots", "Bots"]];
+const CONVERSATION_CHIPS = [["all", "All"], ["awaiting", "Awaiting reply"], ["others", "From others"], ["mine", "Yours"], ["reviews", "Reviews"], ["bots", "Bots"]];
+const PUSH_BURST_MINUTES = 60; // pushes to one branch this close together read as one row
 const CONVERSATION_GLYPHS = { comment: "✎", review: "✓", inline: "‹›" };
 const CONVERSATION_LABELS = { comment: "Comment", review: "Review", inline: "Review comment" };
 const TEXT_PREVIEW = 180;
@@ -29,6 +30,7 @@ const NEEDS_TOKEN = {
   authored: "Pull request details need a token.",
   reviewed: "Pull requests you reviewed need a token.",
   conversations: "Conversations need a token.",
+  requests: "Review requests need a token.",
   notifications: "Unread notifications need a classic token.",
   footprint: "Repository traffic needs a token. Stars and forks are public.",
   history: "Saved history needs a token.",
@@ -47,6 +49,7 @@ const initialState = {
   events: [],
   prInfo: {},
   reviewed: null,
+  requests: null, // GitHub's search for open pull requests that ask you for a review
   prLookup: { authored: null, referenced: { total: 0, covered: 0, asked: 0, found: 0 }, commits: null },
   snapshotSaved: false,
   cards: {},
@@ -451,6 +454,38 @@ async function loadConversations(account, login) {
   };
 }
 
+// Open pull requests that ask you for a review, as GitHub's search body. With two tokens, each runs the
+// search and the results are joined by pull request, since each sees only what its token can read.
+async function loadReviewRequests(account, login) {
+  if (!dual(account)) {
+    const { data } = await api(account, "reviewRequests", { login });
+    if (!Array.isArray(data?.data?.search?.nodes)) throw new Error(data?.errors?.[0]?.message || "GitHub did not return a usable review-request search.");
+    return { search: data.data.search, partial: Boolean(data.errors?.length) };
+  }
+  const settled = await Promise.allSettled(SLOTS.map((slot) => api(account, "reviewRequests", { login }, slot)));
+  const good = SLOTS.map((slot, i) => ({ slot, data: settled[i].value?.data })).filter((l) => Array.isArray(l.data?.data?.search?.nodes));
+  if (!good.length) throw settled[0].reason || new Error("GitHub did not return a usable review-request search.");
+  const key = (n) => `${n?.repository?.nameWithOwner}#${n?.number}`;
+  const nodes = new Map();
+  const seen = new Map();
+  for (const l of good) {
+    for (const n of l.data.data.search.nodes) {
+      if (!n?.repository) continue;
+      if (!nodes.has(key(n))) nodes.set(key(n), n);
+      seen.set(key(n), (seen.get(key(n)) || new Set()).add(l.slot));
+    }
+  }
+  const only = Object.fromEntries(SLOTS.map((slot) => [slot, [...seen.values()].filter((v) => v.size === 1 && v.has(slot)).length]));
+  const counts = good.map((l) => l.data.data.search.issueCount).filter(Number.isInteger);
+  return {
+    search: { nodes: [...nodes.values()], issueCount: Math.max(nodes.size, ...counts) },
+    partial: good.some((l) => l.data.errors?.length),
+    partialSlots: good.filter((l) => l.data.errors?.length).map((l) => l.slot),
+    only,
+    failed: SLOTS.filter((slot) => !good.some((l) => l.slot === slot)).map((slot) => `The ${slot} token's search did not load.`),
+  };
+}
+
 // The contribution year. With two tokens, both read it and the one that hides fewer contributions is
 // kept, so the calendar and the per-repository breakdown come from a single token.
 async function loadYear(account) {
@@ -563,7 +598,7 @@ async function refresh() {
     });
     // Notes load once per account. Later refreshes keep the notes in memory, including unsaved edits.
     const notesTask = account.notes?.userId === user.id && !account.notes.failed ? null : window.desk.notes();
-    const [notes, year, prs, talk, authored, footprint, yearsResult, reviewedResult, notebook, cardStates] = await Promise.allSettled([
+    const [notes, year, prs, talk, authored, footprint, yearsResult, reviewedResult, notebook, cardStates, asks] = await Promise.allSettled([
       classic ? api(account, "notifications") : null,
       yearTask,
       lookupTask,
@@ -574,6 +609,7 @@ async function refresh() {
       reviewedTask,
       notesTask,
       window.desk.cards(),
+      loadReviewRequests(account, user.login),
     ]);
     if (account !== state) return;
     if (notesTask) account.notes = notesFrom(notebook.value, user.id);
@@ -638,6 +674,16 @@ async function refresh() {
       if (parts.length) errors.reviewed = parts.join(" ");
     }
     const reviewed = theirs;
+    const requestLoad = asks.value || null;
+    const requests = requestLoad ? { ...requestLoad, loadedAt: new Date() } : null;
+    if (!requests) errors.requests = `Review requests did not load. ${asks.reason?.message || ""}`.trim();
+    else {
+      const parts = [];
+      if (requestLoad.search.issueCount > requestLoad.search.nodes.length) parts.push(`Showing the ${fmt(requestLoad.search.nodes.length)} oldest of ${fmt(requestLoad.search.issueCount)} open review requests.`);
+      if (requestLoad.partial) parts.push(`Some review requests could not be read ${tokenPhrase(requestLoad.partialSlots)}.`);
+      if (requestLoad.failed?.length) parts.push(...requestLoad.failed);
+      if (parts.length) errors.requests = parts.join(" ");
+    }
     const rateLimit = rate ? { resources: I.summarizeRateLimit(rate.data), at: new Date() } : null;
 
     const fpLoad = footprint.value || null;
@@ -686,10 +732,10 @@ async function refresh() {
     }
     // With two tokens: what only one of them returned for each merged source, and which read the year.
     const tokenUse = dual(account)
-      ? { events: feed.only, authored: mine?.only, reviewed: theirs?.only, conversations: talkData?.only, year: year.value?.slot || null }
+      ? { events: feed.only, authored: mine?.only, reviewed: theirs?.only, conversations: talkData?.only, requests: requestLoad?.only, year: year.value?.slot || null }
       : null;
 
-    Object.assign(account, { tokenUse, user, viewer, contributions, events, notifications, prLookup, prInfo, reviewed, rateLimit, footprint: footprintData, savedHistory, contributionHistory, conversations, errors, refreshedAt: new Date() });
+    Object.assign(account, { tokenUse, user, viewer, contributions, events, notifications, prLookup, prInfo, reviewed, requests, rateLimit, footprint: footprintData, savedHistory, contributionHistory, conversations, errors, refreshedAt: new Date() });
     await saveWeeklySnapshot(account, mine);
     if (!events.some((e) => I.repoName(e) === account.repo)) account.repo = "";
     account.lastSeen = localStorage.getItem(seenKey());
@@ -741,6 +787,8 @@ function computed() {
   const collab = I.summarizeCollaboration(state.prInfo, state.reviewed?.info, state.user && state.user.login, { complete });
   // Outcome findings cover the pull requests the authored search returned, so they wait for it.
   const outcomes = a ? I.summarizeOutcomes(state.prInfo, state.user && state.user.login, state.refreshedAt) : null;
+  const requests = state.requests ? I.summarizeReviewRequests(state.requests.search, state.user && state.user.login, state.refreshedAt) : null;
+  const waiting = I.summarizeWaiting({ requests, conversations: state.conversations, prInfo: a ? state.prInfo : null, login: state.user && state.user.login, now: state.refreshedAt });
   // One chance budget across every check on the page, which findings and suggestions both use.
   const chance = I.chanceBudget({ prs: prPatterns, outcomes, trajectory });
   const observations = [...I.deriveObservations({ rhythm, sessions, prs: prPatterns, trajectory, follow, review, outcomes, chance }), ...collab.findings];
@@ -762,16 +810,16 @@ function computed() {
     follow: eventsLoaded && prsLoaded ? follow : null,
     prPatterns: prsLoaded ? prPatterns : null, review: a ? review : null, prInfo: a ? state.prInfo : null,
     trajectory, notes, notesNote: state.errors.notifications || "", footprint, conversations: state.conversations, token,
-    collab: state.reviewed ? collab : null, outcomes, observations, chance,
+    collab: state.reviewed ? collab : null, requests, outcomes, observations, chance,
   }), state.public ? {} : state.cards, state.refreshedAt, null, snapshots);
-  const scoped = scopedSuggestions({ ev, eventsLoaded, sessions, follow, prsLoaded, trajectory, notes, footprint, token });
-  return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, outcomes, observations, footprint, suggestions, chance, snapshots, scoped };
+  const scoped = scopedSuggestions({ ev, eventsLoaded, sessions, follow, prsLoaded, trajectory, notes, footprint, token, requests });
+  return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, outcomes, observations, footprint, suggestions, chance, snapshots, scoped, requests, waiting };
 }
 
 // Suggestions for one repository: the pull request rules run on that repository's pull requests,
 // with their own chance budget, while feed, calendar, traffic, and token rules stay account-wide.
 // Null in the account view, or when the chosen repository no longer has enough loaded merges.
-function scopedSuggestions({ ev, eventsLoaded, sessions, follow, prsLoaded, trajectory, notes, footprint, token }) {
+function scopedSuggestions({ ev, eventsLoaded, sessions, follow, prsLoaded, trajectory, notes, footprint, token, requests }) {
   const login = state.user && state.user.login;
   const repos = I.scopeRepos(state.prInfo, login);
   const repo = state.suggestScope;
@@ -793,13 +841,53 @@ function scopedSuggestions({ ev, eventsLoaded, sessions, follow, prsLoaded, traj
     prPatterns: prsLoaded ? prPatterns : null, review: a ? review : null, prInfo: a ? prInfo : null,
     trajectory, notes, notesNote: state.errors.notifications || "", footprint, conversations: state.conversations, token,
     collab: state.reviewed ? collab : null, outcomes, observations: [], chance,
+    requests: requests && { ...requests, items: requests.items.filter((r) => r.repo === repo) },
   });
   return { ...I.applyCardStates(result, state.public ? {} : state.cards, state.refreshedAt, repo), chance, repo: repos.find((r) => r.repo === repo) };
 }
 
+const WAITING_ROWS = 5;
+// One waiting item: how long it has waited, what it is, and who it waits on. The pull request or issue
+// opens on github.com from a link the main process builds.
+function waitingRow(item, detail) {
+  const label = `${item.repo} #${item.number}`;
+  return `<li><span class="age${item.hours >= I.REQUEST_LATE_HOURS ? " late" : ""}" title="${esc(`Waiting since ${new Date(item.at).toLocaleString()}`)}">${esc(I.durationLabel(item.hours))}</span>
+    <div><div class="t"><button type="button" class="link where-link" data-open-repo="${esc(item.repo)}" data-open-number="${item.number}" title="${esc(`Open ${label} on github.com`)}">${esc(`${shortRepo(item.repo)} #${item.number}`)}</button> ${esc(item.title)}</div>
+    <div class="d">${esc(detail)}</div></div></li>`;
+}
+function waitingGroup(title, list, empty, detail) {
+  const rows = list == null ? `<p class="note">${esc(empty)}</p>`
+    : list.length ? `<ul class="waiting-list">${list.slice(0, WAITING_ROWS).map((x) => waitingRow(x, detail(x))).join("")}</ul>${list.length > WAITING_ROWS ? `<p class="note">And ${fmt(list.length - WAITING_ROWS)} more, oldest first above.</p>` : ""}`
+    : `<p class="note">${esc(empty)}</p>`;
+  return `<section class="waiting-group"><h4>${esc(title)} <span class="n">${list ? fmt(list.length) : "—"}</span></h4>${rows}</section>`;
+}
+
+function renderWaiting(c) {
+  const w = c.waiting;
+  const r = c.requests;
+  const reviewDetail = (x) => [x.direct ? "Asked by name" : "Asked through a team", x.since === "request" ? "" : "no request time recorded, so timed from opening",
+    `by ${x.author}`, x.draft ? "draft" : "", x.lines ? `${fmt(x.lines)} lines` : ""].filter(Boolean).join(" · ");
+  const replyDetail = (x) => `${x.author} ${x.kind === "review" ? "reviewed" : "replied"} on ${x.yours ? "your" : x.isPr ? "a" : "an"} ${x.isPr ? "pull request" : "issue"}${x.yours ? "" : " you wrote in"}`;
+  const changeDetail = (x) => `${x.author} requested changes`;
+  const unavailable = state.public ? NEEDS_TOKEN.requests : state.errors.requests || "Review requests did not load.";
+  $("waiting").innerHTML = [
+    waitingGroup("Review requests", r ? w.reviews : null, r ? "No open pull request asks you for a review." : unavailable, reviewDetail),
+    waitingGroup("Replies to answer", w.replies, state.conversations ? "No open thread you opened or wrote in ends with someone else's reply." : (state.public ? NEEDS_TOKEN.conversations : state.errors.conversations || "Conversations did not load."), replyDetail),
+    waitingGroup("Changes requested on your pull requests", state.prLookup.authored ? w.changes : null, state.prLookup.authored ? "No open pull request of yours has changes requested as its latest verdict." : (state.public ? NEEDS_TOKEN.authored : state.errors.authored || "Pull requests you opened did not load."), changeDetail),
+  ].join("");
+  const notes = [];
+  if (r) notes.push(`Review requests come from GitHub's search for open pull requests that ask you, by name or through a team, and are timed from the latest ask. GitHub drops a request from the search once you review.${state.errors.requests ? ` ${state.errors.requests}` : ""}`);
+  if (w.replies) notes.push("Replies come from Conversations: open threads you opened or wrote in, whose latest comment from a person is someone else's.");
+  if (w.unsure) notes.push(`${fmt(w.unsure)} open ${w.unsure === 1 ? "pull request has" : "pull requests have"} more than 10 reviews, so its latest verdict is unknown and it is left out.`);
+  $("waiting-caption").textContent = w.count ? `${fmt(w.count)} ${w.count === 1 ? "item" : "items"}, oldest first` : "";
+  $("waiting").insertAdjacentHTML("beforeend", notes.length ? `<p class="note waiting-note">${esc(notes.join(" "))}</p>` : "");
+}
+
 function renderOverview(c) {
-  const { ev, pr, notes, year } = c;
+  const { ev, pr, notes, year, waiting: w, outcomes } = c;
   const parts = [];
+  if (w.reviews?.length) parts.push(`<strong>${fmt(w.reviews.length)} review request${w.reviews.length === 1 ? "" : "s"}</strong> ${w.reviews.length === 1 ? "waits" : "wait"} on you${c.requests.late ? `, ${fmt(c.requests.late)} for a day or more` : ""}.`);
+  if (w.replies?.length) parts.push(`<strong>${fmt(w.replies.length)} thread${w.replies.length === 1 ? "" : "s"}</strong> ${w.replies.length === 1 ? "ends" : "end"} with someone else's reply.`);
   if (ev.fresh) parts.push(`<strong>${fmt(ev.fresh)} new event${ev.fresh === 1 ? "" : "s"}</strong> since you last marked the stream seen.`);
   const replies = freshConversations();
   if (replies) parts.push(`<strong>${fmt(replies)} new comment${replies === 1 ? "" : "s"} from others</strong> on issues and pull requests that involve you.`);
@@ -814,19 +902,33 @@ function renderOverview(c) {
   if (fpt?.views != null) parts.push(`${fmt(fpt.views)} page views across ${fmt(fpt.withTraffic)} of your repositories in the last 14 days.`);
   $("summary").innerHTML = parts.join(" ");
 
+  // Waiting on you replaces the streak: a streak rewards activity for its own sake, while the queue
+  // says what someone is blocked on. The streak stays in the contribution year's line.
+  const waitingParts = [w.reviews && `${fmt(w.reviews.length)} reviews`, w.replies && `${fmt(w.replies.length)} replies`, state.prLookup.authored && `${fmt(w.changes.length)} changes requested`].filter(Boolean);
+  const base = outcomes?.baseline;
   const kpis = [
-    ["Contribution year", year ? fmt(year.total) : "—", year ? `${fmt(year.activeDays)} active days of ${fmt(year.dayCount)}` : esc(state.errors.year || "")],
-    ["Current streak", year ? `${fmt(year.currentStreak)} d` : "—", year ? `Longest ${fmt(year.longestStreak)} days` : ""],
-    ["Last 30 days", fmt(year?.last30), year?.prev30 != null ? `${fmt(year.prev30)} in the prior 30 days` : ""],
+    ["Contribution year", year ? fmt(year.total) : "—", year ? `${fmt(year.activeDays)} active days of ${fmt(year.dayCount)} · streak ${fmt(year.currentStreak)} d` : esc(state.errors.year || "")],
+    ["Waiting on you", waitingParts.length ? fmt(w.count) : "—", waitingParts.length ? esc(waitingParts.join(" · ")) : esc(state.public ? "Needs a token." : "Sources did not load.")],
+    ["Time to merge", base ? esc(I.durationLabel(base.medianHours)) : "—", base ? `Median of ${fmt(base.n)} merges in ${AUTHORED_DAYS} days · slowest quarter past ${esc(I.durationLabel(base.p75Hours))}` : esc(state.public ? "Needs pull request details." : "Needs six merges of yours.")],
     ["Agent signals", ev.total ? pct(ev.agentShare) : "—", ev.agents.length ? ev.agents.slice(0, 3).map(([n, k]) => `${esc(n)} ${k}`).join(" · ") : "No matches in loaded events"],
   ];
   $("kpis").innerHTML = kpis.map(([label, value, sub]) =>
     `<div class="kpi"><div class="label">${esc(label)}</div><div class="value">${value}</div><div class="sub">${sub}</div></div>`).join("");
 
+  renderWaiting(c);
+
+  // Warnings follow the rule Patterns and Suggestions use: outcomes in your own pull requests and
+  // token access. How work was reviewed is a note, since a merge without a recorded review may still
+  // have been checked another way.
   const items = [];
-  for (const w of tokenWarnings()) items.push(["warn", w.title, w.detail]);
-  if (pr.unreviewed.length) items.push(["warn", `${pr.unreviewed.length} of ${pr.merged} loaded merges have zero recorded reviews`, pr.unreviewed.slice(0, 3).map((p) => `${shortRepo(p.repo)} #${p.number}`).join(", ")]);
-  if (pr.openMine.length) items.push(["warn", `${pr.openMine.length} of your loaded PRs are still open`, pr.openMine.slice(0, 4).map((p) => `${shortRepo(p.repo)} #${p.number}${p.isDraft ? " (draft)" : ""}`).join(", ")]);
+  for (const t of tokenWarnings()) items.push(["warn", t.title, t.detail]);
+  // The same warnings Patterns shows, so both views flag the same outcomes by the same rules.
+  const warned = c.observations.filter((o) => o.tone === "warn");
+  for (const o of warned) items.push(["warn", o.title, `${o.detail} From Patterns.`]);
+  const overdue = outcomes?.overdue || [];
+  const others = pr.openMine.filter((p) => !overdue.some((o) => o.repo === p.repo && o.number === p.number));
+  if (others.length) items.push(["info", `${others.length}${overdue.length ? " other" : ""} open pull request${others.length === 1 ? "" : "s"} of yours`, `${base ? "Within your usual merge time. " : ""}${others.slice(0, 4).map((p) => `${shortRepo(p.repo)} #${p.number}${p.isDraft ? " (draft)" : ""}`).join(", ")}`]);
+  if (pr.unreviewed.length) items.push(["info", `${pr.unreviewed.length} of ${pr.merged} loaded merges have no recorded review`, `${pr.unreviewed.slice(0, 3).map((p) => `${shortRepo(p.repo)} #${p.number}`).join(", ")}. A note, not a warning: see Suggestions for whether your own merges back a second look.`]);
   if (notes && notes.missed.length) items.push(["warn", `${notes.missed.length} unread notification${notes.missed.length === 1 ? "" : "s"} flagged`, "Includes review requests, mentions, and failed checks."]);
   if (state.public) items.push(["warn", "Public view, without a token", `Showing what GitHub serves to anyone for @${state.user.login}: public events, public repositories, and stars. The contribution calendar, pull request details, conversations, notifications, repository traffic, and notes need a token. Add one in Data & access.`]);
   // Sources the public view cannot load are covered by the item above, not listed one by one.
@@ -915,7 +1017,8 @@ function renderConversations() {
   const list = I.filterConversations(conv.items, state.conversationFilter, state.repo, state.query);
   const lastSeen = state.lastSeen ? Date.parse(state.lastSeen) : null;
   if (!list.length) {
-    $("stream").innerHTML = `<div class="empty">${conv.items.length ? "No comments match these filters." : "No comments on issues or pull requests that involve you in the last 30 days."}</div>`;
+    $("stream").innerHTML = `<div class="empty">${!conv.items.length ? "No comments on issues or pull requests that involve you in the last 30 days."
+      : state.conversationFilter === "awaiting" ? "No open thread you opened or wrote in ends with someone else's reply." : "No comments match these filters."}</div>`;
     return;
   }
   const groups = new Map();
@@ -934,6 +1037,7 @@ function renderConversations() {
         : "commented on";
       const tags = [];
       if (fresh) tags.push('<span class="tag new">New</span>');
+      if (c.awaiting) tags.push('<span class="tag warn">awaiting reply</span>');
       if (c.bot) tags.push('<span class="tag agent">bot</span>');
       if (c.mine) tags.push('<span class="tag">you</span>');
       tags.push(`<span class="tag ${th.state}">${th.isPr ? "PR" : "issue"} ${th.state}</span>`);
@@ -943,7 +1047,7 @@ function renderConversations() {
         <span class="glyph" title="${esc(CONVERSATION_LABELS[c.kind])}">${esc(CONVERSATION_GLYPHS[c.kind])}</span>
         <div class="what"><div class="title">${esc(`${c.author} ${action} #${th.number} ${th.title}`)}</div>
           ${textBlock(key, I.textInfo(CONVERSATION_LABELS[c.kind], c.body), c.bot)}
-          <div class="meta"><span>${esc(shortRepo(th.repo))}</span>${c.path ? `<span>${esc(c.path)}</span>` : ""}</div></div>
+          <div class="meta"><span>${openLink(th.repo, th.number)}</span>${c.path ? `<span>${esc(c.path)}</span>` : ""}</div></div>
         <div class="tags">${tags.join("")}</div>
       </div>`;
     }).join("")}</div></div>`).join("");
@@ -1000,7 +1104,9 @@ function renderStream(c) {
     $("stream").innerHTML = `<div class="empty">No events match these filters.</div>`;
   } else {
     $("stream").innerHTML = [...groups.entries()].map(([key, rows]) => `
-      <div class="day"><div class="day-head">${esc(dayHeading(key))} · ${rows.length}</div><div class="rows">${rows.map((e) => {
+      <div class="day"><div class="day-head">${esc(dayHeading(key))} · ${rows.length}</div><div class="rows">${pushBursts(rows).map((burst) => {
+        if (burst.length > 1) return pushBurstRow(burst, lastSeen);
+        const e = burst[0];
         const when = new Date(e.created_at);
         const agent = I.agentOf(e);
         const fresh = lastSeen && when.getTime() > lastSeen;
@@ -1014,7 +1120,7 @@ function renderStream(c) {
           const st = info.merged ? "merged" : info.state === "OPEN" ? "open" : "closed";
           tags.push(`<span class="tag ${st}">${st}</span>`);
           tags.push(`<span class="tag">+${fmt(info.additions)} −${fmt(info.deletions)}</span>`);
-          if (info.merged && !info.reviews) tags.push(`<span class="tag warn">0 reviews</span>`);
+          if (info.merged && !info.reviews) tags.push(`<span class="tag">no review</span>`);
         }
         const branch = I.branchOf(e);
         return `<div class="row${fresh ? " fresh" : ""}">
@@ -1022,11 +1128,60 @@ function renderStream(c) {
           <span class="glyph" title="${esc(I.eventLabel(e.type))}">${esc(GLYPHS[e.type] || "•")}</span>
           <div class="what"><div class="title">${esc(I.describeEvent(e, state.prInfo))}</div>
             ${textBlock(`e:${e.id}`, I.eventText(e, index), agent)}
-            <div class="meta"><span>${esc(shortRepo(I.repoName(e)))}</span>${branch && e.type !== "PushEvent" && e.type !== "CreateEvent" && e.type !== "DeleteEvent" ? `<span>${esc(branch)}</span>` : ""}${e.public === false ? "<span>private</span>" : ""}</div></div>
+            <div class="meta"><span>${openLink(I.repoName(e), eventNumber(e))}</span>${branch && e.type !== "PushEvent" && e.type !== "CreateEvent" && e.type !== "DeleteEvent" ? `<span>${esc(branch)}</span>` : ""}${e.public === false ? "<span>private</span>" : ""}</div></div>
           <div class="tags">${tags.join("")}</div>
         </div>`;
       }).join("")}</div></div>`).join("");
   }
+}
+
+// The issue or pull request an event belongs to, when it names one.
+function eventNumber(e) {
+  const p = e.payload || {};
+  const n = p.pull_request?.number || p.issue?.number || (e.type === "PullRequestEvent" ? p.number : null);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+// A repository name, or "repo #n", that opens on github.com. The main process builds the link.
+function openLink(repo, number) {
+  if (!repo || !/^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(repo)) return esc(shortRepo(repo || ""));
+  const label = `${shortRepo(repo)}${number ? ` #${number}` : ""}`;
+  return `<button type="button" class="link open-link" data-open-repo="${esc(repo)}"${number ? ` data-open-number="${number}"` : ""} title="${esc(`Open ${repo}${number ? ` #${number}` : ""} on github.com`)}">${esc(label)}</button>`;
+}
+
+// Consecutive pushes to one branch within PUSH_BURST_MINUTES of each other, newest first, as runs.
+// Every other event is a run of one.
+function pushBursts(rows) {
+  const runs = [];
+  for (const e of rows) {
+    const last = runs.at(-1);
+    const head = last?.[0];
+    const prev = last?.at(-1);
+    if (e.type === "PushEvent" && head?.type === "PushEvent" && I.repoName(e) === I.repoName(head) && I.branchOf(e) === I.branchOf(head) &&
+        Date.parse(prev.created_at) - Date.parse(e.created_at) <= PUSH_BURST_MINUTES * 6e4) last.push(e);
+    else runs.push([e]);
+  }
+  return runs;
+}
+
+function pushBurstRow(burst, lastSeen) {
+  const newest = new Date(burst[0].created_at);
+  const oldest = new Date(burst.at(-1).created_at);
+  const commits = burst.reduce((n, e) => {
+    const p = e.payload || {};
+    return n + (Array.isArray(p.commits) && p.commits.length ? p.commits.length : Number(p.size) || 0);
+  }, 0);
+  const fresh = lastSeen && newest.getTime() > lastSeen;
+  const agent = burst.map(I.agentOf).find(Boolean);
+  const branch = I.branchOf(burst[0]) || burst[0].payload?.ref || "an unspecified ref";
+  const time = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return `<div class="row${fresh ? " fresh" : ""}">
+    <span class="time">${esc(time(newest))}</span>
+    <span class="glyph" title="Pushes">${esc(GLYPHS.PushEvent)}</span>
+    <div class="what"><div class="title">${esc(`Pushed ${commits ? `${commits} commit${commits === 1 ? "" : "s"} ` : ""}to ${branch} in ${burst.length} pushes`)}</div>
+      <div class="meta"><span>${openLink(I.repoName(burst[0]))}</span><span>${esc(`${time(oldest)} to ${time(newest)}`)}</span></div></div>
+    <div class="tags">${fresh ? '<span class="tag new">New</span>' : ""}${agent ? `<span class="tag agent">${esc(agent)}</span>` : ""}<span class="tag push-count">${burst.length} pushes</span></div>
+  </div>`;
 }
 
 function insightSection(id, name, caption, content) {
@@ -1429,7 +1584,15 @@ function reviewCard(r, pr) {
     ${verdicts}
     ${people.length ? bars(people, { violet: true }) + '<p class="note">Pull requests each person reviewed.</p>' : '<p class="note">No one besides you or a bot reviewed the pull requests you authored.</p>'}
     ${repoTable}
-    <p class="note">Measured on ${fmt(r.authored)} ${r.authored === 1 ? "pull request" : "pull requests"} you authored${authoredCoverage()}, following the CHAOSS time-to-first-response definition: the first review by a human who is not the author, from creation. Draft time counts toward the wait. ${fmt(r.withHumanReview)} had a human review; ${fmt(r.reviewedBeforeMerge)} of ${fmt(r.merged)} merges got one before merging, and ${fmt(r.botOnly)} ${r.botOnly === 1 ? "was" : "were"} reviewed only by bots. The slowest quarter appears from four timed waits.${r.states ? " An approval counts when another person approved before the merge. Comment-only reviews count as reviewed but not approved." : ""}${r.truncated ? ` ${fmt(r.truncated)} had more than 10 reviews, and only the first 10 are read.` : ""}</p>`;
+    <p class="note">Measured on ${fmt(r.authored)} ${r.authored === 1 ? "pull request" : "pull requests"} you authored${authoredCoverage()}, following the CHAOSS time-to-first-response definition: the first review by a human who is not the author. The wait starts when the pull request was ready for review: when it opened, or for a draft, when it was first marked ready. ${clockNote(r.clocks, r.noTimeline)}${fmt(r.withHumanReview)} had a human review; ${fmt(r.reviewedBeforeMerge)} of ${fmt(r.merged)} merges got one before merging, and ${fmt(r.botOnly)} ${r.botOnly === 1 ? "was" : "were"} reviewed only by bots. The slowest quarter appears from four timed waits.${r.states ? " An approval counts when another person approved before the merge. Comment-only reviews count as reviewed but not approved." : ""}${r.truncated ? ` ${fmt(r.truncated)} had more than 10 reviews, and only the first 10 are read.` : ""}</p>`;
+}
+
+// Where the waits in review turnaround started, when any started later than opening.
+function clockNote(clocks, missing) {
+  const parts = [];
+  if (clocks?.ready) parts.push(`${fmt(clocks.ready)} ${clocks.ready === 1 ? "wait starts" : "waits start"} when a draft was marked ready.`);
+  if (missing) parts.push(`${fmt(missing)} ${missing === 1 ? "pull request's timeline" : "pull requests' timelines"} did not load, so draft time counts there.`);
+  return parts.length ? `${parts.join(" ")} ` : "";
 }
 
 const PARTNER_ROWS = 8;
@@ -1451,8 +1614,8 @@ function partnersCard(c) {
     <table class="compare"><caption class="note">Pull requests in each direction, last ${AUTHORED_DAYS} days</caption>
       <thead><tr><th scope="col">Person</th><th scope="col">Direction</th><th scope="col">Reviewed yours</th><th scope="col">Their median first review</th><th scope="col">You reviewed theirs</th><th scope="col">Your median first review</th></tr></thead>
       <tbody>${rows}</tbody></table>
-    ${c.outTimed ? `<p class="note">Your first review on other people's pull requests came a median of <strong>${esc(hoursLabel(c.outMedianHours))}</strong> after they opened, across ${fmt(c.outTimed)}${c.outP75Hours != null ? `. The slowest quarter took over ${esc(hoursLabel(c.outP75Hours))}` : ""}.</p>` : ""}
-    <p class="note">From ${window(a, "pull requests you opened")} and ${window(r, "pull requests by others that you reviewed")}. Each person counts once per pull request. Times run from when the pull request was created to that person's first review, so draft time and waiting for a review request both count.${more}${c.truncated ? ` ${fmt(c.truncated)} of your pull requests had more than 10 reviews, and only the first 10 are read.` : ""}${c.botAuthored ? ` ${fmt(c.botAuthored)} ${c.botAuthored === 1 ? "pull request by a bot that you reviewed is" : "pull requests by bots that you reviewed are"} left out.` : ""}${c.unmatched ? ` ${fmt(c.unmatched)} reviewed ${c.unmatched === 1 ? "pull request had" : "pull requests had"} no readable review time.` : ""}</p>`;
+    ${c.outTimed ? `<p class="note">Your first review on other people's pull requests came a median of <strong>${esc(hoursLabel(c.outMedianHours))}</strong> after you were asked, or after they were ready for review where no request to you came first, across ${fmt(c.outTimed)}${c.outP75Hours != null ? `. The slowest quarter took over ${esc(hoursLabel(c.outP75Hours))}` : ""}. ${esc(I.clockText(c.outClocks, "your"))}</p>` : ""}
+    <p class="note">From ${window(a, "pull requests you opened")} and ${window(r, "pull requests by others that you reviewed")}. Each person counts once per pull request. Each person's first review is timed from the request to them when one came first, else from when the pull request was ready for review, so a late request or a long draft no longer reads as a slow reviewer. ${esc(I.clockText(c.inClocks, "their"))}${more}${c.truncated ? ` ${fmt(c.truncated)} of your pull requests had more than 10 reviews, and only the first 10 are read.` : ""}${c.botAuthored ? ` ${fmt(c.botAuthored)} ${c.botAuthored === 1 ? "pull request by a bot that you reviewed is" : "pull requests by bots that you reviewed are"} left out.` : ""}${c.unmatched ? ` ${fmt(c.unmatched)} reviewed ${c.unmatched === 1 ? "pull request had" : "pull requests had"} no readable review time.` : ""}</p>`;
 }
 
 // Where the loaded pull requests came from, for captions.
@@ -1795,6 +1958,10 @@ function renderMeta(c) {
   caps.push(conv
     ? [state.errors.conversations ? "part" : "ok", "Conversations", `${fmt(conv.items.length)} comments and reviews on ${fmt(conv.threads)} threads. ${esc((state.errors.conversations || "") + onlyNote(use?.conversations, "thread", "threads"))}`]
     : ["no", "Conversations", esc(state.errors.conversations || "Not available.")]);
+  const asked = state.requests;
+  caps.push(asked
+    ? [state.errors.requests ? "part" : "ok", "Review requests", esc((state.errors.requests || `${fmt(asked.search.nodes.length)} open pull requests ask you for a review, by name or through a team.`) + onlyNote(use?.requests, "request", "requests"))]
+    : ["no", "Review requests", esc(state.errors.requests || (state.public ? NEEDS_TOKEN.requests : "Not available."))]);
   if (year) {
     caps.push(year.totals.restricted
       ? ["part", "Private contributions", `${fmt(year.totals.restricted)} contributions are counted but hidden from ${both ? "both tokens" : "this token"}.`]
@@ -1850,7 +2017,7 @@ function renderMeta(c) {
 const OPERATION_LABELS = {
   profile: "Profile", events: "Activity stream", notifications: "Notifications", year: "Contribution year",
   pullRequests: "Pull request details", pullRequestCommits: "Last-commit times", authoredPullRequests: "Pull requests you opened", reviewedPullRequests: "Pull requests you reviewed",
-  conversations: "Conversations", rateLimit: "Rate-limit budget", contributionHistory: "Contribution history",
+  conversations: "Conversations", reviewRequests: "Review requests", rateLimit: "Rate-limit budget", contributionHistory: "Contribution history",
   ownedRepos: "Repository list", traffic: "Repository traffic", stargazers: "Star dates",
 };
 
@@ -2528,6 +2695,18 @@ $("insights").addEventListener("click", (event) => {
   if (!button) return;
   showTab("suggestions");
   jumpTo(`#suggestion-${CSS.escape(button.dataset.suggestion)}`);
+});
+// Pull requests and issues named in Overview and Stream open on github.com. Suggestions has its own
+// handler, which reports a failure beside its cards.
+$("content").addEventListener("click", async (event) => {
+  const page = event.target.closest("[data-open-repo]");
+  if (!page || page.closest("#suggestions")) return;
+  const number = page.dataset.openNumber ? Number(page.dataset.openNumber) : null;
+  let opened = false;
+  try {
+    opened = (await window.desk.openGitHub(page.dataset.openRepo, number)).ok;
+  } catch { /* The system browser could not be opened. */ }
+  $("open-status").textContent = opened ? "" : `Could not open ${page.textContent} in your browser.`;
 });
 $("suggestions").addEventListener("change", (event) => {
   if (event.target.id !== "suggest-scope") return;

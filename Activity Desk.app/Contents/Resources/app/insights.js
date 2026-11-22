@@ -830,6 +830,7 @@ function summarizeReviewFlow(prInfo, login) {
 
   const waits = [];
   const approvalWaits = [];
+  const clocks = clockCounts();
   let reviewedBeforeMerge = 0;
   let approvedBeforeMerge = 0;
   let changesRequested = 0;
@@ -842,7 +843,7 @@ function summarizeReviewFlow(prInfo, login) {
     if (states) {
       const approvals = humanBy(pr, "approved").sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
       if (approvals.length) {
-        const h = (Date.parse(approvals[0].at) - Date.parse(pr.createdAt)) / 36e5;
+        const h = (Date.parse(approvals[0].at) - Date.parse(reviewClock(pr, approvals[0].at).start)) / 36e5;
         if (Number.isFinite(h) && h >= 0) approvalWaits.push(h);
       }
       if (pr.merged && approvals.some((r) => Date.parse(r.at) <= Date.parse(pr.mergedAt))) {
@@ -856,10 +857,13 @@ function summarizeReviewFlow(prInfo, login) {
       if (pr.merged) row.noHuman += 1;
       continue;
     }
-    const hours = (Date.parse(first.at) - Date.parse(pr.createdAt)) / 36e5;
+    // The wait runs from when the pull request was ready for review, so time as a draft is left out.
+    const clock = reviewClock(pr, first.at);
+    const hours = (Date.parse(first.at) - Date.parse(clock.start)) / 36e5;
     if (Number.isFinite(hours) && hours >= 0) {
       waits.push(hours);
       row.waits.push(hours);
+      clocks[clock.from] += 1;
     }
     if (pr.merged && Date.parse(first.at) <= Date.parse(pr.mergedAt)) reviewedBeforeMerge += 1;
   }
@@ -893,6 +897,10 @@ function summarizeReviewFlow(prInfo, login) {
     medianFirstReviewHours: median(waits),
     // The slowest quarter of waits starts here. Shown from four waits up.
     p75FirstReviewHours: waits.length >= 4 ? quantile(waits, 0.75) : null,
+    // How many waits started when a draft was marked ready, and how many when the pull request opened.
+    clocks,
+    // Pull requests whose timeline could not be read, so a draft's time counts toward their wait.
+    noTimeline: authored.filter((pr) => pr.requests === null).length,
     states,
     approved: states ? approvalWaits.length : null,
     medianFirstApprovalHours: states ? median(approvalWaits) : null,
@@ -1137,7 +1145,8 @@ function summarizeSnapshots(saved, current, week) {
 const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
 
 // Review partners: who reviews the user's pull requests and whose pull requests the user reviews.
-// Both directions use the same window and the same clock as review turnaround: hours from creation
+// Both directions use the same window. Each person's first review is timed from the request to them when
+// one came before it, else from when the pull request was ready for review, else from creation
 // to that person's first review, not from the review request, which needs the timeline API.
 const COLLAB_MIN_SIDE = 8;      // reviews on the busier side before a balance finding
 const COLLAB_RATIO = 3;         // how lopsided the balance must be
@@ -1162,6 +1171,8 @@ function summarizeCollaboration(prInfo, reviewed, login, { complete = false } = 
   // Inbound: each human reviewer once per pull request the user authored, timed by their first review.
   let received = 0;
   let truncated = 0;
+  const inClocks = clockCounts();
+  const outClocks = clockCounts();
   const authored = Object.values(prInfo || {}).filter((pr) => pr?.title && Array.isArray(pr.reviewList) &&
     me && String(pr.author || "").toLowerCase() === me);
   for (const pr of authored) {
@@ -1177,8 +1188,12 @@ function summarizeCollaboration(prInfo, reviewed, login, { complete = false } = 
       const p = person(r.login);
       p.in += 1;
       received += 1;
-      const h = hoursFrom(pr.createdAt, r.at);
-      if (h != null) p.inHours.push(h);
+      const clock = reviewClock(pr, r.at, r.login);
+      const h = hoursFrom(clock.start, r.at);
+      if (h != null) {
+        p.inHours.push(h);
+        inClocks[clock.from] += 1;
+      }
     }
   }
 
@@ -1193,8 +1208,13 @@ function summarizeCollaboration(prInfo, reviewed, login, { complete = false } = 
     const p = person(author);
     p.out += 1;
     given += 1;
-    const h = pr.myFirstReviewAt ? hoursFrom(pr.createdAt, pr.myFirstReviewAt) : null;
-    if (h != null) p.outHours.push(h); else unmatched += 1;
+    // Timed from when you were asked, where a request to you came before your review.
+    const clock = pr.myFirstReviewAt ? reviewClock(pr, pr.myFirstReviewAt, login) : null;
+    const h = clock ? hoursFrom(clock.start, pr.myFirstReviewAt) : null;
+    if (h != null) {
+      p.outHours.push(h);
+      outClocks[clock.from] += 1;
+    } else unmatched += 1;
   }
 
   // Your own speed on other people's pull requests, across everyone.
@@ -1227,7 +1247,7 @@ function summarizeCollaboration(prInfo, reviewed, login, { complete = false } = 
 
   return {
     authored: authored.length, reviewedCount: Object.keys(reviewed || {}).length,
-    received, given, botAuthored, unmatched, truncated, complete,
+    received, given, botAuthored, unmatched, truncated, complete, inClocks, outClocks,
     outTimed: outAll.length, outMedianHours: median(outAll), outP75Hours: outAll.length >= 4 ? quantile(outAll, 0.75) : null,
     people: rows, mutual: rows.filter((r) => r.kind === "mutual").length, findings,
   };
@@ -1594,6 +1614,7 @@ const SUGGEST_WAITING_DAYS = 2;
 const SUGGEST_LATE_SHARE = 0.15;
 const SUGGEST_CI_SHARE = 0.4;
 const SUGGEST_OUT_MIN = 5;
+const SUGGEST_PENDING_MIN = 2;          // review requests to you by name, each waiting a day, before a card
 
 const lines = (n) => Math.round(n).toLocaleString();
 const ageDays = (nowTime, at) => (nowTime - Date.parse(at)) / DAY_MS;
@@ -1758,7 +1779,7 @@ const SUGGESTION_RULES = [
         targets: review.byRepo.filter((r) => r.timed >= 2 && r.medianFirstReviewHours >= SUGGEST_REVIEW_WAIT_HOURS)
           .sort((a, b) => b.medianFirstReviewHours - a.medianFirstReviewHours).slice(0, SUGGEST_TARGETS)
           .map((r) => ref(`${r.repo}: median ${durationLabel(r.medianFirstReviewHours)} across ${r.timed}`, r.repo)),
-        seen: `Your pull requests waited a median of ${durationLabel(review.medianFirstReviewHours)} for a first review from another person, across ${plural(review.withHumanReview, "pull request")}.${review.p75FirstReviewHours != null ? ` One in four waited longer than ${durationLabel(review.p75FirstReviewHours)}.` : ""} Time as a draft counts toward the wait.`,
+        seen: `Your pull requests waited a median of ${durationLabel(review.medianFirstReviewHours)} for a first review from another person, across ${plural(review.withHumanReview, "pull request")}.${review.p75FirstReviewHours != null ? ` One in four waited longer than ${durationLabel(review.p75FirstReviewHours)}.` : ""} Each wait runs from when the pull request was ready for review, so time as a draft is left out${review.noTimeline ? `, except on ${plural(review.noTimeline, "pull request")} whose timeline did not load` : ""}.`,
         why: [["Google's review guide sets one business day as the maximum time to respond to a review request.", "google-speed"]],
         act: [["Request a reviewer as you open it, or add a CODEOWNERS file so GitHub requests one automatically. Code owners are not requested on drafts until they are marked ready.", "gh-codeowners"]],
         more: ["chaoss-first-response"],
@@ -1768,17 +1789,29 @@ const SUGGESTION_RULES = [
   {
     id: "answer-review-requests", area: "Review", source: "Pull requests you reviewed",
     title: "Answer other people's pull requests within a day",
-    check: ({ collab }) => {
-      if (!collab) return { unavailable: "The search for pull requests you reviewed did not load." };
-      if (collab.outTimed < SUGGEST_OUT_MIN) return { short: `Needs ${SUGGEST_OUT_MIN} pull requests by others with a readable time for your first review; ${collab.outTimed} loaded.` };
-      if (!(collab.outMedianHours >= SUGGEST_REVIEW_WAIT_HOURS)) return null;
+    // Fires on your past speed, or on review requests to you by name that have already waited a day.
+    check: ({ collab, requests }) => {
+      if (!collab && !requests) return { unavailable: "The searches for pull requests you reviewed and for review requests did not load." };
+      const history = collab && collab.outTimed >= SUGGEST_OUT_MIN ? collab : null;
+      const slow = history && history.outMedianHours >= SUGGEST_REVIEW_WAIT_HOURS;
+      const pending = requests ? requests.items.filter((r) => r.direct && r.hours >= REQUEST_LATE_HOURS) : [];
+      const asked = pending.length >= SUGGEST_PENDING_MIN;
+      if (!slow && !asked) {
+        if (!history) return { short: `Needs ${SUGGEST_OUT_MIN} pull requests by others with a readable time for your first review (${collab ? `${collab.outTimed} loaded` : "that search did not load"}), or ${SUGGEST_PENDING_MIN} review requests to you by name that have waited a day (${pending.length} ${pending.length === 1 ? "has" : "have"}).` };
+        return null;
+      }
+      const seen = [];
+      if (slow) seen.push(`Your first review on other people's pull requests came a median of ${durationLabel(history.outMedianHours)} ${history.outClocks.request || history.outClocks.ready ? "after you were asked or they were ready for review" : "after they were opened"}, across ${plural(history.outTimed, "pull request")}.${history.outP75Hours != null ? ` One in four took longer than ${durationLabel(history.outP75Hours)}.` : ""} ${clockText(history.outClocks, "your")}`);
+      if (asked) seen.push(`${plural(pending.length, "open review request")} to you by name ${pending.length === 1 ? "has" : "have"} waited a day or more since the ask. The oldest request, on ${prLabel(pending[0])}, came ${durationLabel(pending[0].hours)} ago.`);
+      const basis = [slow ? `${plural(history.outTimed, "pull request")} by other people that you reviewed` : "", asked ? `${plural(requests.items.filter((r) => r.direct).length, "open review request")} to you by name` : ""].filter(Boolean);
+      const people = slow ? history.people.filter((p) => p.outTimed >= 2 && p.outMedianHours >= SUGGEST_REVIEW_WAIT_HOURS)
+        .sort((a, b) => b.outMedianHours - a.outMedianHours).map((p) => `${p.login}: median ${durationLabel(p.outMedianHours)} across ${p.outTimed}`) : [];
       return {
         tone: "info",
-        basis: `${plural(collab.outTimed, "pull request")} by other people that you reviewed`,
-        targets: collab.people.filter((p) => p.outTimed >= 2 && p.outMedianHours >= SUGGEST_REVIEW_WAIT_HOURS)
-          .sort((a, b) => b.outMedianHours - a.outMedianHours).slice(0, SUGGEST_TARGETS)
-          .map((p) => `${p.login}: median ${durationLabel(p.outMedianHours)} across ${p.outTimed}`),
-        seen: `Your first review on other people's pull requests came a median of ${durationLabel(collab.outMedianHours)} after they were opened, across ${plural(collab.outTimed, "pull request")}.${collab.outP75Hours != null ? ` One in four took longer than ${durationLabel(collab.outP75Hours)}.` : ""} Times run from when each pull request was opened, not from when you were asked, so a late request reads as a slow review.`,
+        source: asked ? (slow ? "Pull requests you reviewed, and review requests" : "Review requests") : undefined,
+        basis: basis.join(", and "),
+        targets: [...pending.map((r) => ref(`${prLabel(r)}: asked ${durationLabel(r.hours)} ago, by ${r.author}`, r.repo, r.number)), ...people].slice(0, SUGGEST_TARGETS),
+        seen: seen.join(" "),
         why: [["Google's review guide sets one business day as the maximum time to respond to a review request.", "google-speed"]],
         act: [["Set one or two fixed times a day to clear your review requests. When a full review has to wait, reply with when you will get to it."]],
       };
@@ -2318,6 +2351,71 @@ function deriveSuggestions(input) {
   return { items, checked, links };
 }
 
+// ---------- Review requests waiting on you ----------
+// Open pull requests that ask you for a review, from the search GitHub keeps for review-requested:you.
+// Each is timed from the latest request to you, or to a team when you were not asked by name, since a
+// re-request after an earlier review restarts the ask. Without a request event it falls back to opening.
+const REQUEST_LATE_HOURS = 24; // Google's one-business-day guideline, rounded to a day, as elsewhere
+function summarizeReviewRequests(search, login, now) {
+  if (!search || !Array.isArray(search.nodes)) return null;
+  const me = String(login || "").toLowerCase();
+  const nowTime = now == null ? Date.now() : new Date(now).getTime();
+  const items = [];
+  for (const n of search.nodes) {
+    const repo = n?.repository?.nameWithOwner;
+    if (!n || n.__typename !== "PullRequest" || typeof repo !== "string" || !Number.isInteger(n.number) || !validTime(n.createdAt)) continue;
+    const reviewers = (n.reviewRequests?.nodes || []).map((r) => r?.requestedReviewer).filter(Boolean);
+    const direct = reviewers.some((r) => r.__typename === "User" && String(r.login || "").toLowerCase() === me);
+    const events = (n.timelineItems?.nodes || []).filter((e) => e && validTime(e.createdAt));
+    const mine = events.filter((e) => e.requestedReviewer?.__typename === "User" && String(e.requestedReviewer.login || "").toLowerCase() === me);
+    const team = events.filter((e) => e.requestedReviewer && e.requestedReviewer.__typename !== "User");
+    const pick = (direct ? mine : team).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+    const at = pick ? pick.createdAt : n.createdAt;
+    items.push({
+      repo, number: n.number, title: String(n.title || ""), author: n.author?.login || "ghost",
+      authorBot: n.author?.__typename === "Bot" || isBotLogin(n.author?.login), draft: Boolean(n.isDraft),
+      lines: (Number(n.additions) || 0) + (Number(n.deletions) || 0), direct, at, since: pick ? "request" : "opened",
+      hours: Math.max(0, (nowTime - Date.parse(at)) / 36e5),
+    });
+  }
+  items.sort((a, b) => b.hours - a.hours);
+  return {
+    items,
+    loaded: items.length,
+    total: Number.isInteger(search.issueCount) ? Math.max(search.issueCount, items.length) : items.length,
+    direct: items.filter((r) => r.direct).length,
+    late: items.filter((r) => r.hours >= REQUEST_LATE_HOURS).length,
+    lateDirect: items.filter((r) => r.direct && r.hours >= REQUEST_LATE_HOURS).length,
+  };
+}
+
+// Everything in the loaded data that waits on you: review requests, threads whose latest reply is
+// someone else's, and your open pull requests whose latest review from another person asked for changes.
+function summarizeWaiting({ requests, conversations, prInfo, login, now } = {}) {
+  const me = String(login || "").toLowerCase();
+  const nowTime = now == null ? Date.now() : new Date(now).getTime();
+  const replies = conversations ? conversations.items.filter((c) => c.awaiting)
+    .map((c) => ({ repo: c.thread.repo, number: c.thread.number, title: c.thread.title, isPr: c.thread.isPr, author: c.author, at: c.at,
+      hours: Math.max(0, (nowTime - Date.parse(c.at)) / 36e5), kind: c.kind, yours: me && c.thread.author.toLowerCase() === me }))
+    .sort((a, b) => b.hours - a.hours) : null;
+  const changes = [];
+  let unsure = 0;
+  for (const pr of Object.values(prInfo || {})) {
+    if (!pr?.title || pr.state !== "OPEN" || String(pr.author || "").toLowerCase() !== me || !Array.isArray(pr.reviewList)) continue;
+    const verdicts = pr.reviewList.filter((r) => !r.bot && r.login && r.login.toLowerCase() !== me && validTime(r.at) &&
+      (r.state === "approved" || r.state === "changes_requested")).sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+    if (verdicts[0]?.state !== "changes_requested") continue;
+    // Only the first 10 reviews are read, so a later approval could be missing.
+    if (pr.reviews > pr.reviewList.length) { unsure += 1; continue; }
+    changes.push({ repo: pr.repo, number: pr.number, title: pr.title, author: verdicts[0].login, at: verdicts[0].at,
+      hours: Math.max(0, (nowTime - Date.parse(verdicts[0].at)) / 36e5) });
+  }
+  changes.sort((a, b) => b.hours - a.hours);
+  const reviews = requests ? requests.items : null;
+  const count = (reviews?.length || 0) + (replies?.length || 0) + changes.length;
+  return { reviews, replies, changes, unsure, count };
+}
+
 function summarizeNotifications(items) {
   const list = Array.isArray(items) ? items : [];
   const unread = list.filter((item) => item && item.unread);
@@ -2346,6 +2444,7 @@ const CONVERSATION_FILTERS = {
   mine: (c) => c.mine,
   reviews: (c) => c.kind !== "comment",
   bots: (c) => c.bot,
+  awaiting: (c) => Boolean(c.awaiting),
 };
 
 // The conversation request runs one search for issues and one for pull requests. Each kind reports
@@ -2405,6 +2504,17 @@ function flattenConversations(data, login) {
   }
   const valid = items.filter((c) => Number.isFinite(Date.parse(c.at)));
   valid.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  // A thread awaits your reply when it is open, you opened it or wrote in it, and its latest comment from
+  // a person, not a bot, is someone else's. That latest comment is marked, so each thread counts once.
+  const joined = new Set(valid.filter((c) => c.mine).map((c) => `${c.thread.repo}#${c.thread.number}`));
+  const latest = new Set();
+  for (const c of valid) {
+    const key = `${c.thread.repo}#${c.thread.number}`;
+    if (c.bot || latest.has(key)) continue;
+    latest.add(key);
+    const yours = joined.has(key) || (me && c.thread.author.toLowerCase() === me);
+    if (!c.mine && c.thread.state === "open" && yours) c.awaiting = true;
+  }
   const found = CONVERSATION_SEARCHES.map((key) => searches[key]).filter(Boolean);
   return {
     items: valid,
@@ -2520,8 +2630,9 @@ function filterEvents(events, filter, repo, query, hideMinor, prInfo, index) {
 // Returns null when GitHub left out the fields the summaries depend on.
 function normalizePullRequest(pr, repo, number, source) {
   if (!pr || typeof pr.title !== "string" || !Number.isInteger(pr.reviews?.totalCount)) return null;
+  const { timelineItems, ...rest } = pr;
   return {
-    ...pr, repo, number, source,
+    ...rest, repo, number, source, ...timelineOf(timelineItems),
     headRef: pr.headRefName, author: pr.author?.login, mergedBy: pr.mergedBy?.login,
     authorBot: pr.author?.__typename === "Bot" || isBotLogin(pr.author?.login),
     reviews: pr.reviews.totalCount,
@@ -2531,6 +2642,50 @@ function normalizePullRequest(pr, repo, number, source) {
       bot: r?.author?.__typename === "Bot" || isBotLogin(r?.author?.login),
     })),
   };
+}
+
+// When review could start on a pull request: the first time a draft was marked ready, and each review
+// request with its time and the requested login (null for a team). Null when the timeline was not read.
+const validTime = (at) => typeof at === "string" && Number.isFinite(Date.parse(at));
+function timelineOf(items) {
+  const nodes = Array.isArray(items?.nodes) ? items.nodes.filter(Boolean) : null;
+  if (!nodes) return { readyAt: null, requests: null };
+  const ready = nodes.filter((n) => n.__typename === "ReadyForReviewEvent" && validTime(n.createdAt))
+    .map((n) => n.createdAt).sort((a, b) => Date.parse(a) - Date.parse(b));
+  const requests = nodes.filter((n) => n.__typename === "ReviewRequestedEvent" && validTime(n.createdAt)).map((n) => ({
+    login: n.requestedReviewer?.__typename === "User" && typeof n.requestedReviewer.login === "string" ? n.requestedReviewer.login : null,
+    at: n.createdAt,
+  }));
+  return { readyAt: ready[0] || null, requests, timelineCapped: Number.isInteger(items.totalCount) && items.totalCount > nodes.length };
+}
+
+// Where the wait for a review starts. For a pull request as a whole it is when it was ready for review:
+// when a draft was first marked ready, if that came before the review, or else when it opened. For one
+// reviewer it is the earliest request to that person before their review, when there is one, since the
+// clock for answering an ask starts with the ask. `from` says which: "request", "ready", or "opened".
+function reviewClock(pr, reviewAt, reviewer) {
+  const at = Date.parse(reviewAt);
+  if (reviewer && Array.isArray(pr.requests)) {
+    const name = reviewer.toLowerCase();
+    const asked = pr.requests.filter((r) => r.login && r.login.toLowerCase() === name && Date.parse(r.at) <= at)
+      .sort((a, b) => Date.parse(a.at) - Date.parse(b.at))[0];
+    if (asked && Date.parse(asked.at) >= Date.parse(pr.createdAt)) return { start: asked.at, from: "request" };
+  }
+  if (pr.readyAt && Date.parse(pr.readyAt) <= at && Date.parse(pr.readyAt) > Date.parse(pr.createdAt)) return { start: pr.readyAt, from: "ready" };
+  return { start: pr.createdAt, from: "opened" };
+}
+const clockCounts = () => ({ request: 0, ready: 0, opened: 0 });
+// One sentence on where review waits started. `asked` names who was asked, for request-timed waits.
+function clockText(c, asked) {
+  if (!c) return "";
+  const total = c.request + c.ready + c.opened;
+  if (!total) return "";
+  const parts = [];
+  if (c.request) parts.push(`from ${asked} review request on ${plural(c.request, "pull request")}`);
+  if (c.ready) parts.push(`from when a draft was marked ready on ${c.ready}`);
+  if (c.opened) parts.push(`from opening on ${c.opened}`);
+  const list = parts.length > 1 ? `${parts.slice(0, -1).join(", ")}, and ${parts.at(-1)}` : parts[0];
+  return `Timed ${list}${c.opened && asked ? ", where no earlier request was recorded" : ""}.`;
 }
 
 // The X-Accepted-GitHub-Permissions value lists the permissions an endpoint needs, comma separated.
@@ -2992,6 +3147,9 @@ const api = {
   summarizePullRequests,
   summarizeContributions,
   summarizeNotifications,
+  summarizeReviewRequests,
+  summarizeWaiting,
+  REQUEST_LATE_HOURS,
   summarizeRhythm,
   summarizeSessions,
   summarizePrPatterns,
@@ -3025,6 +3183,7 @@ const api = {
   READING,
   REWORK_HOURS,
   durationLabel,
+  clockText,
   filterEvents,
   isMinor,
   normalizePullRequest,
