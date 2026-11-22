@@ -567,3 +567,74 @@ test("reads a trial's weekly snapshots from the week it started", () => {
   assert.equal(insights.applyCardStates(sug, { "limit-open-work": st }, null, null, snaps).trying[0].series.weeks, 3);
   assert.equal(insights.applyCardStates(sug, { "limit-open-work@me/a": st }, null, "me/a", snaps).trying[0].series, null);
 });
+
+test("starts review clocks when a draft is ready or a reviewer is asked", () => {
+  const H = 36e5;
+  const c = Date.parse("2026-10-01T00:00:00Z");
+  const iso = (h) => new Date(c + h * H).toISOString();
+  const pr = (number, author, reviews, timeline) => insights.normalizePullRequest({
+    title: `T${number}`, state: "MERGED", merged: true, createdAt: iso(0), mergedAt: iso(100), closedAt: iso(100), additions: 1, deletions: 1,
+    headRefName: "x", author: { login: author }, mergedBy: { login: author },
+    reviews: { totalCount: reviews.length, nodes: reviews.map(([who, h]) => ({ submittedAt: iso(h), state: "APPROVED", author: { __typename: "User", login: who } })) },
+    timelineItems: timeline && { totalCount: timeline.length, nodes: timeline.map(([type, h, who]) => (type === "ready"
+      ? { __typename: "ReadyForReviewEvent", createdAt: iso(h) }
+      : { __typename: "ReviewRequestedEvent", createdAt: iso(h), requestedReviewer: who ? { __typename: "User", login: who } : { __typename: "Team" } })) },
+  }, "o/r", number, "search");
+  const info = {
+    a: pr(1, "me", [["mira", 60]], [["ready", 48]]), // a draft marked ready at 48 h: waits 12 h
+    b: pr(2, "me", [["mira", 10]], [["ready", 48]]), // reviewed while still a draft: from opening
+    c: pr(3, "me", [["tomas", 30]], [["request", 20, "tomas"]]), // the pull request's wait ignores the request
+    d: pr(4, "me", [["tomas", 5]], null), // no timeline read
+  };
+  assert.equal(info.a.readyAt, iso(48));
+  assert.equal("timelineItems" in info.a, false);
+  const flow = insights.summarizeReviewFlow(info, "me");
+  assert.equal(flow.medianFirstReviewHours, 11);
+  assert.deepEqual([flow.clocks, flow.noTimeline], [{ request: 0, ready: 1, opened: 3 }, 1]);
+  // Per reviewer, the request to that person starts the clock: tomas answered in 10 h and 5 h.
+  const theirs = pr(9, "mira", [["me", 46]], [["request", 40, "me"]]);
+  theirs.myFirstReviewAt = iso(46);
+  const collab = insights.summarizeCollaboration(info, { t: theirs }, "me", { complete: true });
+  assert.equal(collab.people.find((p) => p.login === "tomas").inMedianHours, 7.5);
+  assert.deepEqual([collab.outMedianHours, collab.outClocks], [6, { request: 1, ready: 0, opened: 0 }]);
+  assert.match(insights.clockText(collab.outClocks, "your"), /^Timed from your review request on 1 pull request\.$/);
+});
+
+test("lists review requests and threads that wait on you, oldest first", () => {
+  const H = 36e5;
+  const now = Date.parse("2026-11-20T12:00:00Z");
+  const iso = (t) => new Date(t).toISOString();
+  const node = (number, created, direct, events) => ({ __typename: "PullRequest", number, title: `Ask ${number}`, isDraft: false, createdAt: iso(created),
+    additions: 3, deletions: 1, repository: { nameWithOwner: "t/o" }, author: { __typename: "User", login: "mira" },
+    reviewRequests: { nodes: [{ requestedReviewer: direct ? { __typename: "User", login: "me" } : { __typename: "Team" } }] },
+    timelineItems: { nodes: events.map(([h, who]) => ({ createdAt: iso(created + h * H), requestedReviewer: who ? { __typename: "User", login: who } : { __typename: "Team" } })) } });
+  const requests = insights.summarizeReviewRequests({ issueCount: 3, nodes: [
+    node(50, now - 80 * H, true, [[2, "me"], [60, "me"]]), // re-requested: waits from the latest ask, 20 h
+    node(51, now - 50 * H, false, [[1, null]]), // through a team: 49 h
+    node(52, now - 30 * H, true, []), // no request event: from opening, 30 h
+    null,
+  ] }, "me", now);
+  assert.deepEqual(requests.items.map((r) => [r.number, r.direct, r.since, Math.round(r.hours)]),
+    [[51, false, "request", 49], [52, true, "opened", 30], [50, true, "request", 20]]);
+  assert.deepEqual([requests.late, requests.lateDirect], [2, 1]);
+
+  const thread = (number, author, state, comments) => ({ __typename: "Issue", number, title: `Thread ${number}`, issueState: state, author: { login: author },
+    repository: { nameWithOwner: "o/r" }, comments: { totalCount: comments.length, nodes: comments.map(([who, h]) => ({
+      author: { __typename: /\[bot\]$/.test(who) ? "Bot" : "User", login: who }, bodyText: "x", createdAt: iso(now - h * H) })) } });
+  const flat = insights.flattenConversations({ issues: { issueCount: 5, nodes: [
+    thread(1, "me", "OPEN", [["mira", 50], ["ci[bot]", 10]]), // yours, a person's reply is latest once bots are skipped
+    thread(2, "mira", "OPEN", [["me", 60], ["tomas", 40]]), // you wrote in it
+    thread(3, "mira", "OPEN", [["tomas", 5]]), // you never joined
+    thread(4, "me", "CLOSED", [["mira", 5]]), // closed
+    thread(5, "me", "OPEN", [["mira", 9], ["me", 8]]), // you answered
+  ] }, pullRequests: { issueCount: 0, nodes: [] } }, "me");
+  assert.deepEqual(insights.filterConversations(flat.items, "awaiting", "", "").map((x) => x.thread.number).sort(), [1, 2]);
+  const waiting = insights.summarizeWaiting({ requests, conversations: flat, prInfo: {}, login: "me", now });
+  assert.deepEqual([waiting.reviews.length, waiting.replies.length, waiting.changes.length, waiting.count], [3, 2, 0, 5]);
+
+  // Two direct requests a day old are enough for the review-speed card, which names them.
+  const both = { ...requests, items: requests.items.map((r) => ({ ...r, direct: true })) };
+  const card = insights.deriveSuggestions({ login: "me", now, requests: both }).items.find((i) => i.id === "answer-review-requests");
+  assert.deepEqual(card.refs.slice(0, 2), [{ repo: "t/o", number: 51 }, { repo: "t/o", number: 52 }]);
+  assert.equal(insights.deriveSuggestions({ login: "me", now, requests }).checked.find((c) => c.id === "answer-review-requests").status, "short");
+});

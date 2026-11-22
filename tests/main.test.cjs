@@ -175,6 +175,22 @@ test("conversations search issues and pull requests separately, each with a type
   assert.match(variables.pullRequests, /^involves:fixture is:pr updated:>=\d{4}-\d{2}-\d{2} sort:updated-desc$/);
 });
 
+test("review requests search open pull requests that ask the user, by name or team", async (t) => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "activity-desk-"));
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
+  const { invoke, calls } = await start(t, profile);
+  assert.equal((await invoke("sign-in", token)).ok, true);
+  assert.equal((await invoke("github", "reviewRequests", { login: "bad login" })).status, 400);
+  assert.equal((await invoke("github", "reviewRequests", { login: "fixture" })).ok, true);
+  const { query, variables } = JSON.parse(calls.at(-1).options.body);
+  assert.match(query, /search\(query: \$q, type: ISSUE, first: 50\)/);
+  assert.match(query, /timelineItems\(last: 10, itemTypes: \[REVIEW_REQUESTED_EVENT\]\)/);
+  assert.equal(variables.q, "is:pr is:open archived:false review-requested:fixture sort:created-asc");
+  // Every pull request read carries the ready-for-review and review-request events.
+  assert.equal((await invoke("github", "authoredPullRequests", { login: "fixture" })).ok, true);
+  assert.match(JSON.parse(calls.at(-1).options.body).query, /itemTypes: \[READY_FOR_REVIEW_EVENT, REVIEW_REQUESTED_EVENT\]/);
+});
+
 test("notes are per account, validated, encrypted at rest, and survive a restart", async (t) => {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "activity-desk-"));
   t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
