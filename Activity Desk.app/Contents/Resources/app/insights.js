@@ -2379,9 +2379,10 @@ function deriveSuggestions(input) {
 
 // ---------- Review requests waiting on you ----------
 // Open pull requests that ask you for a review, from the search GitHub keeps for review-requested:you.
-// Each is timed from the latest request to you, or to a team when you were not asked by name, since a
-// re-request after an earlier review restarts the ask. Without a request event it falls back to opening.
+// A re-request restarts the clock. For teams, show the oldest of the current asks as an estimate,
+// since the search identifies the PR but does not say which pending team included you.
 const REQUEST_LATE_HOURS = 24; // Google's one-business-day guideline, rounded to a day, as elsewhere
+const isTeamReviewer = (r) => r?.__typename === "Team" || r?.__typename === "EnterpriseTeam";
 function summarizeReviewRequests(search, login, now) {
   if (!search || !Array.isArray(search.nodes)) return null;
   const me = String(login || "").toLowerCase();
@@ -2392,15 +2393,18 @@ function summarizeReviewRequests(search, login, now) {
     if (!n || n.__typename !== "PullRequest" || typeof repo !== "string" || !Number.isInteger(n.number) || !validTime(n.createdAt)) continue;
     const reviewers = (n.reviewRequests?.nodes || []).map((r) => r?.requestedReviewer).filter(Boolean);
     const direct = reviewers.some((r) => r.__typename === "User" && String(r.login || "").toLowerCase() === me);
-    const events = (n.timelineItems?.nodes || []).filter((e) => e && validTime(e.createdAt));
-    const mine = events.filter((e) => e.requestedReviewer?.__typename === "User" && String(e.requestedReviewer.login || "").toLowerCase() === me);
-    const team = events.filter((e) => e.requestedReviewer && e.requestedReviewer.__typename !== "User");
-    const pick = (direct ? mine : team).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+    const events = (n.timelineItems?.nodes || []).filter((e) => e && validTime(e.createdAt))
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+    const pick = direct
+      ? events.find((e) => e.requestedReviewer?.__typename === "User" && String(e.requestedReviewer.login || "").toLowerCase() === me)
+      : reviewers.filter((r) => isTeamReviewer(r) && r.id)
+        .map((r) => events.find((e) => isTeamReviewer(e.requestedReviewer) && e.requestedReviewer.id === r.id))
+        .filter(Boolean).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))[0];
     const at = pick ? pick.createdAt : n.createdAt;
     items.push({
       repo, number: n.number, title: String(n.title || ""), author: n.author?.login || "ghost",
       authorBot: n.author?.__typename === "Bot" || isBotLogin(n.author?.login), draft: Boolean(n.isDraft),
-      lines: (Number(n.additions) || 0) + (Number(n.deletions) || 0), direct, at, since: pick ? "request" : "opened",
+      lines: (Number(n.additions) || 0) + (Number(n.deletions) || 0), direct, at, since: pick ? (direct ? "request" : "team-estimate") : "opened",
       hours: Math.max(0, (nowTime - Date.parse(at)) / 36e5),
     });
   }

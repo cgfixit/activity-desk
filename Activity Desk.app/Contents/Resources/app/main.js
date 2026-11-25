@@ -756,16 +756,19 @@ function publicRequest(operation, args, login) {
 // branches, or commits, so the window marks those unknown rather than zero.
 function shapePublicSearch(body) {
   const data = JSON.parse(body);
+  if (!Array.isArray(data?.items) || !Number.isInteger(data.total_count) || data.total_count < 0) {
+    throw new Error("Invalid public search response.");
+  }
   const repoOf = (url) => {
     const match = typeof url === "string" ? /^https:\/\/api\.github\.com\/repos\/([^/]+\/[^/]+)$/.exec(url) : null;
     return match && validRepo(match[1]) ? match[1] : null;
   };
-  const items = (Array.isArray(data?.items) ? data.items : []).filter((i) => i?.pull_request && Number.isInteger(i.number) && repoOf(i.repository_url)).map((i) => ({
+  const items = data.items.filter((i) => i?.pull_request && Number.isInteger(i.number) && repoOf(i.repository_url)).map((i) => ({
     repo: repoOf(i.repository_url), number: i.number, title: typeof i.title === "string" ? i.title : "", state: i.state === "open" ? "open" : "closed",
     draft: Boolean(i.draft), createdAt: i.created_at, closedAt: i.closed_at || null, mergedAt: i.pull_request.merged_at || null,
     author: typeof i.user?.login === "string" ? i.user.login : null, authorType: typeof i.user?.type === "string" ? i.user.type : null,
   }));
-  return JSON.stringify({ total: Number.isInteger(data?.total_count) ? data.total_count : items.length, incomplete: Boolean(data?.incomplete_results), items });
+  return JSON.stringify({ total: data.total_count, incomplete: Boolean(data.incomplete_results), dropped: data.items.length - items.length, items });
 }
 
 async function publicRead(operation, args, login, signal) {
@@ -1029,13 +1032,15 @@ const REVIEWED_QUERY = `query ($q: String!, $after: String, $login: String!) {
 // Open pull requests that ask the user for a review, directly or through a team. Search drops a pull
 // request once the requested person has reviewed it. The latest request events say when each ask came.
 const REQUESTED_THREADS = 50;
+// Opaque IDs match timeline events to pending teams without reading team membership or names.
+const PENDING_REVIEWER_FIELDS = "__typename ... on User { login } ... on Node { id }";
 const REQUESTED_QUERY = `query ($q: String!) {
   search(query: $q, type: ISSUE, first: ${REQUESTED_THREADS}) {
     issueCount
     nodes { __typename ... on PullRequest { number title isDraft createdAt additions deletions repository { nameWithOwner }
       author { __typename login }
-      reviewRequests(first: 10) { nodes { requestedReviewer { __typename ... on User { login } } } }
-      timelineItems(last: 10, itemTypes: [REVIEW_REQUESTED_EVENT]) { nodes { ... on ReviewRequestedEvent { ${REQUEST_FIELDS} } } } } }
+      reviewRequests(first: 10) { nodes { requestedReviewer { ${PENDING_REVIEWER_FIELDS} } } }
+      timelineItems(last: 10, itemTypes: [REVIEW_REQUESTED_EVENT]) { nodes { ... on ReviewRequestedEvent { createdAt requestedReviewer { ${PENDING_REVIEWER_FIELDS} } } } } } }
   }
 }`;
 const CURSOR = /^[A-Za-z0-9+/=_:-]{1,256}$/;

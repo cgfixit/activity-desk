@@ -611,18 +611,20 @@ test("lists review requests and threads that wait on you, oldest first", () => {
   const H = 36e5;
   const now = Date.parse("2026-11-20T12:00:00Z");
   const iso = (t) => new Date(t).toISOString();
-  const node = (number, created, direct, events) => ({ __typename: "PullRequest", number, title: `Ask ${number}`, isDraft: false, createdAt: iso(created),
+  const user = (login) => ({ __typename: "User", login });
+  const team = (id) => ({ __typename: "Team", id });
+  const node = (number, created, reviewers, events) => ({ __typename: "PullRequest", number, title: `Ask ${number}`, isDraft: false, createdAt: iso(created),
     additions: 3, deletions: 1, repository: { nameWithOwner: "t/o" }, author: { __typename: "User", login: "mira" },
-    reviewRequests: { nodes: [{ requestedReviewer: direct ? { __typename: "User", login: "me" } : { __typename: "Team" } }] },
-    timelineItems: { nodes: events.map(([h, who]) => ({ createdAt: iso(created + h * H), requestedReviewer: who ? { __typename: "User", login: who } : { __typename: "Team" } })) } });
+    reviewRequests: { nodes: reviewers.map((requestedReviewer) => ({ requestedReviewer })) },
+    timelineItems: { nodes: events.map(([h, requestedReviewer]) => ({ createdAt: iso(created + h * H), requestedReviewer })) } });
   const requests = insights.summarizeReviewRequests({ issueCount: 3, nodes: [
-    node(50, now - 80 * H, true, [[2, "me"], [60, "me"]]), // re-requested: waits from the latest ask, 20 h
-    node(51, now - 50 * H, false, [[1, null]]), // through a team: 49 h
-    node(52, now - 30 * H, true, []), // no request event: from opening, 30 h
+    node(50, now - 80 * H, [user("me")], [[2, user("me")], [60, user("me")]]),
+    node(51, now - 50 * H, [team("mine"), team("other")], [[1, team("mine")], [48, team("other")], [49, team("removed")], [0, team("mine")]]),
+    node(52, now - 30 * H, [user("me")], []),
     null,
   ] }, "me", now);
   assert.deepEqual(requests.items.map((r) => [r.number, r.direct, r.since, Math.round(r.hours)]),
-    [[51, false, "request", 49], [52, true, "opened", 30], [50, true, "request", 20]]);
+    [[51, false, "team-estimate", 49], [52, true, "opened", 30], [50, true, "request", 20]]);
   assert.deepEqual([requests.late, requests.lateDirect], [2, 1]);
 
   const thread = (number, author, state, comments) => ({ __typename: "Issue", number, title: `Thread ${number}`, issueState: state, author: { login: author },
