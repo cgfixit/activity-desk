@@ -5,6 +5,7 @@ on:
     paths:
       - 'Activity Desk.app/**'
       - 'scripts/package-macos.sh'
+      - 'scripts/electron-package/**'
       - '.github/workflows/package-check.yml'
       - '.github/workflows/release.yml'
 
@@ -19,14 +20,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
       - name: Package and verify the Apple silicon app
         run: |
           payload='Activity Desk.app/Contents/Resources/app'
           touch "$payload/.env.package-fixture"
           output="$RUNNER_TEMP/package-check"
           bash scripts/package-macos.sh "$output"
-          cd "$output"
-          shasum -a 256 -c Activity-Desk-macos-arm64.zip.sha256
-          ditto -x -k Activity-Desk-macos-arm64.zip extracted
-          codesign --verify --deep --strict 'extracted/Activity Desk.app'
-          test ! -e "extracted/$payload/.env.package-fixture"
+          (cd "$output" && shasum -a 256 -c Activity-Desk-macos-arm64.zip.sha256)
+          ditto -x -k "$output/Activity-Desk-macos-arm64.zip" "$output/extracted"
+          app="$output/extracted/Activity Desk.app"
+          node scripts/electron-package/macos.mjs verify "$app"
+          entries=$(scripts/electron-package/node_modules/.bin/asar list "$app/Contents/Resources/app.asar")
+          ! grep -Fx '/.env.package-fixture' <<< "$entries"
