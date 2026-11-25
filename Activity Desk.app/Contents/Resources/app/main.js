@@ -300,9 +300,9 @@ function pruneHistory(store) {
 async function saveHistory() {
   clearTimeout(historyTimer);
   if (!historyDirty || !history) return;
-  historyDirty = false;
   pruneHistory(history);
   await writeEncrypted(HISTORY_FILE, JSON.stringify(history));
+  historyDirty = false;
 }
 
 function scheduleHistorySave() {
@@ -380,6 +380,7 @@ handle("snapshot", (value) => withHistory(async () => {
 
 // Turning saved history on starts recording. Turning it off deletes it for every account on this Mac.
 handle("history-setting", (enabled) => withHistory(async () => {
+  if (!sessionUser) return { ok: false, error: signInFirst() };
   if (typeof enabled !== "boolean") return { ok: false, error: "Invalid setting." };
   const profile = app.getPath("userData");
   try {
@@ -649,6 +650,7 @@ handle("cards", () => withCards(async () => {
 handle("card-set", (id, input) => withCards(async () => {
   if (!sessionUser) return { ok: false, error: signInFirst() };
   if (!validCardId(id)) return { ok: false, error: "Invalid card." };
+  const key = String(sessionUser.id);
   let card = null;
   if (input !== null) {
     if (!input || typeof input !== "object" || Array.isArray(input)) return { ok: false, error: "Invalid card state." };
@@ -660,12 +662,12 @@ handle("card-set", (id, input) => withCards(async () => {
   }
   try {
     const store = await loadCards();
-    const key = String(sessionUser.id);
-    const cards = store.accounts[key] || (store.accounts[key] = {});
+    const cards = { ...store.accounts[key] };
     if (card) cards[id] = card; else delete cards[id];
     for (const [old, c] of Object.entries(cards)) if (c.state === "snoozed" && Date.parse(c.until) <= Date.now()) delete cards[old];
     if (Object.keys(cards).length > CARDS_MAX) return { ok: false, error: "Too many saved suggestion states." };
-    await writeEncrypted(CARDS_FILE, JSON.stringify(store));
+    await writeEncrypted(CARDS_FILE, JSON.stringify({ ...store, accounts: { ...store.accounts, [key]: cards } }));
+    store.accounts[key] = cards;
     cardsNote = "";
     return { ok: true, cards: { ...cards } };
   } catch {
@@ -1306,7 +1308,7 @@ app.whenReady().then(() => {
   }
 });
 
-// Note saves the window sent while closing, and a pending history save, finish before the app exits.
+// Finish the window's pending saves before the app exits.
 let drained = false;
 app.on("will-quit", (event) => {
   if (drained) return;
@@ -1314,10 +1316,11 @@ app.on("will-quit", (event) => {
   event.preventDefault();
   (async () => {
     for (let pass = 0; pass < 20; pass += 1) {
-      const pending = notesQueue;
-      await Promise.allSettled([pending, withHistory(saveHistory)]);
+      const notes = notesQueue;
+      const cards = cardsQueue;
+      await Promise.allSettled([notes, cards, withHistory(saveHistory)]);
       await new Promise((resolve) => setTimeout(resolve, 25));
-      if (pending === notesQueue) break;
+      if (notes === notesQueue && cards === cardsQueue) break;
     }
   })().finally(() => app.quit());
 });
