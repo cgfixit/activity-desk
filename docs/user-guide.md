@@ -81,6 +81,7 @@ Traffic needs a token with read access to **Administration** on your repositorie
 In **Your events**, rows for comments, review comments, commit comments, and reviews show the text you wrote. Issues and pull requests you opened show their description. The **Comments** and **Agents** filters list these rows together, and an agent's comment is marked with the agent's color.
 
 - Short text appears in full. Longer text shows a two-line preview. Select **Show full comment** to read the rest in place, with its line breaks, and **Hide comment** to fold it again. Text you expanded stays open while you filter or search, and **Search** also matches comment text.
+- The stream hides HTML comments. If deeply nested comment markup cannot be fully cleaned in a bounded number of passes, the row still shows the author and thread link, with the body withheld.
 - Text comes from GitHub's event payload. When the payload leaves the text out, Activity Desk uses your matching comment from **Conversations**, from the same thread and within two minutes of the event, and marks it **text from Conversations**. When neither has it, the row says the text is unavailable.
 - Hidden HTML comments that bots and agents leave in their text are removed, and text over 20,000 characters is cut short with a count of what was left out.
 

@@ -82,6 +82,7 @@ let signingOut = false;
 // Comment texts the reader expanded, kept open when the stream re-renders.
 const openTexts = new Set();
 let indexCache = { items: null, login: null, index: null };
+const conversationTexts = new WeakMap();
 const seenKey = () => `${LAST_SEEN_KEY}.${state.public ? "public." : ""}${state.user.id}`;
 const SLOTS = I.TOKEN_SLOTS;
 // True when both a fine-grained and a classic token are saved, so sources can be read with each.
@@ -1105,11 +1106,12 @@ function renderConversations() {
       if (c.mine) tags.push('<span class="tag">you</span>');
       tags.push(`<span class="tag ${th.state}">${th.isPr ? "PR" : "issue"} ${th.state}</span>`);
       const key = `c:${th.repo}#${th.number}:${c.kind}:${c.at}:${c.author}`;
+      if (!conversationTexts.has(c)) conversationTexts.set(c, I.textInfo(CONVERSATION_LABELS[c.kind], c.body));
       return `<div class="row${fresh ? " fresh" : ""}">
         <span class="time">${esc(when.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}</span>
         <span class="glyph" title="${esc(CONVERSATION_LABELS[c.kind])}">${esc(CONVERSATION_GLYPHS[c.kind])}</span>
         <div class="what"><div class="title">${esc(`${c.author} ${action} #${th.number} ${th.title}`)}</div>
-          ${textBlock(key, I.textInfo(CONVERSATION_LABELS[c.kind], c.body), c.bot)}
+          ${textBlock(key, conversationTexts.get(c), c.bot)}
           <div class="meta"><span>${openLink(th.repo, th.number)}</span>${c.path ? `<span>${esc(c.path)}</span>` : ""}</div></div>
         <div class="tags">${tags.join("")}</div>
       </div>`;

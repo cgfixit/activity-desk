@@ -273,6 +273,13 @@ test("finds the text behind comment events in the payload or the loaded conversa
   assert.equal(insights.filterEvents(events, "comment", "", "absent", false, {}, index).length, 0);
 });
 
+test("withholds text if hidden comment markup still needs cleanup", () => {
+  let body = "<!-- example -->";
+  for (let i = 0; i < 12; i += 1) body = `<!${body}-- note -->`;
+  assert.equal(insights.textInfo("Comment", `Before ${body} after`), null);
+  assert.equal(insights.textInfo("Comment", "Before <!-- example --> after").text, "Before  after");
+});
+
 test("joins what a fine-grained and a classic token each returned for one account", () => {
   const events = insights.mergeTokenEvents([
     { slot: "fine-grained", events: [{ id: "1" }, { id: "2" }] },
