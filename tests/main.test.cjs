@@ -13,8 +13,9 @@ const bearer = (options) => options.headers.Authorization.replace("Bearer ", "")
 const isUser = (url) => url === "https://api.github.com/user";
 
 // Sign-in asks GitHub whose token it is, so the default fixture answers /user with an account.
-async function start(t, profile, response = (url) => (isUser(url) ? Response.json({ id: 1, login: "fixture" }) : new Response("{}"))) {
+async function start(t, profile, response = (url) => (isUser(url) ? Response.json({ id: 1, login: "fixture" }) : new Response("{}")), hooks = {}) {
   const handlers = new Map();
+  const appEvents = new Map();
   const calls = [];
   const opened = [];
   const frame = { url: pathToFileURL(path.join(payload, "index.html")).href };
@@ -24,7 +25,8 @@ async function start(t, profile, response = (url) => (isUser(url) ? Response.jso
       getPath: () => profile,
       requestSingleInstanceLock: () => true,
       whenReady: () => Promise.resolve(),
-      on() {},
+      on: (name, listener) => appEvents.set(name, listener),
+      quit: () => hooks.onQuit?.(),
     },
     BrowserWindow: class {
       webContents = sender;
@@ -35,7 +37,10 @@ async function start(t, profile, response = (url) => (isUser(url) ? Response.jso
     shell: { openExternal: async (url) => opened.push(url) },
     // The token encrypts to a fixed string. Anything else, such as notes, uses a reversible mock encoding.
     safeStorage: {
-      encryptStringAsync: async (value) => Buffer.from(value === token ? "mock ciphertext" : `mock:${Buffer.from(value).toString("base64")}`),
+      encryptStringAsync: async (value) => {
+        await hooks.beforeEncrypt?.(value);
+        return Buffer.from(value === token ? "mock ciphertext" : `mock:${Buffer.from(value).toString("base64")}`);
+      },
       decryptStringAsync: async (buffer) => {
         const text = buffer.toString();
         if (text === "mock ciphertext") return { result: token, shouldReEncrypt: false };
@@ -50,6 +55,8 @@ async function start(t, profile, response = (url) => (isUser(url) ? Response.jso
     process,
     AbortController,
     AbortSignal,
+    setTimeout,
+    clearTimeout,
     fetch: async (url, options) => {
       calls.push({ url, options });
       return response(url, options);
@@ -60,6 +67,7 @@ async function start(t, profile, response = (url) => (isUser(url) ? Response.jso
   return {
     calls,
     opened,
+    requestQuit: () => appEvents.get("will-quit")({ preventDefault() {} }),
     // IPC structured-clones results, which also moves them out of the vm realm for deepEqual.
     invoke: async (name, ...args) => structuredClone(await handlers.get(`desk:${name}`)(event, ...args)),
     foreign: async (name) => structuredClone(await handlers.get(`desk:${name}`)({ ...event, senderFrame: null })),
@@ -127,6 +135,79 @@ test("profile IPC returns only display identity", async (t) => {
   assert.deepEqual(JSON.parse((await invoke("github", "profile")).body), {
     id: 1, login: "fixture", name: "Test account",
   });
+});
+
+test("rejected suggestion states stay out of memory and later saves", async (t) => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "activity-desk-"));
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
+  const account = Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`rule-${i}`, {
+    state: "trying", at: "2026-11-22T10:00:00.000Z",
+  }]));
+  const saved = path.join(profile, "cards.enc");
+  fs.writeFileSync(saved, `mock:${Buffer.from(JSON.stringify({ version: 1, accounts: { 1: account } })).toString("base64")}`);
+  let fail = false;
+  const { invoke } = await start(t, profile, undefined, { beforeEncrypt: () => { if (fail) throw new Error("fixture write failure"); } });
+  await invoke("sign-in", token);
+  await invoke("github", "profile");
+  assert.match((await invoke("card-set", "over-limit", { state: "trying" })).error, /too many/i);
+  fail = true;
+  assert.equal((await invoke("card-set", "rule-0", null)).ok, false);
+  const { cards } = await invoke("cards");
+  assert.deepEqual(Object.keys(cards), Object.keys(account));
+  fail = false;
+  assert.equal((await invoke("card-set", "rule-1", null)).ok, true);
+  const restarted = await start(t, profile);
+  await restarted.invoke("github", "profile");
+  assert.deepEqual(Object.keys((await restarted.invoke("cards")).cards), Object.keys(account).filter((id) => id !== "rule-1"));
+});
+
+test("quit waits for a pending suggestion state write", async (t) => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "activity-desk-"));
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
+  const started = Promise.withResolvers();
+  const write = Promise.withResolvers();
+  const quit = Promise.withResolvers();
+  const saved = path.join(profile, "cards.enc");
+  const { invoke, requestQuit } = await start(t, profile, undefined, {
+    beforeEncrypt: (value) => {
+      if (!JSON.parse(value).accounts) return;
+      started.resolve();
+      return write.promise;
+    },
+    onQuit: () => quit.resolve(fs.existsSync(saved)),
+  });
+  await invoke("sign-in", token);
+  await invoke("github", "profile");
+  const saving = invoke("card-set", "follow-up", { state: "trying" });
+  await started.promise;
+  requestQuit();
+  try {
+    assert.equal(await Promise.race([quit.promise, new Promise((resolve) => setTimeout(resolve, 60, "pending"))]), "pending");
+  } finally {
+    write.resolve();
+    await saving;
+  }
+  assert.equal(await quit.promise, true);
+});
+
+test("saved history retries a failed write with the pending snapshot", async (t) => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "activity-desk-"));
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
+  let fail = false;
+  const { invoke } = await start(t, profile, undefined, { beforeEncrypt: () => { if (fail) throw new Error("fixture write failure"); } });
+  await invoke("sign-in", token);
+  await invoke("github", "profile");
+  assert.equal((await invoke("history-setting", true)).ok, true);
+  const { ok, week } = await invoke("snapshot", { merged: 5 });
+  assert.equal(ok, true);
+  fail = true;
+  assert.equal((await invoke("history")).ok, false);
+  fail = false;
+  const result = await invoke("history");
+  assert.ok(result.bytes > 0);
+  const restarted = await start(t, profile);
+  await restarted.invoke("github", "profile");
+  assert.equal((await restarted.invoke("history")).snapshots[week].merged, 5);
 });
 
 test("migration survives restart and sign-out reports removal failure", async (t) => {
@@ -372,6 +453,10 @@ test("the public view sends no credential, reads only public routes for one user
     assert.equal((await invoke("github", operation, args, slot)).ok, false, operation);
   }
   for (const channel of ["notes", "history", "clear-history"]) assert.match((await invoke(channel)).error, /needs a token/, channel);
+  const historyFlag = path.join(profile, "history-on");
+  fs.writeFileSync(historyFlag, "");
+  assert.match((await invoke("history-setting", false)).error, /needs a token/);
+  assert.equal(fs.existsSync(historyFlag), true);
   assert.match((await invoke("note-save", { text: "x" })).error, /needs a token/);
   assert.equal(calls.length, 0);
 
