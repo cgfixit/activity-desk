@@ -2572,16 +2572,15 @@ const COMMENT_EVENTS = {
   PullRequestReviewEvent: { kind: "review", label: "Review", always: false },
 };
 
-// Hidden HTML comments, often left by bots, removed until none remain. One pass is not enough: removing
-// a comment can join the text around it into a new "<!--". An unterminated comment runs to the end.
-// The result is display text and is always HTML-escaped where it is shown.
+// Removing a comment can join the surrounding text into a new opener. Bound the number of
+// rescans and withhold text with unresolved markup so hidden content cannot become visible.
+const COMMENT_STRIP_PASSES = 8;
 function stripHtmlComments(text) {
-  let previous;
-  do {
-    previous = text;
+  for (let pass = 0; pass < COMMENT_STRIP_PASSES; pass += 1) {
+    if (!text.includes("<!--")) return text;
     text = text.replace(/<!--[\s\S]*?(?:-->|$)/g, "");
-  } while (text !== previous);
-  return text;
+  }
+  return text.includes("<!--") ? "" : text;
 }
 
 // Line endings normalized, hidden HTML comments and runs of blank lines removed.
