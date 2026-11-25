@@ -276,14 +276,13 @@ async function lookupPullRequests(account, refs) {
   };
 }
 
-// This week's outcome numbers go to saved history when it is on. A capped search would make the week
-// look unlike the others, so that week is skipped and the card says why.
+// Save this week's numbers only when the authored search covered the full window.
 async function saveWeeklySnapshot(account, mine) {
   account.snapshotSaved = false;
   const h = account.savedHistory;
-  if (account.public || !h?.enabled || !mine) return;
-  if (mine.capped) {
-    account.errors.snapshot = "This week's numbers were not saved, because the search for pull requests you opened was capped.";
+  if (account.public || !h?.enabled) return;
+  if (!mine || mine.capped || mine.partial || mine.issue || mine.loaded < mine.total) {
+    account.errors.snapshot = "A weekly snapshot needs a complete search for pull requests you opened. This refresh kept the previously saved weeks.";
     return;
   }
   const snapshot = I.snapshotOf(I.summarizeOutcomes(account.prInfo, account.user.login, account.refreshedAt));
@@ -1548,7 +1547,9 @@ function snapshotCard(snap) {
   if (state.public) return '<p class="note">Weekly numbers need a token. A username alone does not show whose saved history to open.</p>';
   if (!h || !h.enabled) return '<p class="note">Turn on saved history in Data &amp; access to keep one snapshot a week of your merge time, follow-up fixes, open work, and waiting. Changes appear from the second week.</p>';
   if (!snap || snap.weeks < 2) {
-    return `<p class="note">${state.errors.snapshot ? `${esc(state.errors.snapshot)} ` : ""}The first snapshot is saved${snap?.latest ? ` for the week of ${esc(snap.latest)}` : ""}. Changes appear once a second week is saved.</p>`;
+    const status = snap?.latest ? `First snapshot saved for the week of ${esc(snap.latest)}. Changes appear when a second week is saved.`
+      : "The first snapshot will appear after a successful save.";
+    return `<p class="note">${state.errors.snapshot ? `${esc(state.errors.snapshot)} ` : ""}${status}</p>`;
   }
   const rows = snap.rows.filter((r) => r.latest);
   const day = (w) => new Date(`${w}T00:00:00Z`).toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
@@ -1557,7 +1558,7 @@ function snapshotCard(snap) {
     <table class="compare"><caption class="note">${fmt(snap.weeks)} saved weeks, from the week of ${esc(day(snap.first))}</caption>
       <thead><tr><th scope="col">Number</th><th scope="col">First saved</th><th scope="col">About 4 weeks ago</th><th scope="col">Now</th></tr></thead>
       <tbody>${rows.map((r) => `<tr><th scope="row">${esc(r.label)}</th><td>${cell(r, r.first)}</td><td>${cell(r, r.back)}</td><td>${cell(r, r.latest)}</td></tr>`).join("")}</tbody></table>
-    <p class="note">${state.errors.snapshot ? `${esc(state.errors.snapshot)} ` : ""}Each week's numbers cover the ${AUTHORED_DAYS} days before it, so neighbouring weeks share most of their pull requests and a change you make shows up gradually. Compare points at least four weeks apart. Weeks when the search for your pull requests was capped are not saved.</p>`;
+    <p class="note">${state.errors.snapshot ? `${esc(state.errors.snapshot)} ` : ""}Each week's numbers cover the ${AUTHORED_DAYS} days before it, so neighbouring weeks share most of their pull requests and a change you make shows up gradually. Compare points at least four weeks apart. Only complete pull request searches update the weekly snapshot.</p>`;
 }
 const noOutcomes = () => `<p class="note">${esc(state.errors.authored || "The search for pull requests you opened did not load, so there are no outcomes to compare.")}</p>`;
 
