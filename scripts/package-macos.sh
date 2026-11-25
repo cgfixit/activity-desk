@@ -18,13 +18,14 @@ test -x "$app/Contents/MacOS/Electron"
 cp "$root/Activity Desk.app/Contents/Info.plist" "$app/Contents/Info.plist"
 payload="Activity Desk.app/Contents/Resources/app"
 git -C "$root" ls-files -z -- "$payload/" | while IFS= read -r -d '' source; do
-  destination="$app/Contents/Resources/app/${source#"$payload/"}"
+  destination="$scratch/payload/${source#"$payload/"}"
   mkdir -p "$(dirname "$destination")"
   cp "$root/$source" "$destination"
 done
-test -f "$app/Contents/Resources/app/package.json"
-codesign --force --deep --sign - "$app"
-codesign --verify --deep --strict "$app"
+test -f "$scratch/payload/package.json"
+tools="$root/scripts/electron-package"
+npm --prefix "$tools" ci --ignore-scripts --no-audit --no-fund
+node "$tools/macos.mjs" pack "$app" "$scratch/payload"
 mkdir -p "$output"
 mv "$app" "$scratch/unpacked/Activity Desk.app"
 ditto -c -k --sequesterRsrc --keepParent "$scratch/unpacked/Activity Desk.app" "$output/Activity-Desk-macos-arm64.zip"
