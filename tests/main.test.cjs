@@ -185,6 +185,7 @@ test("review requests search open pull requests that ask the user, by name or te
   const { query, variables } = JSON.parse(calls.at(-1).options.body);
   assert.match(query, /search\(query: \$q, type: ISSUE, first: 50\)/);
   assert.match(query, /timelineItems\(last: 10, itemTypes: \[REVIEW_REQUESTED_EVENT\]\)/);
+  assert.equal(query.match(/\.\.\. on Node \{ id \}/g)?.length, 2, "matches pending reviewers to their timeline events");
   assert.equal(variables.q, "is:pr is:open archived:false review-requested:fixture sort:created-asc");
   // Every pull request read carries the ready-for-review and review-request events.
   assert.equal((await invoke("github", "authoredPullRequests", { login: "fixture" })).ok, true);
@@ -324,6 +325,7 @@ test("the public view sends no credential, reads only public routes for one user
       return Response.json({ id: 1, login: "fixture", name: "Test account", type: "User", created_at: "2020-01-01T00:00:00Z", followers: 4, public_repos: 2, email: "fixture@example.invalid" });
     }
     if (url.includes("/repos?")) return Response.json([{ full_name: "fixture/example", private: false, stargazers_count: 1, forks_count: 0, pushed_at: "2026-01-01T00:00:00Z", owner: { login: "fixture" } }]);
+    if (url.includes("/search/issues?")) return Response.json({ total_count: 101, incomplete_results: false, items: [{ number: 1 }] });
     return new Response("[]", { headers: { "x-ratelimit-remaining": "50" } });
   });
   const routes = () => calls.splice(0).map((c) => c.url.replace("https://api.github.com", ""));
@@ -360,7 +362,7 @@ test("the public view sends no credential, reads only public routes for one user
   assert.equal(searched.pathname, "/search/issues");
   assert.match(searched.searchParams.get("q"), /^author:fixture is:pr is:public created:>=\d{4}-\d{2}-\d{2}$/);
   assert.deepEqual([searched.searchParams.get("sort"), searched.searchParams.get("per_page"), searched.searchParams.get("page")], ["created", "100", "1"]);
-  assert.deepEqual(JSON.parse(found.body), { total: 0, incomplete: false, items: [] });
+  assert.deepEqual(JSON.parse(found.body), { total: 101, incomplete: false, dropped: 1, items: [] });
   for (const args of [{ login: "someone", page: 1 }, { login: "fixture", page: 4 }, { login: "fixture" }]) {
     assert.equal((await invoke("github", "authoredPullRequests", args)).ok, false);
   }

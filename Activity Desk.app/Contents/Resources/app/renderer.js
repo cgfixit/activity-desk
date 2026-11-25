@@ -516,7 +516,7 @@ async function loadPublicPullRequests(account, login) {
   let total = 0;
   let issue = "";
   let more = false;
-  let incomplete = false;
+  let partial = false;
   for (let page = 1; page <= AUTHORED_PAGES; page += 1) {
     let data;
     try {
@@ -528,17 +528,18 @@ async function loadPublicPullRequests(account, login) {
       issue = `Public pull requests page ${page} did not load. ${message}`;
       break;
     }
-    total = Number.isInteger(data.total) ? data.total : total;
-    incomplete = incomplete || data.incomplete;
+    total = data.total;
+    partial = partial || data.incomplete || data.dropped > 0;
     for (const item of data.items) {
       const pr = I.normalizeSearchPullRequest(item);
       if (pr) info[I.prKey(pr.repo, pr.number)] = pr;
+      else partial = true;
     }
-    more = data.items.length === 100 && page * 100 < total;
+    more = page * 100 < total;
     if (!more) break;
   }
   const loaded = Object.keys(info).length;
-  return { info, loaded, total: Math.max(total, loaded), capped: more || Boolean(issue), partial: incomplete, issue, days: AUTHORED_DAYS, public: true };
+  return { info, loaded, total: Math.max(total, loaded), capped: more || Boolean(issue), partial: partial || (!more && loaded < total), issue, days: AUTHORED_DAYS, public: true };
 }
 
 // The public view: a username and no token. It loads what GitHub serves to anyone: the profile, public
@@ -583,7 +584,7 @@ async function refreshPublic() {
       const parts = [];
       if (mine.issue) parts.push(mine.issue);
       if (mine.capped) parts.push(`Loaded the newest ${fmt(mine.loaded)} of ${fmt(mine.total)} public pull requests opened in the last ${AUTHORED_DAYS} days.`);
-      if (mine.partial) parts.push("GitHub marked the search incomplete, so some public pull requests may be missing.");
+      if (mine.partial) parts.push("Public search results were incomplete or contained unusable records. Some pull requests may be missing.");
       if (parts.length) errors.authored = parts.join(" ");
     }
     const count = (n) => (Number.isFinite(n) ? { totalCount: n } : null);
@@ -928,7 +929,8 @@ function renderWaiting(c) {
     $("waiting").innerHTML = '<p class="note waiting-note">Needs a token. Review requests, conversations, and review verdicts are not public, so nothing here can show what waits on you.</p>';
     return;
   }
-  const reviewDetail = (x) => [x.direct ? "Asked by name" : "Asked through a team", x.since === "request" ? "" : "no request time recorded, so timed from opening",
+  const reviewDetail = (x) => [x.direct ? "Asked by name" : "Asked through a team",
+    x.since === "team-estimate" ? "estimated from pending team requests" : x.since === "opened" ? "no matching request time recorded, so timed from opening" : "",
     `by ${x.author}`, x.draft ? "draft" : "", x.lines ? `${fmt(x.lines)} lines` : ""].filter(Boolean).join(" · ");
   const replyDetail = (x) => `${x.author} ${x.kind === "review" ? "reviewed" : "replied"} on ${x.yours ? "your" : x.isPr ? "a" : "an"} ${x.isPr ? "pull request" : "issue"}${x.yours ? "" : " you wrote in"}`;
   const changeDetail = (x) => `${x.author} requested changes`;
@@ -940,7 +942,7 @@ function renderWaiting(c) {
       : state.prLookup.authored ? "No open pull request of yours has changes requested as its latest verdict." : state.errors.authored || "Pull requests you opened did not load.", changeDetail),
   ].join("");
   const notes = [];
-  if (r) notes.push(`Review requests come from GitHub's search for open pull requests that ask you, by name or through a team, and are timed from the latest ask. GitHub drops a request from the search once you review.${state.errors.requests ? ` ${state.errors.requests}` : ""}`);
+  if (r) notes.push(`Direct review requests are timed from the latest ask. For team requests, GitHub does not identify which pending team includes you. GitHub drops a request from the search once you review.${state.errors.requests ? ` ${state.errors.requests}` : ""}`);
   if (w.replies) notes.push("Replies come from Conversations: open threads you opened or wrote in, whose latest comment from a person is someone else's.");
   if (w.unsure) notes.push(`${fmt(w.unsure)} open ${w.unsure === 1 ? "pull request has" : "pull requests have"} more than 10 reviews, so its latest verdict is unknown and it is left out.`);
   $("waiting-caption").textContent = w.count ? `${fmt(w.count)} ${w.count === 1 ? "item" : "items"}, oldest first` : "";
@@ -950,7 +952,7 @@ function renderWaiting(c) {
 function renderOverview(c) {
   const { ev, pr, notes, year, waiting: w, outcomes } = c;
   const parts = [];
-  if (w.reviews?.length) parts.push(`<strong>${fmt(w.reviews.length)} review request${w.reviews.length === 1 ? "" : "s"}</strong> ${w.reviews.length === 1 ? "waits" : "wait"} on you${c.requests.late ? `, ${fmt(c.requests.late)} for a day or more` : ""}.`);
+  if (w.reviews?.length) parts.push(`<strong>${fmt(w.reviews.length)} review request${w.reviews.length === 1 ? "" : "s"}</strong> ${w.reviews.length === 1 ? "waits" : "wait"} on you${c.requests.lateDirect ? `, ${fmt(c.requests.lateDirect)} by name for a day or more` : ""}.`);
   if (w.replies?.length) parts.push(`<strong>${fmt(w.replies.length)} thread${w.replies.length === 1 ? "" : "s"}</strong> ${w.replies.length === 1 ? "ends" : "end"} with someone else's reply.`);
   if (ev.fresh) parts.push(`<strong>${fmt(ev.fresh)} new event${ev.fresh === 1 ? "" : "s"}</strong> since you last marked the stream seen.`);
   const replies = freshConversations();
