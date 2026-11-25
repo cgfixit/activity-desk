@@ -27,7 +27,6 @@ const PUBLIC_STAR_REPOS = 3; // star dates read without a token, to stay inside 
 const NEEDS_TOKEN = {
   year: "The contribution calendar needs a token.",
   years: "Contribution history needs a token.",
-  authored: "Reviews, sizes, and branches of pull requests need a token. Public pull requests load by search.",
   reviewed: "Pull requests you reviewed need a token.",
   conversations: "Conversations need a token.",
   requests: "Review requests need a token.",
@@ -577,8 +576,6 @@ async function refreshPublic() {
       locked.delete("footprint");
     }
     const mine = authored.value || null;
-    locked.delete("authored");
-    delete errors.authored;
     if (!mine) errors.authored = `Public pull requests did not load. ${authored.reason?.message || ""}`.trim();
     else {
       const parts = [];
@@ -597,15 +594,7 @@ async function refreshPublic() {
       rateLimit: rate ? { resources: I.summarizeRateLimit(rate.data), at: new Date() } : null,
       notes: { userId: user.id, failed: PUBLIC_NOTES, list: [] },
     });
-    if (!events.some((e) => I.repoName(e) === account.repo)) account.repo = "";
-    account.lastSeen = localStorage.getItem(seenKey());
-    if (!account.lastSeen && newestActivity(account)) {
-      account.lastSeen = newestActivity(account);
-      localStorage.setItem(seenKey(), account.lastSeen);
-    }
-    renderIdentity();
-    renderAll();
-    showApp(true);
+    finishRefresh(account);
   } catch (error) {
     if (account !== state) return;
     if (!account.user) throw error;
@@ -793,15 +782,7 @@ async function refresh() {
 
     Object.assign(account, { tokenUse, user, viewer, contributions, events, notifications, prLookup, prInfo, reviewed, requests, rateLimit, footprint: footprintData, savedHistory, contributionHistory, conversations, errors, refreshedAt: new Date() });
     await saveWeeklySnapshot(account, mine);
-    if (!events.some((e) => I.repoName(e) === account.repo)) account.repo = "";
-    account.lastSeen = localStorage.getItem(seenKey());
-    if (!account.lastSeen && newestActivity(account)) {
-      account.lastSeen = newestActivity(account);
-      localStorage.setItem(seenKey(), account.lastSeen);
-    }
-    renderIdentity();
-    renderAll();
-    showApp(true);
+    finishRefresh(account);
   } catch (error) {
     if (account !== state) return;
     if (!account.user) throw error;
@@ -810,6 +791,19 @@ async function refresh() {
   } finally {
     if (account === state) setBusy("");
   }
+}
+
+function finishRefresh(account) {
+  if (!account.events.some((e) => I.repoName(e) === account.repo)) account.repo = "";
+  const key = seenKey();
+  account.lastSeen = localStorage.getItem(key);
+  if (!account.lastSeen) {
+    account.lastSeen = newestActivity(account);
+    if (account.lastSeen) localStorage.setItem(key, account.lastSeen);
+  }
+  renderIdentity();
+  renderAll();
+  showApp(true);
 }
 
 // The latest timestamp across your events and loaded conversations, used for "seen".
@@ -828,8 +822,12 @@ function renderIdentity() {
   $("initials").textContent = (name ? name.split(/\s+/).slice(0, 2).map((part) => Array.from(part)[0]).join("") : u.login.slice(0, 2)).toUpperCase();
 }
 
+function summarizeCurrentEvents() {
+  return I.summarizeEvents(state.events, { lastSeen: state.lastSeen });
+}
+
 function computed() {
-  const ev = I.summarizeEvents(state.events, { lastSeen: state.lastSeen });
+  const ev = summarizeCurrentEvents();
   const pr = I.summarizePullRequests(state.prInfo, state.user && state.user.login);
   const notes = state.notifications ? I.summarizeNotifications(state.notifications) : null;
   const rhythm = state.contributions ? I.summarizeRhythm(state.contributions) : null;
@@ -1087,12 +1085,7 @@ function renderConversations() {
       : state.conversationFilter === "awaiting" ? "No open thread you opened or wrote in ends with someone else's reply." : "No comments match these filters."}</div>`;
     return;
   }
-  const groups = new Map();
-  for (const c of list) {
-    const key = localDayKey(new Date(c.at));
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(c);
-  }
+  const groups = Map.groupBy(list, (c) => localDayKey(new Date(c.at)));
   $("stream").innerHTML = [...groups.entries()].map(([key, rows]) => `
     <div class="day"><div class="day-head">${esc(dayHeading(key))} · ${rows.length}</div><div class="rows">${rows.map((c) => {
       const when = new Date(c.at);
@@ -1120,8 +1113,7 @@ function renderConversations() {
     }).join("")}</div></div>`).join("");
 }
 
-function renderStream(c) {
-  const { ev } = c;
+function renderStream(ev = summarizeCurrentEvents()) {
   $("stream-source").querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.stream === state.streamSource)));
   const others = freshConversations();
   $("conversation-count").textContent = others ? String(others) : "";
@@ -1161,12 +1153,7 @@ function renderStream(c) {
   const index = commentIndex();
   const list = I.filterEvents(state.events, state.filter, state.repo, state.query, state.hideMinor, state.prInfo, index);
   const lastSeen = state.lastSeen ? new Date(state.lastSeen).getTime() : null;
-  const groups = new Map();
-  for (const e of list) {
-    const key = localDayKey(new Date(e.created_at));
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(e);
-  }
+  const groups = Map.groupBy(list, (e) => localDayKey(new Date(e.created_at)));
   if (!list.length) {
     $("stream").innerHTML = `<div class="empty">No events match these filters.</div>`;
   } else {
@@ -2359,7 +2346,7 @@ function rateCard() {
 function renderAll() {
   const c = computed();
   renderOverview(c);
-  renderStream(c);
+  renderStream(c.ev);
   renderInsights(c);
   renderSuggestions(c);
   renderMeta(c);
@@ -2908,7 +2895,7 @@ $("insights").addEventListener("click", (event) => {
   $("search").value = "";
   $("hide-minor").checked = false;
   showTab("stream");
-  renderStream(computed());
+  renderStream();
   $("repo-filter").focus();
 });
 // A finding and the suggestion that acts on it link to each other.
@@ -2926,17 +2913,18 @@ $("insights").addEventListener("click", (event) => {
   showTab("suggestions");
   jumpTo(`#suggestion-${CSS.escape(button.dataset.suggestion)}`);
 });
-// Pull requests and issues named in Overview and Stream open on github.com. Suggestions has its own
-// handler, which reports a failure beside its cards.
+// GitHub links report opening failures in the view that contains them.
 $("content").addEventListener("click", async (event) => {
   const page = event.target.closest("[data-open-repo]");
-  if (!page || page.closest("#suggestions")) return;
+  if (!page) return;
+  const statusId = page.closest("#suggestions") ? "reading-status" : "open-status";
   const number = page.dataset.openNumber ? Number(page.dataset.openNumber) : null;
   let opened = false;
   try {
     opened = (await window.desk.openGitHub(page.dataset.openRepo, number)).ok;
   } catch { /* The system browser could not be opened. */ }
-  $("open-status").textContent = opened ? "" : `Could not open ${page.textContent} in your browser.`;
+  const status = $(statusId);
+  if (status) status.textContent = opened ? "" : `Could not open ${page.textContent} in your browser.`;
 });
 $("suggestions").addEventListener("change", (event) => {
   if (event.target.id !== "suggest-scope") return;
@@ -2945,17 +2933,6 @@ $("suggestions").addEventListener("change", (event) => {
   $("suggest-scope")?.focus();
 });
 $("suggestions").addEventListener("click", async (event) => {
-  const page = event.target.closest("[data-open-repo]");
-  if (page) {
-    const number = page.dataset.openNumber ? Number(page.dataset.openNumber) : null;
-    let opened = false;
-    try {
-      opened = (await window.desk.openGitHub(page.dataset.openRepo, number)).ok;
-    } catch { /* The system browser could not be opened. */ }
-    const status = $("reading-status");
-    if (status) status.textContent = opened ? "" : `Could not open ${page.textContent} in your browser.`;
-    return;
-  }
   const card = event.target.closest("[data-card]");
   if (card) {
     await setCardState(card.dataset.card, card.dataset.state, Number(card.dataset.days) || 0);
@@ -2983,14 +2960,14 @@ $("chips").addEventListener("click", (event) => {
   const chip = event.target.closest(".chip");
   if (!chip) return;
   state[state.streamSource === "conversations" ? "conversationFilter" : "filter"] = chip.dataset.filter;
-  renderStream(computed());
+  renderStream();
 });
 $("stream-source").addEventListener("click", (event) => {
   const button = event.target.closest("[data-stream]");
   if (!button || state.streamSource === button.dataset.stream) return;
   if (state.streamSource === "notes") flushNotes();
   state.streamSource = button.dataset.stream;
-  renderStream(computed());
+  renderStream();
   if (state.streamSource === "notes") renderNotes();
   $("content").scrollTop = 0;
 });
@@ -3036,15 +3013,15 @@ $("stream").addEventListener("toggle", (event) => {
 }, true);
 $("repo-filter").addEventListener("change", (event) => {
   state.repo = event.target.value;
-  renderStream(computed());
+  renderStream();
 });
 $("search").addEventListener("input", (event) => {
   state.query = event.target.value;
-  renderStream(computed());
+  renderStream();
 });
 $("hide-minor").addEventListener("change", (event) => {
   state.hideMinor = event.target.checked;
-  renderStream(computed());
+  renderStream();
 });
 $("mark-seen").addEventListener("click", () => {
   const newest = newestActivity(state);
