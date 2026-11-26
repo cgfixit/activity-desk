@@ -273,6 +273,19 @@ test("finds the text behind comment events in the payload or the loaded conversa
   assert.equal(insights.filterEvents(events, "comment", "", "absent", false, {}, index).length, 0);
 });
 
+test("cleans an event's text once per conversation index", () => {
+  const event = { id: "1", type: "IssueCommentEvent", repo: { name: "me/app" }, created_at: "2026-03-02T10:00:00Z", payload: { issue: { number: 9 }, comment: { id: 5 } } };
+  const thread = { repo: "me/app", number: 9 };
+  const before = insights.conversationIndex([], "me");
+  assert.deepEqual(insights.eventText(event, before), { label: "Comment", missing: true });
+  // Conversations that load later can supply the text, so a new index is looked up again.
+  const after = insights.conversationIndex([{ kind: "comment", thread, author: "me", at: "2026-03-02T10:00:30Z", body: "Found <!-- x --> later" }], "me");
+  const found = insights.eventText(event, after);
+  assert.equal(found.text, "Found  later");
+  assert.equal(insights.eventText(event, after), found);
+  assert.equal(insights.eventText(null, after), null);
+});
+
 test("withholds text if hidden comment markup still needs cleanup", () => {
   let body = "<!-- example -->";
   for (let i = 0; i < 12; i += 1) body = `<!${body}-- note -->`;
@@ -539,6 +552,84 @@ test("sorts suggestions by card state and brings a dismissed card back when its 
   assert.deepEqual([r.snoozed.map((x) => x.id), r.dismissed.map((x) => x.id)], [["c"], ["d"]]);
   assert.deepEqual(r.trying.map((t) => [t.id, t.showing, t.then, t.now, t.better]), [["a", true, "40%", "20%", true], ["e", false, "30 h", "5.0 h", true]]);
   assert.deepEqual(Object.keys(r.links), ["fb"]);
+});
+
+test("compares a card's saved number only with the same measure", () => {
+  const item = (id, metric) => ({ id, title: id, metric, targets: [], refs: [], also: [], why: [], act: [] });
+  const now = "2026-11-21T00:00:00Z";
+  // settle-stale-prs counts open pull requests past two weeks until 6 merges, then past your usual merge time.
+  const older = { unit: "count", value: 3, label: "Open pull requests older than two weeks" };
+  const overdue = { unit: "count", value: 8, label: "Open pull requests past your usual merge time" };
+  const suggestions = { items: [item("s", overdue), item("t", overdue)], links: {},
+    checked: ["s", "t"].map((id) => ({ id, title: id, status: "shown" })) };
+  const r = insights.applyCardStates(suggestions, {
+    s: { state: "dismissed", at: "2026-11-01T00:00:00Z", metric: older },
+    t: { state: "trying", at: "2026-11-01T00:00:00Z", metric: older },
+  }, now);
+  assert.deepEqual(r.dismissed.map((x) => x.id), ["s"], "3 then and 8 now measure different things");
+  assert.equal(r.items.find((i) => i.id === "t").trying.then, null);
+  assert.deepEqual(r.trying.map((t) => [t.then, t.now, t.better, t.started]),
+    [[null, "8", null, { label: older.label, value: "3" }]]);
+});
+
+test("a repository view counts closed-unmerged pull requests in that repository only", () => {
+  const pr = (repo, number, merged) => ({ repo, number, title: `PR ${number}`, author: "me", merged, state: merged ? "MERGED" : "CLOSED",
+    createdAt: "2026-10-01T00:00:00Z", mergedAt: merged ? "2026-10-02T00:00:00Z" : null, closedAt: merged ? null : "2026-10-03T00:00:00Z",
+    reviews: 0, reviewList: [], additions: 10, deletions: 1, headRef: "x" });
+  const info = {};
+  for (let i = 1; i <= 4; i += 1) info[`me/a#${i}`] = pr("me/a", i, true);
+  for (let i = 1; i <= 7; i += 1) info[`me/b#${i}`] = pr("me/b", i, i > 3);
+  const now = "2026-11-26T12:00:00Z";
+  const view = (prInfo, scope) => {
+    const s = insights.deriveSuggestions({ login: "me", now, scope, review: insights.summarizeReviewFlow(prInfo, "me"), prInfo, observations: [] });
+    const r = insights.applyCardStates(s, {}, now, scope);
+    return [r.checked.find((c) => c.id === "agree-before-building").status, r.items.find((i) => i.id === "agree-before-building")?.key];
+  };
+  assert.deepEqual(view(info, null), ["clear", undefined], "3 of 11 is under 30%");
+  assert.deepEqual(view(insights.scopePullRequests(info, "me/b"), "me/b"), ["shown", "agree-before-building@me/b"]);
+  assert.equal(insights.ACCOUNT_RULES.has("agree-before-building"), false);
+});
+
+test("a contribution year that did not load is not a break", () => {
+  const year = (y, active) => {
+    const days = [];
+    for (let t = Date.UTC(y, 0, 1); t <= Date.UTC(y, 11, 31); t += 864e5) {
+      const date = new Date(t).toISOString().slice(0, 10);
+      days.push({ date, contributionCount: active(date) ? 1 : 0 });
+    }
+    return { contributionCalendar: { weeks: [{ contributionDays: days }] } };
+  };
+  const loaded = { 2023: year(2023, () => true), 2025: year(2025, () => true), 2026: year(2026, (d) => d <= "2026-11-26") };
+  assert.equal(insights.summarizeContributionHistory(loaded, "2026-11-26", "2015-01-01T00:00:00Z").bestGap.days, 0);
+  loaded[2024] = year(2024, (d) => d < "2024-03-01" || d > "2024-03-10");
+  assert.deepEqual(insights.summarizeContributionHistory(loaded, "2026-11-26", "2015-01-01T00:00:00Z").bestGap,
+    { days: 10, start: "2024-02-29", end: "2024-03-11" });
+});
+
+test("traffic days no refresh read stay unknown and hold back the four-week trend", () => {
+  const now = "2026-11-26T12:00:00Z";
+  const day = (o) => new Date(Date.parse(now) - o * 864e5).toISOString().slice(0, 10);
+  const today = [];
+  for (let o = 13; o >= 0; o -= 1) today.push({ timestamp: `${day(o)}T00:00:00Z`, count: 20, uniques: 5 });
+  const fp = { repos: [{ full_name: "me/a", stargazers_count: 0 }], stars: { "me/a": [] },
+    traffic: { "me/a": { views: { count: 280, uniques: 70, views: today }, clones: {}, referrers: [] } } };
+  // Weekly refreshes, each saving the day's star count. Day 40 had no views.
+  const views = {};
+  const counts = {};
+  for (let o = 63; o >= 14; o -= 1) if (o !== 40) views[day(o)] = [o >= 28 ? 10 : 20, 5];
+  for (let o = 63; o >= 7; o -= 7) counts[day(o)] = [0, 0];
+  const read = insights.summarizeFootprint(fp, { repos: { "me/a": { views, counts } } }, now);
+  assert.deepEqual(read.trend, { last: 560, prev: 270, change: 29 / 27 }, "a read day without views counts as zero");
+  // No refresh on days 35 and 28: days 35 to 41 were never read, so day 40 is unknown, not zero.
+  const missed = { ...counts };
+  delete missed[day(35)];
+  delete missed[day(28)];
+  const gap = insights.summarizeFootprint(fp, { repos: { "me/a": { views, counts: missed } } }, now);
+  assert.equal(gap.trend, null);
+  assert.equal(gap.findings.some((f) => /over four weeks/.test(f.title)), false);
+  const week = gap.weeks.find((w) => w.start === day(34));
+  assert.equal(week.known, true, "the week ending day 34 has saved days");
+  assert.equal(gap.weeks.some((w) => w.known && w.count === 0), false);
 });
 
 test("scopes suggestions to one repository and keys card states per view", () => {

@@ -794,7 +794,9 @@ async function refresh() {
 }
 
 function finishRefresh(account) {
-  if (!account.events.some((e) => I.repoName(e) === account.repo)) account.repo = "";
+  // Keep a repository filter that still matches an event or a conversation after the refresh.
+  if (!account.events.some((e) => I.repoName(e) === account.repo) &&
+      !account.conversations?.items.some((c) => c.thread.repo === account.repo)) account.repo = "";
   const key = seenKey();
   account.lastSeen = localStorage.getItem(key);
   if (!account.lastSeen) {
@@ -1147,7 +1149,9 @@ function renderStream(ev = summarizeCurrentEvents()) {
   $("chips").innerHTML = CHIPS.map(([k, label]) =>
     `<button class="chip" role="tab" type="button" data-filter="${k}" aria-selected="${state.filter === k}">${esc(label)}<span class="n">${counts[k]}</span></button>`).join("");
 
+  // A repository picked in Conversations stays selected, and listed, even when it has no events.
   const repos = ev.byRepo.map(([r]) => r);
+  if (state.repo && !repos.includes(state.repo)) repos.unshift(state.repo);
   $("repo-filter").innerHTML = `<option value="">All repositories</option>${repos.map((r) => `<option value="${esc(r)}"${r === state.repo ? " selected" : ""}>${esc(shortRepo(r))}</option>`).join("")}`;
 
   const index = commentIndex();
@@ -1886,7 +1890,10 @@ function tryingPanel(list, scope) {
   if (!list.length) return "";
   const row = (t) => {
     const series = t.series ? `Week by week ${t.series.before ? `from ${esc(shortDate(t.series.start))}, the last saved week before you started` : `since ${esc(shortDate(t.series.start))}`}: ${t.series.values.map((v) => (v ? esc(v.text) : "…")).join(" → ")}${t.series.same ? " (no change)" : t.series.better ? " (lower)" : " (not lower yet)"}` : "";
-    const change = series ? `${esc(t.label || "")}. ${series}` : t.then && t.now ? `${esc(t.label)}: ${esc(t.then)} → <strong>${esc(t.now)}</strong>${t.better == null ? "" : t.better ? " (lower)" : t.then === t.now ? " (no change)" : " (not lower yet)"}` : t.label ? `${esc(t.label)} is not measurable in the loaded data yet.` : "No number to follow for this card.";
+    const change = series ? `${esc(t.label || "")}. ${series}`
+      : t.then && t.now ? `${esc(t.label)}: ${esc(t.then)} → <strong>${esc(t.now)}</strong>${t.better == null ? "" : t.better ? " (lower)" : t.then === t.now ? " (no change)" : " (not lower yet)"}`
+      : t.started && t.now ? `${esc(t.label)}: <strong>${esc(t.now)}</strong>. When you started, this card measured ${esc(t.started.label.toLowerCase())} (${esc(t.started.value)}), so the two are not compared.`
+      : t.label ? `${esc(t.label)} is not measurable in the loaded data yet.` : "No number to follow for this card.";
     const where = t.showing ? "" : ` <span class="muted small">· ${t.status === "clear" ? "No longer suggested" : esc(SUGGESTION_STATUS[t.status]?.[2] || "")}</span>`;
     return `<li><div><div>${esc(t.title)}${where}</div><div class="d">Since ${esc(shortDate(t.at))}. ${change}</div></div>
       <button type="button" class="link" data-card="${esc(t.key)}" data-state="">Stop</button></li>`;
