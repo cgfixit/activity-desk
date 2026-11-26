@@ -273,6 +273,19 @@ test("finds the text behind comment events in the payload or the loaded conversa
   assert.equal(insights.filterEvents(events, "comment", "", "absent", false, {}, index).length, 0);
 });
 
+test("cleans an event's text once per conversation index", () => {
+  const event = { id: "1", type: "IssueCommentEvent", repo: { name: "me/app" }, created_at: "2026-03-02T10:00:00Z", payload: { issue: { number: 9 }, comment: { id: 5 } } };
+  const thread = { repo: "me/app", number: 9 };
+  const before = insights.conversationIndex([], "me");
+  assert.deepEqual(insights.eventText(event, before), { label: "Comment", missing: true });
+  // Conversations that load later can supply the text, so a new index is looked up again.
+  const after = insights.conversationIndex([{ kind: "comment", thread, author: "me", at: "2026-03-02T10:00:30Z", body: "Found <!-- x --> later" }], "me");
+  const found = insights.eventText(event, after);
+  assert.equal(found.text, "Found  later");
+  assert.equal(insights.eventText(event, after), found);
+  assert.equal(insights.eventText(null, after), null);
+});
+
 test("withholds text if hidden comment markup still needs cleanup", () => {
   let body = "<!-- example -->";
   for (let i = 0; i < 12; i += 1) body = `<!${body}-- note -->`;

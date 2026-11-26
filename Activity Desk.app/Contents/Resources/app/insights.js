@@ -2615,7 +2615,19 @@ function conversationIndex(items, login) {
 
 // { label, text, clipped, source: "event" | "conversation" } when the text is known,
 // { label, missing: true } for a comment whose text GitHub did not send, or null when there is no text.
+// Cleaned once per event and conversation index, since Stream renders and searches on every keystroke.
+// Loaded events are not changed afterwards, and callers only read the result.
+const eventTexts = new WeakMap();
 function eventText(event, index) {
+  if (!event || typeof event !== "object") return findEventText(event, index);
+  const hit = eventTexts.get(event);
+  if (hit && hit.index === index) return hit.value;
+  const value = findEventText(event, index);
+  eventTexts.set(event, { index, value });
+  return value;
+}
+
+function findEventText(event, index) {
   const p = (event && event.payload) || {};
   const type = event && event.type;
   const comment = COMMENT_EVENTS[type];

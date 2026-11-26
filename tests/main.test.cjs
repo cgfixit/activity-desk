@@ -333,6 +333,44 @@ test("an unreadable notes file is set aside instead of overwritten", async (t) =
   assert.equal(fs.existsSync(path.join(profile, "notes.enc")), false);
 });
 
+test("unreadable saved history and suggestion states are set aside, and turning history off removes the history copy", async (t) => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "activity-desk-"));
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(profile, "history-on"), "");
+  fs.writeFileSync(path.join(profile, "history.enc"), "mock:not base64 json");
+  fs.writeFileSync(path.join(profile, "cards.enc"), `mock:${Buffer.from(JSON.stringify({ version: 99 })).toString("base64")}`);
+  const kept = (prefix) => fs.readdirSync(profile).filter((f) => f.startsWith(prefix));
+  const rename = fs.renameSync;
+  t.after(() => { fs.renameSync = rename; });
+  const { invoke } = await start(t, profile);
+  await invoke("sign-in", token);
+  await invoke("github", "profile");
+
+  // A copy that cannot be moved aside stays where it is, and nothing is saved over it.
+  fs.renameSync = (from, to) => {
+    if (String(to).includes("-unreadable-")) throw Object.assign(new Error("fixture rename failure"), { code: "EACCES" });
+    return rename(from, to);
+  };
+  assert.equal((await invoke("history")).ok, false);
+  assert.equal((await invoke("snapshot", { merged: 1 })).ok, false);
+  assert.equal(fs.readFileSync(path.join(profile, "history.enc"), "utf8"), "mock:not base64 json");
+  fs.renameSync = rename;
+
+  const history = await invoke("history");
+  assert.deepEqual([history.ok, history.repos], [true, {}]);
+  assert.match(history.note, /could not be read.*history-unreadable-\d+\.enc/);
+  assert.equal(fs.readFileSync(path.join(profile, kept("history-unreadable-")[0]), "utf8"), "mock:not base64 json");
+  const cards = await invoke("cards");
+  assert.match(cards.note, /could not be read.*cards-unreadable-\d+\.enc/);
+  assert.equal(kept("cards-unreadable-").length, 1);
+  assert.equal((await invoke("card-set", "follow-up", { state: "trying" })).ok, true);
+  assert.equal((await invoke("snapshot", { merged: 2 })).ok, true);
+
+  // Saved history is all of it: turning it off removes the set-aside copy too, but not the cards copy.
+  assert.equal((await invoke("history-setting", false)).ok, true);
+  assert.deepEqual([kept("history").length, kept("cards-unreadable-").length], [0, 1]);
+});
+
 test("a second token is saved only for the same account, and each read goes to the right token", async (t) => {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "activity-desk-"));
   t.after(() => fs.rmSync(profile, { recursive: true, force: true }));

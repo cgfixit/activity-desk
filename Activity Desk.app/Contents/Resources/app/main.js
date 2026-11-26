@@ -53,6 +53,16 @@ async function writeEncrypted(name, text) {
   }
 }
 
+// Renames an unreadable encrypted file to <name>-unreadable-<time>.enc beside it, so a later save
+// cannot overwrite data that may decrypt again after a Keychain change. Returns the new name.
+function setAside(name) {
+  const profile = app.getPath("userData");
+  const aside = `${name.replace(/\.enc$/, "")}-unreadable-${Date.now()}.enc`;
+  fs.renameSync(path.join(profile, name), path.join(profile, aside));
+  return aside;
+}
+const keptAs = (aside) => `The unreadable file was kept as ${aside} in the app's data folder.`;
+
 // ---------- Saved tokens ----------
 // Up to two tokens for one GitHub account, one per slot: a fine-grained personal access token and a
 // classic (scope-based) token. They are kept together in one encrypted file, and a token is only saved
@@ -198,6 +208,7 @@ function resetSession() {
 // main process accepts only the known keys, as bounded numbers, under a week it works out itself.
 const HISTORY_FILE = "history.enc";
 const HISTORY_ON = "history-on"; // present only after the user turned saved history on
+const HISTORY_ASIDE = /^history-unreadable-\d+\.enc$/;
 const HISTORY_VERSION = 1;
 const HISTORY_DAYS = 400;
 const HISTORY_REPOS = 50;
@@ -225,19 +236,23 @@ function withHistory(operation) {
 const count = (n) => Number.isSafeInteger(n) && n >= 0;
 const today = () => new Date().toISOString().slice(0, 10);
 
+// A file that cannot be decrypted, or is in an unknown format, is set aside rather than overwritten.
+// If it cannot be moved, loading fails, so nothing replaces it.
 async function loadHistory() {
   if (history) return history;
-  history = { version: HISTORY_VERSION, accounts: {} };
+  let store = { version: HISTORY_VERSION, accounts: {} };
   const encrypted = readIfPresent(path.join(app.getPath("userData"), HISTORY_FILE));
-  if (!encrypted) return history;
-  try {
-    const { result } = await safeStorage.decryptStringAsync(encrypted);
-    const parsed = JSON.parse(result);
-    if (parsed?.version === HISTORY_VERSION && parsed.accounts && typeof parsed.accounts === "object") history = parsed;
-    else historyNote = "Saved history used an unknown format, so it started again.";
-  } catch {
-    historyNote = "Saved history could not be decrypted, so it started again.";
+  if (encrypted) {
+    let parsed = null;
+    try {
+      parsed = JSON.parse((await safeStorage.decryptStringAsync(encrypted)).result);
+    } catch {
+      parsed = null;
+    }
+    if (parsed?.version === HISTORY_VERSION && parsed.accounts && typeof parsed.accounts === "object") store = parsed;
+    else historyNote = `Saved history could not be read, so it started again. ${keptAs(setAside(HISTORY_FILE))}`;
   }
+  history = store;
   return history;
 }
 
@@ -393,6 +408,10 @@ handle("history-setting", (enabled) => withHistory(async () => {
       history = { version: HISTORY_VERSION, accounts: {} };
       historyNote = "";
       fs.rmSync(path.join(profile, HISTORY_FILE), { force: true });
+      // Copies set aside because they could not be read hold history too.
+      for (const name of fs.readdirSync(profile)) {
+        if (HISTORY_ASIDE.test(name)) fs.rmSync(path.join(profile, name), { force: true });
+      }
     }
     return { ok: true, enabled: historyEnabled() };
   } catch {
@@ -477,9 +496,7 @@ async function loadNotes() {
       }
       if (reEncrypt) await writeEncrypted(NOTES_FILE, JSON.stringify(store));
     } else {
-      const aside = `notes-unreadable-${Date.now()}.enc`;
-      fs.renameSync(file, path.join(profile, aside));
-      notesNote = `Saved notes could not be read, so a new notebook started. The unreadable file was kept as ${aside} in the app's data folder.`;
+      notesNote = `Saved notes could not be read, so a new notebook started. ${keptAs(setAside(NOTES_FILE))}`;
     }
   }
   notesStore = store;
@@ -616,9 +633,13 @@ async function loadCards() {
   const store = { version: CARDS_VERSION, accounts: {} };
   const encrypted = readIfPresent(path.join(app.getPath("userData"), CARDS_FILE));
   if (encrypted) {
+    let parsed = null;
     try {
-      const parsed = JSON.parse((await safeStorage.decryptStringAsync(encrypted)).result);
-      if (parsed?.version !== CARDS_VERSION || !parsed.accounts || typeof parsed.accounts !== "object") throw new Error("format");
+      parsed = JSON.parse((await safeStorage.decryptStringAsync(encrypted)).result);
+    } catch {
+      parsed = null;
+    }
+    if (parsed?.version === CARDS_VERSION && parsed.accounts && typeof parsed.accounts === "object") {
       for (const [key, cards] of Object.entries(parsed.accounts)) {
         if (!/^\d+$/.test(key) || !cards || typeof cards !== "object") continue;
         const clean = {};
@@ -628,8 +649,8 @@ async function loadCards() {
         }
         store.accounts[key] = clean;
       }
-    } catch {
-      cardsNote = "Saved suggestion states could not be read, so every card starts fresh.";
+    } else {
+      cardsNote = `Saved suggestion states could not be read, so every card starts fresh. ${keptAs(setAside(CARDS_FILE))}`;
     }
   }
   cardsStore = store;
