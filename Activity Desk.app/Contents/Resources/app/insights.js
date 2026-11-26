@@ -1919,11 +1919,13 @@ const SUGGESTION_RULES = [
   {
     id: "agree-before-building", area: "Pull requests", source: "Recent events", patterns: ["closed-unmerged"],
     title: "Agree on the approach before building",
-    check: ({ follow, review }) => {
+    check: ({ follow, review, scope }) => {
       // The authored search covers every pull request you opened in its window, so it is preferred.
-      // The Events feed is used when that search did not load or found too few finished ones.
+      // The Events feed is used when that search did not load or found too few finished ones. In a
+      // repository view the search is already narrowed to that repository, and the feed, which covers
+      // the whole account, is not used.
       const fromSearch = review && review.outcomes.merged + review.outcomes.closed >= 4;
-      const source = fromSearch ? review : follow;
+      const source = fromSearch || scope ? review : follow;
       if (!source) return { unavailable: "Recent events or pull request details did not load." };
       const { merged, closed } = source.outcomes;
       const decided = merged + closed;
@@ -2152,6 +2154,9 @@ const SNOOZE_DAYS = [7, 30];
 const WORSE_FLOOR = { share: 0.1, hours: 12, lines: 100, count: 2 };
 const metricText = (m, value) => (m.unit === "share" ? share(value) : m.unit === "hours" ? durationLabel(value)
   : m.unit === "lines" ? `${Math.round(value).toLocaleString()} lines` : Math.round(value).toLocaleString());
+// A saved number is compared with today's only when both measure the same thing. One rule can switch
+// measures as data grows, such as settle-stale-prs moving from a two-week cutoff to your own merges.
+const sameMeasure = (saved, current) => Boolean(saved && current && saved.unit === current.unit && saved.label === current.label);
 function clearlyWorse(unit, then, now) {
   return Number.isFinite(then) && Number.isFinite(now) && now - then > (WORSE_FLOOR[unit] ?? 0) && now >= then * 1.25;
 }
@@ -2197,7 +2202,7 @@ function trialSeries(id, at, snapshots) {
 // ---------- One repository at a time ----------
 // Rules that read the Events feed, the contribution calendar, notifications, conversations, traffic, or
 // the token describe the whole account, so a repository view shows them unchanged and says so.
-const ACCOUNT_RULES = new Set(["agree-before-building", "branches-without-prs", "answer-waiting-threads", "batch-by-repo",
+const ACCOUNT_RULES = new Set(["branches-without-prs", "answer-waiting-threads", "batch-by-repo",
   "re-entry-notes", "late-night-review", "ci-notifications", "labels-not-prefixes", "readme-first-screen", "fine-grained-token"]);
 const SCOPE_MIN_MERGES = SUGGEST_MIN_MERGES;
 
@@ -2248,14 +2253,14 @@ function applyCardStates(suggestions, allStates, now, scope = null, snapshots = 
     const pinned = PINNED_SUGGESTIONS.has(item.id);
     if (!st || pinned) { items.push(item); continue; }
     if (st.state === "trying") {
-      const then = st.metric ? metricText(st.metric, st.metric.value) : null;
+      const then = sameMeasure(st.metric, item.metric) ? metricText(st.metric, st.metric.value) : null;
       items.push({ ...item, trying: { ...st, then, now: item.metric ? metricText(item.metric, item.metric.value) : null } });
       continue;
     }
     if (st.state === "snoozed" && Date.parse(st.until) > nowTime) { snoozed.push({ ...item, until: st.until }); continue; }
     if (st.state === "dismissed") {
       const m = item.metric;
-      if (m && st.metric && clearlyWorse(m.unit, st.metric.value, m.value)) {
+      if (sameMeasure(st.metric, m) && clearlyWorse(m.unit, st.metric.value, m.value)) {
         items.push({ ...item, returned: { at: st.at, then: metricText(m, st.metric.value), now: metricText(m, m.value), label: m.label } });
       } else {
         dismissed.push({ ...item, dismissedAt: st.at });
@@ -2271,12 +2276,15 @@ function applyCardStates(suggestions, allStates, now, scope = null, snapshots = 
     const check = checked.find((c) => c.id === id);
     if (!check) continue;
     const metric = (shown || byId.get(id))?.metric || check.metric || null;
+    const same = sameMeasure(st.metric, metric);
     trying.push({
       id, key: cardKey(id, scope), title: check.title, at: st.at, showing: Boolean(shown), status: check.status,
-      then: st.metric && metric ? metricText(metric, st.metric.value) : null,
+      then: same ? metricText(metric, st.metric.value) : null,
       now: metric ? metricText(metric, metric.value) : null,
       label: metric?.label || st.metric?.label || null,
-      better: st.metric && metric ? metric.value < st.metric.value : null,
+      // The measure changed since you started, so the saved number is named but not compared.
+      started: st.metric && metric && !same ? { label: st.metric.label, value: metricText(st.metric, st.metric.value) } : null,
+      better: same ? metric.value < st.metric.value : null,
       series: scope ? null : trialSeries(id, st.at, snapshots),
       weekly: !scope && Boolean(TRIAL_SNAPSHOTS[id]),
     });
@@ -2897,6 +2905,7 @@ const sumKnown = (values) => {
 
 // fp: { repos, traffic: { repo: { views, clones, referrers } }, stars: { repo: [starred_at] } }
 // saved: the main process's saved history for this account, { repos: { repo: { views, clones, counts, referrers } } }
+const TRAFFIC_WINDOW_DAYS = 14; // GitHub's traffic endpoints return the last 14 days
 function summarizeFootprint(fp, saved, now) {
   const nowTime = now == null ? Date.now() : new Date(now).getTime();
   const dayKey = (offset) => new Date(nowTime - offset * DAY_MS).toISOString().slice(0, 10);
@@ -2941,9 +2950,19 @@ function summarizeFootprint(fp, saved, now) {
   };
 
   // Daily views across repositories: saved days first, then today's 14-day response on top.
+  // GitHub omits days with no views, so a missing day reads as zero, but only inside a window some
+  // read covered. Each refresh with saved history on stores that day's star count for every owned
+  // repository, so those days mark when traffic was read. A read covers its day and the 13 before.
   const daily = new Map();
+  const covered = new Set();
+  const cover = (day) => {
+    const end = Date.parse(`${day}T00:00:00Z`);
+    for (let d = 0; d < TRAFFIC_WINDOW_DAYS && Number.isFinite(end); d += 1) covered.add(new Date(end - d * DAY_MS).toISOString().slice(0, 10));
+  };
   let firstSaved = null;
   for (const r of rows) {
+    for (const day of Object.keys(savedRepos[r.repo]?.counts || {})) cover(day);
+    if (Array.isArray(traffic[r.repo]?.views?.views)) cover(dayKey(0));
     const merged = { ...(savedRepos[r.repo]?.views || {}) };
     for (const d of traffic[r.repo]?.views?.views || []) {
       const day = String(d?.timestamp || "").slice(0, 10);
@@ -2961,13 +2980,16 @@ function summarizeFootprint(fp, saved, now) {
     for (let d = 0; d < 7; d += 1) {
       const day = dayKey(w * 7 + d);
       if (daily.has(day)) { n += daily.get(day); known = true; }
-      else if (firstSaved && day >= firstSaved) known = true; // GitHub omits days with no views
+      else if (firstSaved && day >= firstSaved && covered.has(day)) known = true;
     }
     weeks.push({ start: dayKey(w * 7 + 6), count: n, known });
   }
   const coveredDays = firstSaved ? Math.floor((nowTime - Date.parse(`${firstSaved}T00:00:00Z`)) / DAY_MS) + 1 : 0;
+  // The trend compares two full four-week windows, so every day in both must have been read.
+  let gaps = 0;
+  for (let d = 0; d < 56; d += 1) if (!daily.has(dayKey(d)) && !covered.has(dayKey(d))) gaps += 1;
   let trend = null;
-  if (coveredDays >= 56) {
+  if (coveredDays >= 56 && !gaps) {
     const range = (from, to) => { let n = 0; for (let d = from; d < to; d += 1) n += daily.get(dayKey(d)) || 0; return n; };
     const last = range(0, 28);
     const prev = range(28, 56);
@@ -3093,7 +3115,8 @@ function summarizeContributionHistory(byYear, todayKey, createdAt) {
   years.sort((a, b) => a.year - b.year);
   allDays.sort((a, b) => a.date.localeCompare(b.date));
 
-  // Records across years, so a streak that crosses New Year counts once.
+  // Records across years, so a streak that crosses New Year counts once. Days missing from the loaded
+  // years, such as a year GitHub did not return, end a streak and are not counted as a break.
   let run = 0;
   let runStart = null;
   let bestRun = { days: 0, start: null, end: null };
@@ -3102,7 +3125,7 @@ function summarizeContributionHistory(byYear, todayKey, createdAt) {
   let prevTime = null;
   for (const d of allDays) {
     const time = Date.parse(`${d.date}T00:00:00Z`);
-    if (prevTime != null && time - prevTime !== DAY_MS) run = 0;
+    if (prevTime != null && time - prevTime !== DAY_MS) { run = 0; lastActive = null; }
     prevTime = time;
     if (d.contributionCount > 0) {
       if (run === 0) runStart = d.date;
