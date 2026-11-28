@@ -602,8 +602,16 @@ test("saved events extend the feed for the signed-in account, follow their level
   assert.equal((await invoke("github", "events", { login: "fixture", page: 1 })).ok, true);
   // GitHub's feed later drops the older event; the saved one still covers it.
   feed = [event(3, 1), event(1, 10)];
-  await invoke("github", "events", { login: "fixture", page: 1 });
-  const saved = await invoke("event-archive");
+  const page = await invoke("github", "events", { login: "fixture", page: 1 });
+  const disconnected = await invoke("event-archive", []);
+  assert.equal(disconnected.current, null, "no successful first page in the refresh");
+  assert.deepEqual(disconnected.earlier.map((s) => s.count), [3]);
+  const saved = await invoke("event-archive", [page.feedReadAt]);
+  const afterGap = await invoke("event-archive", [page.feedReadAt + 864e5]);
+  assert.equal(afterGap.current, null, "the saved span ends before this read");
+  assert.deepEqual(afterGap.earlier, disconnected.earlier);
+  const dual = await invoke("event-archive", [page.feedReadAt + 864e5, page.feedReadAt]);
+  assert.deepEqual(dual.current, saved.current);
   assert.deepEqual([saved.ok, saved.level, saved.count, saved.current.events.map((e) => e.id)], [true, "standard", 3, ["5003", "5001", "5002"]]);
   assert.equal(saved.earlier.length, 0, "the second read overlapped the first, so there is no gap");
   const kept = saved.current.events[0];
