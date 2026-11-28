@@ -584,6 +584,25 @@ test("set-aside copies are bounded, and one that decrypts again is joined back i
   assert.ok(copies.every((f) => now - Number(/(\d+)\.enc$/.exec(f)[1]) < 90 * 864e5));
 });
 
+test("a newly unreadable notebook recovers the oldest readable copy before enforcing the cap", async (t) => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "activity-desk-"));
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
+  const now = Date.now();
+  const file = (age) => path.join(profile, `notes-unreadable-${now - age * 864e5}.enc`);
+  const note = { id: "00000001-0000-4000-8000-000000000000", text: "Recovered from the third copy" };
+  const store = { version: 1, accounts: { 1: { login: "fixture", notes: [note] } } };
+  fs.writeFileSync(file(3), `mock:${Buffer.from(JSON.stringify(store)).toString("base64")}`);
+  for (const f of [file(2), file(1), path.join(profile, "notes.enc")]) fs.writeFileSync(f, "unreadable");
+
+  const { invoke } = await start(t, profile);
+  await invoke("sign-in", token);
+  await invoke("github", "profile");
+  const result = await invoke("notes");
+  assert.deepEqual(result.notes.map((n) => n.text), [note.text]);
+  assert.equal(fs.existsSync(file(3)), false);
+  assert.equal(fs.readdirSync(profile).filter((f) => f.startsWith("notes-unreadable-")).length, 3);
+});
+
 test("saved events extend the feed for the signed-in account, follow their level, and stay closed without a token", async (t) => {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "activity-desk-"));
   t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
