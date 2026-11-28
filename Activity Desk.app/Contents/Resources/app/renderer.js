@@ -8,6 +8,7 @@ const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const LAST_SEEN_KEY = "desk.lastSeen";
 const EVENT_PAGES = 3; // GitHub serves at most 300 events
+const STREAM_ROWS = 400; // Stream draws this many events at a time; saved events can hold thousands
 const PR_LOOKUP_LIMIT = 40;
 const AUTHORED_PAGES = 3; // 100 pull requests per page
 const AUTHORED_DAYS = 90; // matches the authored search window in main.js
@@ -59,6 +60,9 @@ const initialState = {
   tokenMeta: null,
   footprint: null,
   repoHealth: null, // Dependabot alerts and community profiles for the repositories Footprint reads
+  eventArchive: null, // what the main process saved from earlier feed reads, see archive.js
+  eventsNote: "", // what saved events added to the feed, and what they hold outside it
+  streamLimit: STREAM_ROWS,
   savedHistory: null,
   contributionHistory: null,
   contributions: null,
@@ -382,6 +386,24 @@ async function loadFootprint(account) {
   return { fp, saved };
 }
 
+// What saved events added to the feed, and what they hold that the dashboard leaves out.
+const longDate = (ms) => new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+function archiveNote(saved, feed, events) {
+  if (!saved) return "";
+  if (!saved.ok) return `Saved events are unavailable. ${saved.error || ""}`.trim();
+  const parts = [];
+  if (saved.note) parts.push(saved.note);
+  const fromFeed = new Set(feed.events.map((e) => e.id));
+  const added = events.filter((e) => !fromFeed.has(e.id)).length;
+  if (added) parts.push(`${fmt(added)} older ${added === 1 ? "event comes" : "events come"} from events saved on this Mac, read back to ${longDate(saved.current.from)}.`);
+  const earlier = saved.earlier || [];
+  if (earlier.length) {
+    const held = earlier.reduce((n, s) => n + s.count, 0);
+    parts.push(`Saved events also hold ${fmt(held)} from before ${longDate(earlier[0].to)}. No refresh read the stretch after that, so they are left out of the summaries.`);
+  }
+  return parts.join(" ");
+}
+
 // Open Dependabot alerts for the repositories Footprint reads, and the community profile of the public
 // ones. As with traffic, the first repository that answers for alerts decides whether the token can
 // read them at all; a repository with alerts turned off says nothing about the token, so the next is tried.
@@ -674,7 +696,12 @@ async function refresh() {
     setBusy("Loading activity…");
     const feed = await loadAllEvents(account, user.login);
     if (account !== state) return;
-    const events = [...new Map(feed.events.map((e) => [e.id, e])).values()]
+    // The main process saved this feed as it arrived. Its saved span that reaches now joins the feed;
+    // earlier spans are separated by a period nobody read, so they stay out of the summaries.
+    const saved = await window.desk.eventArchive().catch(() => null);
+    if (account !== state) return;
+    const kept = saved?.ok && saved.current ? saved.current.events : [];
+    const events = [...new Map([...kept, ...feed.events].map((e) => [e.id, e])).values()]
       .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
 
     setBusy("Loading contribution year and notifications…");
@@ -728,6 +755,8 @@ async function refresh() {
     if (cardRead && !cardRead.ok) errors.cards = cardRead.error;
     else if (cardRead?.note) errors.cards = cardRead.note;
     if (feed.issue) errors.events = feed.issue;
+    // What saved events added is information, not a problem with the feed, so it is kept apart.
+    const eventsNote = archiveNote(saved, feed, events);
     const notifications = Array.isArray(notes.value?.data) ? notes.value.data : null;
     if (!notifications) errors.notifications = classic
       ? notes.reason?.message || "Notifications are unavailable."
@@ -847,7 +876,7 @@ async function refresh() {
       ? { events: feed.only, authored: mine?.only, reviewed: theirs?.only, conversations: talkData?.only, requests: requestLoad?.only, year: year.value?.slot || null }
       : null;
 
-    Object.assign(account, { tokenUse, user, viewer, contributions, events, notifications, prLookup, prInfo, reviewed, requests, rateLimit, footprint: footprintData, repoHealth, savedHistory, contributionHistory, conversations, errors, refreshedAt: new Date() });
+    Object.assign(account, { eventArchive: saved, eventsNote, tokenUse, user, viewer, contributions, events, notifications, prLookup, prInfo, reviewed, requests, rateLimit, footprint: footprintData, repoHealth, savedHistory, contributionHistory, conversations, errors, refreshedAt: new Date() });
     await saveWeeklySnapshot(account, mine);
     finishRefresh(account);
   } catch (error) {
@@ -1210,6 +1239,7 @@ function renderStream(ev = summarizeCurrentEvents()) {
     ? `${fmt(ev.total)} events loaded${range ? ` · ${range}` : ""}.`
     : "No recent events loaded.";
   if (state.errors.events) $("stream-caption").textContent += ` ${state.errors.events}`;
+  if (state.eventsNote) $("stream-caption").textContent += ` ${state.eventsNote}`;
 
   const counts = Object.fromEntries(CHIPS.map(([k]) => [k, I.filterEvents(state.events, k, state.repo, "", state.hideMinor).length]));
   const minor = state.events.filter(I.isMinor).length;
@@ -1225,7 +1255,9 @@ function renderStream(ev = summarizeCurrentEvents()) {
   const index = commentIndex();
   const list = I.filterEvents(state.events, state.filter, state.repo, state.query, state.hideMinor, state.prInfo, index);
   const lastSeen = state.lastSeen ? new Date(state.lastSeen).getTime() : null;
-  const groups = Map.groupBy(list, (e) => localDayKey(new Date(e.created_at)));
+  const shown = list.slice(0, state.streamLimit);
+  const groups = Map.groupBy(shown, (e) => localDayKey(new Date(e.created_at)));
+  const hidden = list.length - shown.length;
   if (!list.length) {
     $("stream").innerHTML = `<div class="empty">No events match these filters.</div>`;
   } else {
@@ -1257,7 +1289,8 @@ function renderStream(ev = summarizeCurrentEvents()) {
             <div class="meta"><span>${openLink(I.repoName(e), eventNumber(e))}</span>${branch && e.type !== "PushEvent" && e.type !== "CreateEvent" && e.type !== "DeleteEvent" ? `<span>${esc(branch)}</span>` : ""}${e.public === false ? "<span>private</span>" : ""}</div></div>
           <div class="tags">${tags.join("")}</div>
         </div>`;
-      }).join("")}</div></div>`).join("");
+      }).join("")}</div></div>`).join("") + (hidden
+      ? `<div class="actions"><button class="btn ghost" type="button" id="stream-more">Show ${fmt(Math.min(STREAM_ROWS, hidden))} more of ${fmt(hidden)} older events</button></div>` : "");
   }
 }
 
@@ -2072,7 +2105,7 @@ function renderMeta(c) {
   const use = state.tokenUse;
   const both = dual(state);
   const caps = [];
-  caps.push([state.errors.events ? "part" : "ok", "Activity stream", esc((state.errors.events || `${fmt(ev.total)} recent events loaded.`) + onlyNote(use?.events, "event", "events"))]);
+  caps.push([state.errors.events ? "part" : "ok", "Activity stream", esc((state.errors.events || `${fmt(ev.total)} recent events loaded.`) + (state.eventsNote ? ` ${state.eventsNote}` : "") + onlyNote(use?.events, "event", "events"))]);
   caps.push(ev.privateEvents ? ["ok", "Private events", `${fmt(ev.privateEvents)} private events visible.`]
     : ["part", "Private events", state.public ? "Not visible without a token." : state.tokens["fine-grained"] ? "None visible. Add the account permission Events: read to the fine-grained token if you have private activity." : "None in this window."]);
   caps.push(state.notifications ? [state.errors.notifications ? "part" : "ok", "Notifications", `${fmt(state.notifications.length)} unread loaded. ${esc(state.errors.notifications || "")}`]
@@ -2146,6 +2179,7 @@ function renderMeta(c) {
   $("add-token-label").textContent = state.public ? "Add a token to load everything else" : "Add a second token for this account, or replace a saved one";
   cards.push(rateCard());
   cards.push(historyCard());
+  cards.push(eventsCard());
   cards.push(notesCard());
 
   cards.push(`<article class="card"><h3>This session</h3>
@@ -2716,6 +2750,30 @@ async function reloadNotes() {
   renderNotes();
 }
 
+// Events saved from earlier refreshes: the level, what is kept, and what the limits will drop.
+const EVENT_LEVEL_TEXT = { off: "Off", standard: "Standard", extended: "Extended" };
+const sizeText = (bytes) => (bytes >= 1e6 ? `${(bytes / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1e3))} KB`);
+function eventsCard() {
+  const a = state.eventArchive;
+  if (!a || state.public) return "";
+  const head = '<article class="card"><h3>Events saved on this Mac</h3>';
+  if (!a.ok) return `${head}<div class="callout">${esc(a.error || "Saved events are unavailable.")}</div></article>`;
+  const buttons = ["off", "standard", "extended"].map((level) => `<button class="btn ghost" type="button" data-events-level="${level}" aria-pressed="${a.level === level}">${EVENT_LEVEL_TEXT[level]}</button>`).join("");
+  const limit = (l) => `${fmt(l.events)} events, ${fmt(l.days)} days, ${sizeText(l.bytes)}`;
+  const body = a.level === "off"
+    ? '<p class="big">Off. Only GitHub\'s feed is shown: up to 300 events from the last 30 days.</p>'
+    : `<dl class="kv">
+      <dt>Level</dt><dd>${EVENT_LEVEL_TEXT[a.level]}: keeps up to ${esc(limit(a.limits))}, whichever is reached first</dd>
+      <dt>Saved for this account</dt><dd>${fmt(a.count)} events</dd>
+      <dt>Read without a gap</dt><dd>${a.current ? `${esc(dateRange(a.current.from, a.current.to))}, ${fmt(a.current.events.length)} events` : "Nothing yet"}</dd>
+      ${(a.earlier || []).map((e) => `<dt>Before a gap</dt><dd>${esc(dateRange(e.from, e.to))}, ${fmt(e.count)} events, left out of summaries</dd>`).join("")}
+      <dt>File size, every account</dt><dd>${a.bytes ? sizeText(a.bytes) : "None"}</dd>
+    </dl>`;
+  return `${head}${a.note ? `<div class="callout">${esc(a.note)}</div>` : ""}${body}
+    <p class="note">GitHub's feed stops at 300 events or 30 days. Each refresh saves what it read, encrypted with the same Keychain-backed key as the token, so Stream and Insights can reach further back. When a limit is reached, the oldest events are deleted first. A refresh that finds the feed no longer overlaps what was saved, for example after weeks away, starts a new stretch; the older one is kept but left out of summaries, since what happened in between is unknown. Extended keeps ${esc(limit(a.levels.extended))}. Off deletes saved events for every account on this Mac.</p>
+    <div class="actions" role="group" aria-label="Saved events level">${buttons}</div></article>`;
+}
+
 function notesCard() {
   const n = state.notes;
   if (!n) return "";
@@ -2959,6 +3017,23 @@ async function historyAction(event) {
   if (action === "history-on") refresh();
 }
 $("meta").addEventListener("click", historyAction);
+$("meta").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-events-level]");
+  if (!button || state.busy || button.getAttribute("aria-pressed") === "true") return;
+  const level = button.dataset.eventsLevel;
+  if (level === "off" && !window.confirm("Turn off saved events and delete them for every account on this Mac?")) return;
+  button.disabled = true;
+  const account = state;
+  const result = await window.desk.setEventArchive(level).catch((error) => ({ ok: false, error: error.message }));
+  if (account !== state) return;
+  if (!result.ok) {
+    state.eventArchive = { ok: false, level, error: result.error };
+    renderAll();
+    return;
+  }
+  // A refresh rereads the feed so the new level applies to what Stream and Insights show.
+  refresh();
+});
 // What to change: GitHub's token forms, and the token field above the cards.
 $("meta").addEventListener("click", (event) => {
   const page = event.target.closest("[data-token-page]");
@@ -3048,6 +3123,11 @@ $("suggestions").addEventListener("click", async (event) => {
   } catch { /* The system browser could not be opened. */ }
   const status = $("reading-status");
   if (status) status.textContent = ok ? "" : `Could not open ${I.READING[id]?.title || "that source"} in your browser.`;
+});
+$("stream").addEventListener("click", (event) => {
+  if (!event.target.closest("#stream-more")) return;
+  state.streamLimit += STREAM_ROWS;
+  renderStream();
 });
 $("chips").addEventListener("click", (event) => {
   const chip = event.target.closest(".chip");
