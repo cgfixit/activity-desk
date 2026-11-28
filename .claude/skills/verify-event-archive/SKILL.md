@@ -41,14 +41,15 @@ Why this tool: JavaScript has no verifier that runs on this code. A bounded enum
 | `main.js`: `recordEvents` | Keys runs by the token the window asked for (`slot`, or `"any"`), passes the token that answered as `via`, and sends the request time as `readAt`. The model mirrors this. If that wiring changes, update `apply()` in the check to match. |
 | `renderer.js`: `loadEvents` | Asks for pages 1, 2, 3 in order and stops at the first failure. |
 
-**Not covered:**
+The focused `view` check uses first-page request times from the current refresh. It covers a failed read, the second boundary, disjoint reads and two tokens. It rejects a mutation that accepts a disconnected span. The saved-events IPC check in `tests/main.test.cjs` exercises the same selection through the main process.
+
+**Not covered by the feed model:**
 - `mergeAccount`, which joins a recovered copy. It only adds events and spans, so it cannot remove an event from a span.
-- `view`.
 - Encryption and the IPC handlers. `tests/main.test.cjs` exercises these with synthetic responses.
 - GitHub's delivery delay of up to several hours. A late event can land in a span already read, and the next refresh adds it. The user guide says so.
 - Feeds with more than two pages or a cap above 3. The rules don't depend on page count, but the bound is a bound.
 
-**Sync commit:** `069a0f745eb8e5a7eb05a4012dad462f13e7a6b7`. The check was last confirmed to describe the covered code at this commit.
+**Sync commit:** `8e28d6ceb34f08166173cc4ffbe7b93ed7d3f302`. The check was last confirmed to describe the covered code at this commit.
 
 ## When to run it
 
@@ -60,7 +61,7 @@ Run it when a diff touches any of these:
 To see what changed in covered code since the sync commit:
 
 ```bash
-git diff 069a0f745eb8e5a7eb05a4012dad462f13e7a6b7 -- "Activity Desk.app/Contents/Resources/app/archive.js" "Activity Desk.app/Contents/Resources/app/main.js" "Activity Desk.app/Contents/Resources/app/renderer.js"
+git diff 8e28d6ceb34f08166173cc4ffbe7b93ed7d3f302 -- "Activity Desk.app/Contents/Resources/app/archive.js" "Activity Desk.app/Contents/Resources/app/main.js" "Activity Desk.app/Contents/Resources/app/renderer.js"
 ```
 
 ## How to run it
