@@ -815,8 +815,13 @@ test("Dependabot and community-profile cards read only what loaded and say why a
     "me/private": { open: [alert("critical"), alert("high", "2026-11-27T00:00:00Z"), alert("low")], more: true },
   } })).items.find((s) => s.id === "fix-dependabot-alerts");
   assert.equal(fix.tone, "warn");
-  assert.equal(fix.seen, "3 open critical or high alerts in 2 repositories, 1 of them critical. The oldest has been open 30 days.");
-  assert.deepEqual(fix.targets, ["me/private: 1 critical, 1 high, and more than 100 open alerts in all", "me/app: 0 critical, 1 high"]);
+  assert.equal(fix.seen, "At least 3 open critical or high alerts in 2 repositories, 1 of them critical.", "a capped list gives a floor and no oldest age");
+  const uncapped = run(health({ alerts: { "me/app": { open: [alert("high")], more: false }, "me/private": { open: [alert("critical", "not a date")], more: false } } }))
+    .items.find((s) => s.id === "fix-dependabot-alerts");
+  assert.equal(uncapped.seen, "2 open critical or high alerts in 2 repositories, 1 of them critical. The oldest has been open 30 days.");
+  const undated = run(health({ alerts: { "me/app": { open: [alert("high", null)], more: false } } })).items.find((s) => s.id === "fix-dependabot-alerts");
+  assert.equal(undated.seen, "1 open critical or high alert in 1 repository.", "no age when none is known");
+  assert.deepEqual(fix.targets, ["me/private: 1 critical, 1 high, and more past the first 100", "me/app: 0 critical, 1 high"]);
   assert.deepEqual(fix.metric, { label: "Open critical and high Dependabot alerts", value: 3, unit: "count" });
   assert.deepEqual(fix.reading, ["gh-dependabot-alerts", "gh-dependabot-updates"]);
 

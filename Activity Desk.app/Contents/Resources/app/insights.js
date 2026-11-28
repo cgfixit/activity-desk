@@ -2147,15 +2147,19 @@ const SUGGESTION_RULES = [
       if (!health.alertsRead) {
         return { unavailable: health.alertsOff ? `Dependabot alerts are off in the ${plural(health.alertsOff, "repository", "repositories")} checked.` : "Dependabot alerts did not load for any repository." };
       }
-      const hit = health.rows.filter((r) => r.alerts?.serious).sort((a, b) => b.alerts.serious - a.alerts.serious || b.alerts.oldestDays - a.alerts.oldestDays);
+      const hit = health.rows.filter((r) => r.alerts?.serious).sort((a, b) => b.alerts.serious - a.alerts.serious || (b.alerts.oldestDays ?? 0) - (a.alerts.oldestDays ?? 0));
       if (!hit.length) return null;
       const serious = sum(hit.map((r) => r.alerts.serious));
       const critical = sum(hit.map((r) => r.alerts.critical));
+      // GitHub lists the newest alerts first, so past 100 the count is a floor and the oldest is unseen.
+      const capped = hit.some((r) => r.alerts.more);
+      const ages = hit.map((r) => r.alerts.oldestDays).filter((d) => d != null);
+      const age = !capped && ages.length ? ` The oldest has been open ${durationLabel(Math.max(...ages) * 24)}.` : "";
       return {
         tone: "warn",
         basis: `open alerts in ${plural(health.alertsRead, "repository", "repositories")}`,
-        targets: hit.slice(0, SUGGEST_TARGETS).map((r) => ref(`${r.repo}: ${r.alerts.critical} critical, ${r.alerts.high} high${r.alerts.more ? ", and more than 100 open alerts in all" : ""}`, r.repo)),
-        seen: `${plural(serious, "open critical or high alert")} in ${plural(hit.length, "repository", "repositories")}${critical ? `, ${critical} of them critical` : ""}. The oldest has been open ${durationLabel(Math.max(...hit.map((r) => r.alerts.oldestDays)) * 24)}.`,
+        targets: hit.slice(0, SUGGEST_TARGETS).map((r) => ref(`${r.repo}: ${r.alerts.critical} critical, ${r.alerts.high} high${r.alerts.more ? ", and more past the first 100" : ""}`, r.repo)),
+        seen: `${capped ? "At least " : ""}${plural(serious, "open critical or high alert")} in ${plural(hit.length, "repository", "repositories")}${critical ? `, ${critical} of them critical` : ""}.${age}`,
         why: [["Dependabot alerts help you find and fix vulnerable dependencies before they become security risks.", "gh-dependabot-alerts"]],
         act: [["Start in each repository's Security tab with critical alerts. With Dependabot security updates turned on, Dependabot tries to open a pull request for every open alert that has a patch.", "gh-dependabot-updates"]],
       };
@@ -2608,7 +2612,7 @@ function summarizeRepoHealth(health, now) {
       alerts = {
         open: a.open.length, more: Boolean(a.more), serious: serious.length,
         critical: serious.filter((x) => x.severity === "critical").length, high: serious.filter((x) => x.severity === "high").length,
-        oldestDays: ages.length ? Math.max(...ages) : 0,
+        oldestDays: ages.length ? Math.max(...ages) : null,
       };
     }
     return { repo, isPublic, alerts, off: health.off.includes(repo), profile: health.profiles[repo] || null };

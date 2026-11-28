@@ -411,8 +411,13 @@ async function loadRepoHealth(account, repos) {
         await readAlerts(repo);
       } catch (error) {
         if (error.message === "Session changed.") throw error;
-        health.denied = error.message;
-        return;
+        // Only a refusal says the token cannot read alerts. A timeout or server error is this repository's.
+        if ([401, 403, 404].includes(error.status)) {
+          health.denied = error.message;
+          return;
+        }
+        health.issues.push(`${repo} alerts: ${error.message}`);
+        continue;
       }
       if (health.alerts[repo]) break;
     }

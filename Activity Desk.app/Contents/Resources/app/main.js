@@ -1143,7 +1143,8 @@ function githubRequest(operation, args) {
     }
     case "dependabotAlerts": {
       if (!validRepo(args?.repo)) break;
-      return { route: `/repos/${args.repo}/dependabot/alerts?state=open&per_page=100` };
+      // Only the severities the suggestion acts on, so the 100 per page caps those and not low alerts.
+      return { route: `/repos/${args.repo}/dependabot/alerts?state=open&severity=critical,high&per_page=100` };
     }
     case "communityProfile": {
       if (!validRepo(args?.repo)) break;

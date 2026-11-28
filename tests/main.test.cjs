@@ -521,7 +521,7 @@ test("Dependabot alerts and community profiles are read-only, shaped in main, an
   const { invoke, calls } = await start(t, profile, (url, options) => {
     const who = bearer(options);
     if (isUser(url)) return Response.json({ id: 1, login: "fixture" });
-    if (url.endsWith("/repos/fixture/off/dependabot/alerts?state=open&per_page=100")) {
+    if (url.endsWith("/repos/fixture/off/dependabot/alerts?state=open&severity=critical,high&per_page=100")) {
       return Response.json({ message: "Dependabot alerts are disabled for this repository." }, { status: 403, headers: { "x-accepted-github-permissions": "vulnerability_alerts=read" } });
     }
     if (url.includes("/dependabot/alerts")) {
