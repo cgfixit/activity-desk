@@ -80,7 +80,6 @@ function setAside(name) {
   const profile = app.getPath("userData");
   const aside = `${name.replace(/\.enc$/, "")}-unreadable-${Date.now()}.enc`;
   fs.renameSync(path.join(profile, name), path.join(profile, aside));
-  trimAside(name);
   return aside;
 }
 const keptAs = (aside) => `The unreadable file was kept as ${aside} in the app's data folder for up to ${ASIDE_DAYS} days. Activity Desk tries it again each time it starts and joins it back in if it can be read.`;
