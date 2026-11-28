@@ -188,6 +188,7 @@ input[type="search"] { width: 180px; }
 .insight-nav button { color: var(--muted); font-size: 13px; padding: 6px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
 .insight-nav button:hover { color: var(--text); border-color: var(--muted); }
 .insight-nav button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 9%, var(--surface)); }
+.btn[data-events-level][aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 9%, var(--surface)); font-weight: 600; }
 #insights, .insight-section { display: grid; gap: 12px; min-width: 0; }
 .insight-heading h3 { font-size: 20px; margin: 0; letter-spacing: -.02em; }
 .insight-section .card h4 { margin: 0 0 8px; font-size: 15px; line-height: 1.35; }

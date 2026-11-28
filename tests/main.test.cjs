@@ -559,3 +559,65 @@ test("Dependabot alerts and community profiles are read-only, shaped in main, an
     files: { readme: true, license: false, contributing: false, code_of_conduct: false, issue_template: false, pull_request_template: false },
   });
 });
+
+test("set-aside copies are bounded, and one that decrypts again is joined back in and removed", async (t) => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "activity-desk-"));
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
+  const enc = (value) => `mock:${Buffer.from(JSON.stringify(value)).toString("base64")}`;
+  const now = Date.now();
+  // Four unreadable copies, one of them older than 90 days, plus one that decrypts now.
+  for (const [i, age] of [[1, 1], [2, 2], [3, 3], [4, 200]].entries()) fs.writeFileSync(path.join(profile, `notes-unreadable-${now - age[1] * 864e5 - i}.enc`), "still unreadable");
+  const note = (id, text, updated) => ({ id, text, color: "yellow", pinned: false, created: "2026-01-01T00:00:00.000Z", updated });
+  const id = (n) => `0000000${n}-0000-4000-8000-000000000000`;
+  const readable = `notes-unreadable-${now - 5 * 864e5}.enc`;
+  fs.writeFileSync(path.join(profile, readable), enc({ version: 1, accounts: { 1: { login: "fixture", notes: [note(id(1), "recovered", "2026-02-01T00:00:00.000Z"), note(id(2), "older copy", "2026-01-02T00:00:00.000Z")] } } }));
+  fs.writeFileSync(path.join(profile, "notes.enc"), enc({ version: 1, accounts: { 1: { login: "fixture", notes: [note(id(2), "newer edit", "2026-03-01T00:00:00.000Z")] } } }));
+  const { invoke } = await start(t, profile);
+  await invoke("sign-in", token);
+  await invoke("github", "profile");
+  const notes = await invoke("notes");
+  assert.deepEqual(notes.notes.map((n) => n.text).sort(), ["newer edit", "recovered"], "joined by id, the later edit wins");
+  assert.match(notes.note, /set aside on \d{4}-\d{2}-\d{2} could be read again and was joined back in/);
+  const copies = fs.readdirSync(profile).filter((f) => f.startsWith("notes-unreadable-"));
+  assert.equal(copies.includes(readable), false, "the recovered copy is removed after the save");
+  assert.equal(copies.length, 3, "at most three copies, none older than 90 days");
+  assert.ok(copies.every((f) => now - Number(/(\d+)\.enc$/.exec(f)[1]) < 90 * 864e5));
+});
+
+test("saved events extend the feed for the signed-in account, follow their level, and stay closed without a token", async (t) => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "activity-desk-"));
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
+  const at = (minutes) => new Date(Date.now() - minutes * 6e4).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const event = (n, minutes) => ({ id: String(5000 + n), type: "PushEvent", created_at: at(minutes), public: true, repo: { name: "fixture/app" }, actor: { login: "fixture" },
+    payload: { ref: "refs/heads/main", head: "abc", url: "https://api.github.com/x", body: "x".repeat(30000) } });
+  let feed = [event(1, 10), event(2, 20)];
+  const { invoke } = await start(t, profile, (url) => {
+    if (isUser(url)) return Response.json({ id: 1, login: "fixture" });
+    if (url.includes("/users/fixture/events")) return Response.json(feed);
+    return new Response("[]");
+  });
+  assert.equal((await invoke("event-archive")).ok, false, "closed before sign-in");
+  await invoke("sign-in", token);
+  await invoke("github", "profile");
+  assert.equal((await invoke("github", "events", { login: "fixture", page: 1 })).ok, true);
+  // GitHub's feed later drops the older event; the saved one still covers it.
+  feed = [event(3, 1), event(1, 10)];
+  await invoke("github", "events", { login: "fixture", page: 1 });
+  const saved = await invoke("event-archive");
+  assert.deepEqual([saved.ok, saved.level, saved.count, saved.current.events.map((e) => e.id)], [true, "standard", 3, ["5003", "5001", "5002"]]);
+  assert.equal(saved.earlier.length, 0, "the second read overlapped the first, so there is no gap");
+  const kept = saved.current.events[0];
+  assert.equal(kept.payload.url, undefined, "API links are dropped");
+  assert.equal(kept.payload.body.length, 20000, "long text is bounded");
+  assert.doesNotMatch(fs.readFileSync(path.join(profile, "events.enc"), "utf8"), /PushEvent/, "saved encrypted");
+
+  assert.equal((await invoke("event-archive-level", "everything")).ok, false);
+  assert.equal((await invoke("event-archive-level", "extended")).level, "extended");
+  assert.equal((await invoke("event-archive")).limits.events, 15000);
+  fs.writeFileSync(path.join(profile, `events-unreadable-${Date.now()}.enc`), "x");
+  assert.equal((await invoke("event-archive-level", "off")).level, "off");
+  assert.deepEqual(fs.readdirSync(profile).filter((f) => f.startsWith("events")), [], "off deletes saved events and set-aside copies");
+  await invoke("github", "events", { login: "fixture", page: 1 });
+  assert.deepEqual([(await invoke("event-archive")).count, fs.existsSync(path.join(profile, "events.enc"))], [0, false], "nothing is saved while off");
+  assert.equal((await invoke("event-archive-level", "standard")).level, "standard");
+});

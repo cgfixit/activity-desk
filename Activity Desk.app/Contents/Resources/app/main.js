@@ -13,6 +13,7 @@ const TOKEN_PAGES = {
 const API = "https://api.github.com";
 // Suggestions cite sources from this catalogue. The renderer asks for a link by id only.
 const { READING } = require(path.join(__dirname, "insights.js"));
+const archive = require(path.join(__dirname, "archive.js"));
 const READING_HOSTS = new Set(["docs.github.com", "github.com", "google.github.io", "chaoss.community", "doi.org", "dora.dev"]);
 
 const DOCUMENT = pathToFileURL(path.join(__dirname, "index.html")).href;
@@ -53,15 +54,68 @@ async function writeEncrypted(name, text) {
   }
 }
 
-// Renames an unreadable encrypted file to <name>-unreadable-<time>.enc beside it, so a later save
-// cannot overwrite data that may decrypt again after a Keychain change. Returns the new name.
+// ---------- Files that cannot be read ----------
+// An encrypted file that cannot be decrypted, for example after a Keychain change, is renamed to
+// <name>-unreadable-<time>.enc beside it instead of being overwritten. Each later load tries those copies
+// again, and one that decrypts is joined into the current file and then removed, so data comes back on
+// its own when the key does. Copies are bounded: the newest ASIDE_KEEP of each file, for ASIDE_DAYS.
+const ASIDE_KEEP = 3;
+const ASIDE_DAYS = 90;
+
+function asideCopies(name) {
+  const pattern = new RegExp(`^${name.replace(/\.enc$/, "")}-unreadable-(\\d{1,16})\\.enc$`);
+  const files = fs.existsSync(app.getPath("userData")) ? fs.readdirSync(app.getPath("userData")) : [];
+  return files.map((file) => [file, pattern.exec(file)]).filter(([, m]) => m)
+    .map(([file, m]) => ({ file, at: Number(m[1]) })).sort((a, b) => b.at - a.at);
+}
+
+// Removes copies beyond the newest ASIDE_KEEP and those older than ASIDE_DAYS.
+function trimAside(name) {
+  for (const [i, copy] of asideCopies(name).entries()) {
+    if (i >= ASIDE_KEEP || Date.now() - copy.at > ASIDE_DAYS * 864e5) fs.rmSync(path.join(app.getPath("userData"), copy.file), { force: true });
+  }
+}
+
 function setAside(name) {
   const profile = app.getPath("userData");
   const aside = `${name.replace(/\.enc$/, "")}-unreadable-${Date.now()}.enc`;
   fs.renameSync(path.join(profile, name), path.join(profile, aside));
+  trimAside(name);
   return aside;
 }
-const keptAs = (aside) => `The unreadable file was kept as ${aside} in the app's data folder.`;
+const keptAs = (aside) => `The unreadable file was kept as ${aside} in the app's data folder for up to ${ASIDE_DAYS} days. Activity Desk tries it again each time it starts and joins it back in if it can be read.`;
+
+// The set-aside copies of a file that decrypt now and pass `valid`, newest first. Every copy is tried
+// before any is trimmed, so a copy that can be read again is never lost to the cap.
+async function readableAside(name, valid) {
+  const out = [];
+  for (const copy of asideCopies(name)) {
+    try {
+      const parsed = JSON.parse((await safeStorage.decryptStringAsync(fs.readFileSync(path.join(app.getPath("userData"), copy.file)))).result);
+      if (valid(parsed)) out.push({ ...copy, parsed });
+    } catch {
+      // Still unreadable. It stays until a later load can read it or it ages out.
+    }
+  }
+  return out;
+}
+
+// Joins readable set-aside copies into a store, saves it, and only then removes the copies. Joining is
+// by key, so a crash between the save and the removal joins the same copy again harmlessly.
+async function restoreAside(name, store, valid, join, what) {
+  const back = await readableAside(name, valid);
+  if (!back.length) {
+    trimAside(name);
+    return "";
+  }
+  for (const copy of back) join(store, copy.parsed);
+  await writeEncrypted(name, JSON.stringify(store));
+  for (const copy of back) fs.rmSync(path.join(app.getPath("userData"), copy.file), { force: true });
+  trimAside(name);
+  const dates = back.map((c) => new Date(c.at).toISOString().slice(0, 10));
+  return `${what} set aside on ${[...new Set(dates)].join(", ")} could be read again and was joined back in.`;
+}
+const validStore = (version) => (parsed) => parsed?.version === version && parsed.accounts && typeof parsed.accounts === "object";
 
 // ---------- Saved tokens ----------
 // Up to two tokens for one GitHub account, one per slot: a fine-grained personal access token and a
@@ -198,6 +252,7 @@ function resetSession() {
   sessionUser = null;
   publicUser = null;
   preferred.clear();
+  eventRuns = {};
 }
 
 // ---------- Saved history ----------
@@ -208,12 +263,12 @@ function resetSession() {
 // main process accepts only the known keys, as bounded numbers, under a week it works out itself.
 const HISTORY_FILE = "history.enc";
 const HISTORY_ON = "history-on"; // present only after the user turned saved history on
-const HISTORY_ASIDE = /^history-unreadable-\d+\.enc$/;
 const HISTORY_VERSION = 1;
 const HISTORY_DAYS = 400;
 const HISTORY_REPOS = 50;
 const HISTORY_REFERRERS = 50;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
+const REPO_KEY = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
 const REFERRER = /^[A-Za-z0-9.-]{1,100}$/;
 
 let sessionUser = null; // { id, login } from the profile read in this session
@@ -249,11 +304,33 @@ async function loadHistory() {
     } catch {
       parsed = null;
     }
-    if (parsed?.version === HISTORY_VERSION && parsed.accounts && typeof parsed.accounts === "object") store = parsed;
+    if (validStore(HISTORY_VERSION)(parsed)) store = parsed;
     else historyNote = `Saved history could not be read, so it started again. ${keptAs(setAside(HISTORY_FILE))}`;
   }
+  historyNote = await restoreAside(HISTORY_FILE, store, validStore(HISTORY_VERSION), joinHistory, "Saved history") || historyNote;
   history = store;
   return history;
+}
+
+// Adds what a recovered history holds and the current one lacks. The current file wins for any day,
+// repository, referrer, or week that both have, since it was read more recently.
+function joinHistory(into, from) {
+  for (const [key, account] of Object.entries(from.accounts)) {
+    if (!/^\d+$/.test(key) || !account || typeof account !== "object") continue;
+    const target = into.accounts[key] || (into.accounts[key] = { login: String(account.login || ""), repos: {} });
+    for (const [repo, entry] of Object.entries(account.repos || {})) {
+      if (!REPO_KEY.test(repo) || !entry || typeof entry !== "object") continue;
+      const mine = target.repos[repo] || (target.repos[repo] = { views: {}, clones: {}, counts: {}, referrers: {}, seen: "" });
+      for (const series of ["views", "clones", "counts", "referrers"]) {
+        for (const [k, v] of Object.entries(entry[series] || {})) if (!Object.hasOwn(mine[series], k)) mine[series][k] = v;
+      }
+      if (typeof entry.seen === "string" && entry.seen > mine.seen) mine.seen = entry.seen;
+    }
+    for (const [week, snap] of Object.entries(account.snapshots || {})) {
+      const clean = DAY.test(week) ? cleanSnapshot(snap) : null;
+      if (clean && !target.snapshots?.[week]) (target.snapshots || (target.snapshots = {}))[week] = clean;
+    }
+  }
 }
 
 function accountHistory(store, user) {
@@ -409,9 +486,7 @@ handle("history-setting", (enabled) => withHistory(async () => {
       historyNote = "";
       fs.rmSync(path.join(profile, HISTORY_FILE), { force: true });
       // Copies set aside because they could not be read hold history too.
-      for (const name of fs.readdirSync(profile)) {
-        if (HISTORY_ASIDE.test(name)) fs.rmSync(path.join(profile, name), { force: true });
-      }
+      for (const copy of asideCopies(HISTORY_FILE)) fs.rmSync(path.join(profile, copy.file), { force: true });
     }
     return { ok: true, enabled: historyEnabled() };
   } catch {
@@ -432,6 +507,138 @@ handle("clear-history", () => withHistory(async () => {
     return { ok: true };
   } catch {
     return { ok: false, error: "Saved history could not be removed. Try again." };
+  }
+}));
+
+// ---------- Saved events ----------
+// What each refresh read from GitHub's Events feed, kept per account so the dashboard can reach past the
+// feed's 300 events and 30 days. archive.js holds the rules; this part stores and serves them. It is on by
+// default at the standard level and can be turned off, which deletes it, or raised to the extended level.
+// Only the main process writes it, from feed responses it fetched itself for the signed-in account.
+const EVENTS_FILE = "events.enc";
+const EVENTS_LEVEL = "event-archive-level"; // absent: standard; otherwise "off" or "extended"
+const EVENTS_VERSION = 1;
+const EVENT_LEVELS = ["off", "standard", "extended"];
+let eventStore = null;
+let eventNote = "";
+let eventQueue = Promise.resolve();
+let eventTimer = null;
+let eventDirty = false;
+let eventRuns = {}; // account and token → the feed read in progress, see archive.pageCoverage
+
+function withEvents(operation) {
+  const pending = eventQueue.then(operation);
+  eventQueue = pending.catch(() => {});
+  return pending;
+}
+
+function eventLevel() {
+  const text = readIfPresent(path.join(app.getPath("userData"), EVENTS_LEVEL))?.toString("utf8").trim();
+  return text === "off" || text === "extended" ? text : "standard";
+}
+
+function cleanEventAccount(account) {
+  const out = archive.emptyAccount(typeof account?.login === "string" ? account.login : "");
+  archive.mergeAccount(out, account || {});
+  return out;
+}
+
+async function loadEventStore() {
+  if (eventStore) return eventStore;
+  const store = { version: EVENTS_VERSION, accounts: {} };
+  const encrypted = readIfPresent(path.join(app.getPath("userData"), EVENTS_FILE));
+  if (encrypted) {
+    let parsed = null;
+    try {
+      parsed = JSON.parse((await safeStorage.decryptStringAsync(encrypted)).result);
+    } catch {
+      parsed = null;
+    }
+    if (validStore(EVENTS_VERSION)(parsed)) {
+      for (const [key, account] of Object.entries(parsed.accounts)) if (/^\d+$/.test(key)) store.accounts[key] = cleanEventAccount(account);
+    } else {
+      eventNote = `Saved events could not be read, so saving started again. ${keptAs(setAside(EVENTS_FILE))}`;
+    }
+  }
+  eventNote = await restoreAside(EVENTS_FILE, store, validStore(EVENTS_VERSION), (into, from) => {
+    for (const [key, account] of Object.entries(from.accounts)) {
+      if (/^\d+$/.test(key)) archive.mergeAccount(into.accounts[key] || (into.accounts[key] = archive.emptyAccount(String(account?.login || ""))), account || {});
+    }
+  }, "Saved events") || eventNote;
+  eventStore = store;
+  return store;
+}
+
+async function saveEvents() {
+  clearTimeout(eventTimer);
+  if (!eventDirty || !eventStore) return;
+  const limits = archive.LEVELS[eventLevel()];
+  if (!limits) return;
+  for (const account of Object.values(eventStore.accounts)) archive.prune(account, limits, Date.now());
+  await writeEncrypted(EVENTS_FILE, JSON.stringify(eventStore));
+  eventDirty = false;
+}
+
+function scheduleEventSave() {
+  eventDirty = true;
+  clearTimeout(eventTimer);
+  eventTimer = setTimeout(() => withEvents(saveEvents).catch(() => {}), 400);
+}
+
+// Records one page of the signed-in account's own feed, sent at `readAt`. `slot` is the token the window
+// asked for, or undefined when the main process chose; `via` is the token that answered.
+function recordEvents(user, slot, via, args, events, more, readAt) {
+  return withEvents(async () => {
+    if (eventLevel() === "off" || !Array.isArray(events)) return;
+    const store = await loadEventStore();
+    const key = String(user.id);
+    const account = store.accounts[key] || (store.accounts[key] = archive.emptyAccount(user.login));
+    account.login = user.login;
+    if (archive.recordPage(account, eventRuns, `${key}:${slot || "any"}`, { page: args.page, events, more, readAt, via })) scheduleEventSave();
+  });
+}
+
+handle("event-archive", () => withEvents(async () => {
+  if (!sessionUser) return { ok: false, error: signInFirst() };
+  const level = eventLevel();
+  const limits = archive.LEVELS[level] || null;
+  try {
+    const store = level === "off" ? null : await loadEventStore();
+    if (store) {
+      eventDirty = true;
+      await saveEvents();
+    }
+    const file = readIfPresent(path.join(app.getPath("userData"), EVENTS_FILE));
+    return { ok: true, level, limits, levels: archive.LEVELS, ...archive.view(store?.accounts[String(sessionUser.id)]), bytes: file ? file.length : 0, note: eventNote };
+  } catch {
+    return { ok: false, level, error: "Saved events could not be read or saved." };
+  }
+}));
+
+// Off deletes saved events for every account on this Mac, including copies set aside as unreadable.
+// A lower level takes effect on the next save, which drops the oldest events beyond it.
+handle("event-archive-level", (level) => withEvents(async () => {
+  if (!sessionUser) return { ok: false, error: signInFirst() };
+  if (!EVENT_LEVELS.includes(level)) return { ok: false, error: "Invalid setting." };
+  const profile = app.getPath("userData");
+  try {
+    if (level === "standard") fs.rmSync(path.join(profile, EVENTS_LEVEL), { force: true });
+    else fs.writeFileSync(path.join(profile, EVENTS_LEVEL), level, { mode: 0o600 });
+    if (level === "off") {
+      clearTimeout(eventTimer);
+      eventDirty = false;
+      eventStore = null;
+      eventRuns = {};
+      eventNote = "";
+      fs.rmSync(path.join(profile, EVENTS_FILE), { force: true });
+      for (const copy of asideCopies(EVENTS_FILE)) fs.rmSync(path.join(profile, copy.file), { force: true });
+    } else if (eventStore) {
+      eventDirty = true;
+      await saveEvents();
+    }
+    return { ok: true, level: eventLevel() };
+  } catch {
+    return { ok: false, error: "The saved events setting could not be changed." };
   }
 }));
 
@@ -499,8 +706,23 @@ async function loadNotes() {
       notesNote = `Saved notes could not be read, so a new notebook started. ${keptAs(setAside(NOTES_FILE))}`;
     }
   }
+  notesNote = await restoreAside(NOTES_FILE, store, validStore(NOTES_VERSION), joinNotes, "A notebook") || notesNote;
   notesStore = store;
   return store;
+}
+
+// Adds recovered notes by id. When both copies have a note, the one edited later is kept.
+function joinNotes(into, from) {
+  for (const [key, account] of Object.entries(from.accounts)) {
+    if (!/^\d+$/.test(key) || !Array.isArray(account?.notes)) continue;
+    const target = into.accounts[key] || (into.accounts[key] = { login: typeof account.login === "string" ? account.login : "", notes: [] });
+    for (const note of account.notes.map(cleanNote).filter(Boolean)) {
+      const at = target.notes.findIndex((n) => n.id === note.id);
+      if (at < 0) target.notes.push(note);
+      else if (note.updated > target.notes[at].updated) target.notes[at] = note;
+    }
+    target.notes = target.notes.slice(0, NOTES_MAX);
+  }
 }
 
 const noteCopy = (n) => ({ id: n.id, text: n.text, color: n.color, pinned: n.pinned, created: n.created, updated: n.updated });
@@ -653,8 +875,22 @@ async function loadCards() {
       cardsNote = `Saved suggestion states could not be read, so every card starts fresh. ${keptAs(setAside(CARDS_FILE))}`;
     }
   }
+  cardsNote = await restoreAside(CARDS_FILE, store, validStore(CARDS_VERSION), joinCards, "Suggestion states") || cardsNote;
   cardsStore = store;
   return store;
+}
+
+// Adds recovered card states for cards the current file says nothing about.
+function joinCards(into, from) {
+  for (const [key, cards] of Object.entries(from.accounts)) {
+    if (!/^\d+$/.test(key) || !cards || typeof cards !== "object") continue;
+    const target = into.accounts[key] || (into.accounts[key] = {});
+    for (const [id, c] of Object.entries(cards)) {
+      if (Object.keys(target).length >= CARDS_MAX) break;
+      const card = !Object.hasOwn(target, id) && validCardId(id) ? cleanCard(c) : null;
+      if (card) target[id] = card;
+    }
+  }
 }
 
 handle("cards", () => withCards(async () => {
@@ -1306,6 +1542,7 @@ handle("github", async (operation, args, slot) => {
     let response;
     let via;
     let off = false;
+    const sentAt = Date.now();
     for (const [i, candidate] of order.entries()) {
       via = candidate;
       response = await fetch(API + request.route, {
@@ -1337,6 +1574,9 @@ handle("github", async (operation, args, slot) => {
     if (user && !credential.signal.aborted && (operation === "ownedRepos" ||
         (operation === "traffic" && args.repo.toLowerCase().startsWith(`${user.login.toLowerCase()}/`)))) {
       await recordHistory(user, operation, args, JSON.parse(body)).catch(() => {});
+    }
+    if (user && !credential.signal.aborted && operation === "events" && args.login.toLowerCase() === user.login.toLowerCase()) {
+      await recordEvents(user, slot, via, args, JSON.parse(body), /rel="next"/.test(response.headers.get("link") || ""), sentAt).catch(() => {});
     }
     return {
       ok: true,
@@ -1378,7 +1618,7 @@ app.on("will-quit", (event) => {
     for (let pass = 0; pass < 20; pass += 1) {
       const notes = notesQueue;
       const cards = cardsQueue;
-      await Promise.allSettled([notes, cards, withHistory(saveHistory)]);
+      await Promise.allSettled([notes, cards, withHistory(saveHistory), withEvents(saveEvents)]);
       await new Promise((resolve) => setTimeout(resolve, 25));
       if (notes === notesQueue && cards === cardsQueue) break;
     }
