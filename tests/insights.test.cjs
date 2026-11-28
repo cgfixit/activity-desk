@@ -766,3 +766,68 @@ test("reads public search records as unknown where search has no reviews, sizes,
     assert.match(c.detail, /^Needs a token\./, id);
   }
 });
+
+test("notifications that name you and watched-repository noise each need their minimum before a card", () => {
+  const now = "2026-11-28T12:00:00Z";
+  const item = (reason, at, repo = "me/app", n = 7) => ({ unread: true, reason, updated_at: at, repository: { full_name: repo }, subject: { title: `Thread ${n}`, url: `https://api.github.com/repos/${repo}/issues/${n}` } });
+  const old = "2026-11-20T12:00:00Z";
+  const fresh = "2026-11-28T06:00:00Z";
+  const run = (items) => {
+    const notes = insights.summarizeNotifications(items);
+    return insights.deriveSuggestions({ login: "me", now, notes });
+  };
+  const card = (result, id) => result.items.find((s) => s.id === id);
+  const status = (result, id) => result.checked.find((c) => c.id === id).status;
+
+  // One old mention is below the minimum; a fresh mention and a review request do not count.
+  const few = run([item("mention", old), item("mention", fresh), item("review_requested", old)]);
+  assert.equal(status(few, "answer-direct-asks"), "clear");
+  const asks = card(run([item("mention", old, "me/app", 3), item("assign", "2026-11-10T12:00:00Z", "me/lib", 9), item("review_requested", old)]), "answer-direct-asks");
+  assert.equal(asks.tone, "warn");
+  assert.match(asks.seen, /^2 unread notifications that name you .*: 1 @mention, 1 assignment\.$/);
+  assert.deepEqual(asks.refs[0], { repo: "me/lib", number: 9 }, "oldest first, linked to its issue");
+  assert.deepEqual(asks.reading, ["gh-inbox-filters"]);
+  assert.equal(asks.metric.value, 2);
+
+  const watching = (k) => Array.from({ length: 10 }, (_, i) => item(i < k ? "subscribed" : "comment", fresh, i < 3 ? "big/one" : "big/two", i + 1));
+  assert.equal(status(run(watching(10).slice(0, 9)), "trim-watched-repos"), "short");
+  assert.equal(status(run(watching(4)), "trim-watched-repos"), "clear");
+  const trim = card(run(watching(6)), "trim-watched-repos");
+  assert.equal(trim.seen, "6 of 10 unread notifications come from repositories you watch, not from threads you took part in.");
+  assert.deepEqual(trim.targets, ["big/one: 3 unread notifications from watching", "big/two: 3 unread notifications from watching"], "ties sort by name");
+  assert.deepEqual(trim.reading, ["gh-subscriptions", "gh-unwatch"]);
+});
+
+test("Dependabot and community-profile cards read only what loaded and say why a source is missing", () => {
+  const now = "2026-11-28T00:00:00Z";
+  const repos = [{ repo: "me/app", isPublic: true }, { repo: "me/private", isPublic: false }, { repo: "me/off", isPublic: true }];
+  const health = (over = {}) => insights.summarizeRepoHealth({ repos, alerts: {}, off: [], profiles: {}, denied: "", issues: [], ...over }, now);
+  const run = (h) => insights.deriveSuggestions({ login: "me", now, health: h });
+  const checked = (r, id) => r.checked.find((c) => c.id === id);
+
+  assert.equal(checked(run(null), "fix-dependabot-alerts").status, "unavailable");
+  assert.match(checked(run(health({ denied: "GitHub denied the request." })), "fix-dependabot-alerts").detail, /denied/);
+  assert.equal(checked(run(health({ off: ["me/off"] })), "fix-dependabot-alerts").detail, "Dependabot alerts are off in the 1 repository checked.");
+  const alert = (severity, at = "2026-10-29T00:00:00Z") => ({ number: 1, severity, created_at: at, package: "x", runtime: true });
+  assert.equal(checked(run(health({ alerts: { "me/app": { open: [alert("low"), alert("medium")], more: false } } })), "fix-dependabot-alerts").status, "clear");
+  const fix = run(health({ off: ["me/off"], alerts: {
+    "me/app": { open: [alert("high")], more: false },
+    "me/private": { open: [alert("critical"), alert("high", "2026-11-27T00:00:00Z"), alert("low")], more: true },
+  } })).items.find((s) => s.id === "fix-dependabot-alerts");
+  assert.equal(fix.tone, "warn");
+  assert.equal(fix.seen, "3 open critical or high alerts in 2 repositories, 1 of them critical. The oldest has been open 30 days.");
+  assert.deepEqual(fix.targets, ["me/private: 1 critical, 1 high, and more than 100 open alerts in all", "me/app: 0 critical, 1 high"]);
+  assert.deepEqual(fix.metric, { label: "Open critical and high Dependabot alerts", value: 3, unit: "count" });
+  assert.deepEqual(fix.reading, ["gh-dependabot-alerts", "gh-dependabot-updates"]);
+
+  const files = (license, contributing) => ({ health: 50, description: true, files: { readme: true, license, contributing, code_of_conduct: false, issue_template: false, pull_request_template: false } });
+  assert.equal(checked(run(health({ repos: [{ repo: "me/private", isPublic: false }] })), "add-community-files").detail, "None of the repositories checked are public.");
+  assert.equal(checked(run(health({ profiles: { "me/app": files(true, true) } })), "add-community-files").status, "clear");
+  const community = run(health({ profiles: { "me/app": files(false, true), "me/off": files(false, false) } })).items.find((s) => s.id === "add-community-files");
+  assert.equal(community.seen, "2 of 2 public repositories have no license; 1 of 2 public repositories has no contributing guide.");
+  assert.equal(community.targets[0], "me/off: no license or contributing guide, community profile 50%");
+  assert.deepEqual(community.reading, ["gh-license", "gh-contributing", "gh-community-profile"]);
+  // A rule cites only sources the main process can open.
+  for (const id of community.reading.concat(fix.reading)) assert.match(insights.READING[id].url, /^https:\/\/docs\.github\.com\//);
+  assert.equal(insights.deriveSuggestions({ publicView: true }).checked.find((c) => c.id === "fix-dependabot-alerts").detail, "Needs a token. Dependabot alerts are never public.");
+});
