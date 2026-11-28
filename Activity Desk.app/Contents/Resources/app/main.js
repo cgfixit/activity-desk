@@ -598,8 +598,9 @@ function recordEvents(user, slot, via, args, events, more, readAt) {
   });
 }
 
-handle("event-archive", () => withEvents(async () => {
+handle("event-archive", (feedReads = []) => withEvents(async () => {
   if (!sessionUser) return { ok: false, error: signInFirst() };
+  if (!Array.isArray(feedReads) || feedReads.length > SLOTS.length || !feedReads.every(Number.isSafeInteger)) return { ok: false, error: "Invalid feed read times." };
   const level = eventLevel();
   const limits = archive.LEVELS[level] || null;
   try {
@@ -609,7 +610,7 @@ handle("event-archive", () => withEvents(async () => {
       await saveEvents();
     }
     const file = readIfPresent(path.join(app.getPath("userData"), EVENTS_FILE));
-    return { ok: true, level, limits, levels: archive.LEVELS, ...archive.view(store?.accounts[String(sessionUser.id)]), bytes: file ? file.length : 0, note: eventNote };
+    return { ok: true, level, limits, levels: archive.LEVELS, ...archive.view(store?.accounts[String(sessionUser.id)], feedReads), bytes: file ? file.length : 0, note: eventNote };
   } catch {
     return { ok: false, level, error: "Saved events could not be read or saved." };
   }
@@ -1583,6 +1584,7 @@ handle("github", async (operation, args, slot) => {
       status: response.status,
       body,
       link: response.headers.get("link"),
+      ...(operation === "events" && args.page === 1 && { feedReadAt: sentAt }),
       remaining: response.headers.get("x-ratelimit-remaining"),
       token,
       via,

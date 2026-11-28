@@ -203,7 +203,7 @@ async function api(account, operation, args, slot) {
     })[result.status] || `GitHub returned HTTP ${result.status}.`) + need;
     throw Object.assign(new Error(detail), { status: result.status, disabled: Boolean(result.disabled) });
   }
-  return { data: JSON.parse(result.body || "null"), more: /rel="next"/.test(result.link || ""), via: result.via };
+  return { data: JSON.parse(result.body || "null"), more: /rel="next"/.test(result.link || ""), via: result.via, feedReadAt: result.feedReadAt };
 }
 
 // Token metadata from response headers, kept per saved token: expiry, classic scopes, the permissions
@@ -228,19 +228,21 @@ function recordToken(account, operation, result) {
 
 async function loadEvents(account, login, slot) {
   const events = [];
+  const feedReads = [];
   let more = false;
   for (let page = 1; page <= EVENT_PAGES; page += 1) {
     try {
       const result = await api(account, "events", { login, page }, slot);
       if (!Array.isArray(result.data)) throw new Error("Unexpected events response.");
+      if (page === 1 && Number.isSafeInteger(result.feedReadAt)) feedReads.push(result.feedReadAt);
       events.push(...result.data);
       more = result.more;
       if (!more) break;
     } catch (error) {
-      return { events, issue: `Events page ${page} did not load. ${error.message}` };
+      return { events, feedReads, issue: `Events page ${page} did not load. ${error.message}` };
     }
   }
-  return { events, issue: more || events.length >= 300 ? "The feed reached the 300-event limit." : "" };
+  return { events, feedReads, issue: more || events.length >= 300 ? "The feed reached the 300-event limit." : "" };
 }
 
 // With two tokens, each reads the feed and the pages are joined by event id, since a token only
@@ -251,7 +253,7 @@ async function loadAllEvents(account, login) {
   const { events, only } = I.mergeTokenEvents(loads);
   const same = loads.every((l) => l.issue === loads[0].issue);
   const issue = same ? loads[0].issue : loads.filter((l) => l.issue).map((l) => `With the ${l.slot} token: ${l.issue}`).join(" ");
-  return { events, issue, only };
+  return { events, issue, only, feedReads: loads.flatMap((l) => l.feedReads) };
 }
 
 // Details for pull requests referenced in events. With two tokens, those the first token could not
@@ -698,7 +700,7 @@ async function refresh() {
     if (account !== state) return;
     // The main process saved this feed as it arrived. Its saved span that reaches now joins the feed;
     // earlier spans are separated by a period nobody read, so they stay out of the summaries.
-    const saved = await window.desk.eventArchive().catch(() => null);
+    const saved = await window.desk.eventArchive(feed.feedReads).catch(() => null);
     if (account !== state) return;
     const kept = saved?.ok && saved.current ? saved.current.events : [];
     const events = [...new Map([...kept, ...feed.events].map((e) => [e.id, e])).values()]

@@ -159,14 +159,19 @@ function mergeAccount(into, from) {
 // What the window receives: the span that reaches the latest read and its events, plus a count for each
 // earlier span. Events outside every span are kept but not shown, since nothing says what is missing
 // around them.
-function view(account) {
+function view(account, feedReads) {
   const spans = account?.spans || [];
   const events = Object.values(account?.events || {});
   const inSpan = ([a, b]) => events.filter((e) => timeOf(e) >= a && timeOf(e) <= b);
   const last = spans.at(-1);
+  // A failed first page or a capped page with no complete seconds can leave an old span last.
+  const connected = last && feedReads.some((ms) => {
+    const end = secondOf(ms) - 1;
+    return last[0] <= end && end <= last[1];
+  });
   return {
-    current: last ? { from: last[0], to: last[1], events: inSpan(last).sort((x, y) => timeOf(y) - timeOf(x)) } : null,
-    earlier: spans.slice(0, -1).map((s) => ({ from: s[0], to: s[1], count: inSpan(s).length })).reverse(),
+    current: connected ? { from: last[0], to: last[1], events: inSpan(last).sort((x, y) => timeOf(y) - timeOf(x)) } : null,
+    earlier: (connected ? spans.slice(0, -1) : spans).map((s) => ({ from: s[0], to: s[1], count: inSpan(s).length })).reverse(),
     count: events.length,
   };
 }

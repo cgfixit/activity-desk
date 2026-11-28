@@ -176,4 +176,16 @@ for (const [name, edit] of Object.entries(MUTATIONS)) {
   });
 }
 
+test("only a span connected to this refresh supplies current events", () => {
+  function selections(A) {
+    const account = A.emptyAccount("me");
+    account.spans = [[1000, 2999]];
+    return [[], [3000], [3999, 5000], [1000], [4000]].map((reads) => Boolean(A.view(account, reads).current));
+  }
+  const expected = [false, true, true, false, false];
+  assert.deepEqual(selections(load()), expected);
+  const stale = load(["return last[0] <= end && end <= last[1];", "return true;"]);
+  assert.notDeepEqual(selections(stale), expected);
+});
+
 module.exports = { check, load, run, STEPS, apply, makeWorld, feedAt };

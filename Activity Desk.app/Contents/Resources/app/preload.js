@@ -19,6 +19,6 @@ contextBridge.exposeInMainWorld("desk", {
   deleteNote: (id) => ipcRenderer.invoke("desk:note-delete", id),
   cards: () => ipcRenderer.invoke("desk:cards"),
   setCard: (id, state) => ipcRenderer.invoke("desk:card-set", id, state),
-  eventArchive: () => ipcRenderer.invoke("desk:event-archive"),
+  eventArchive: (feedReads) => ipcRenderer.invoke("desk:event-archive", feedReads),
   setEventArchive: (level) => ipcRenderer.invoke("desk:event-archive-level", level),
 });
