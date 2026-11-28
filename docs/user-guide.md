@@ -162,9 +162,17 @@ A suggestion appears only when its sample is large enough. **What was checked** 
 | Leave yourself a next step before a break | An active day is followed by another active day at least 30 points more often than an idle day is. Needs at least 10 days after active days and 10 after idle days. | Parnin and Rugaber, Software Quality Journal 2011 |
 | Review late-night changes the next day | At least 15% of 20 or more loaded events, and at least 5, happened between midnight and 4am local time. | Eyolfson et al., Empirical Software Engineering 2014 |
 | Get Actions notifications only for failures | At least 40% of 10 or more unread notifications are routine CI updates. Needs a classic token with `notifications`. Only the first page of 50 is read, and the card says so when there are more. | GitHub Docs on Actions notifications |
+| Clear the notifications that name you | 2 or more unread notifications that @mention you, mention your team, or assign you to something have waited more than 2 days. Review requests are left to **Answer other people's pull requests within a day**. **Where** lists the oldest first. Needs a classic token with `notifications`. | GitHub Docs on inbox filters |
+| Unwatch the repositories that fill your inbox | Half or more of 10 or more unread notifications come from repositories you watch rather than threads you took part in. **Where** names the repositories with the most. | GitHub Docs on viewing and managing subscriptions |
 | Use labels instead of title prefixes | 3 or more issues you opened in the loaded events start with a bracketed tag such as `[bug]`. | GitHub Docs on filtering and issue forms |
 | Make the README's first screen do the work | A repository you own had 20 or more unique visitors in 14 days and no new stars, by star dates. | GitHub Docs on READMEs, topics, and social previews |
+| Fix critical and high Dependabot alerts first | One or more open critical or high Dependabot alerts in the repositories Footprint reads. Repositories with alerts turned off are counted apart, never as clean. | GitHub Docs on Dependabot alerts and security updates |
+| Add a license and a contributing guide | One or more public repositories that Footprint reads have no license or no contributing guide in their community profile. | GitHub Docs on licensing, contributing guidelines, and community profiles |
 | Switch to a read-only fine-grained token | The signed-in classic token has a scope that allows writes. | GitHub Docs on personal access tokens |
+
+![A Dependabot suggestion for a fictional account, naming the repositories with critical and high alerts](screenshots/suggestions-dependabot.png)
+
+![An inbox suggestion listing the oldest unread notifications that name the user](screenshots/suggestions-inbox.png)
 
 Pull request suggestions use the pull requests you opened in the last 90 days plus those referenced in recent events. **Split large pull requests** and **Review agent branches like a colleague's work** use every loaded pull request, the same as **Merge patterns**. Agent branches are matched by prefix such as `claude/` or `codex/`. Late-night and session suggestions use events, not commits. Events can lag, and the feed holds at most 300.
 
@@ -188,6 +196,8 @@ Pull request suggestions use the pull requests you opened in the last 90 days pl
 | [Review requests](https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests#search-by-pull-request-review-status-and-reviewer) | Up to 50 open pull requests that ask you for a review, by name or through a team, oldest first, each with its latest 10 review-request events. |
 | [Conversations](https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests#search-by-a-user-thats-involved-in-an-issue-or-pull-request) | Up to 25 issues and 25 pull requests that involve you and were updated in the last 30 days. Each shows its latest 10 comments, latest 10 reviews, and up to 5 review comments per review. |
 | [Unread notifications](https://docs.github.com/en/rest/activity/notifications) | The first page of up to 50 unread notifications. GitHub serves them only to a classic token. |
+| [Dependabot alerts](https://docs.github.com/en/rest/dependabot/alerts) | Up to 100 open critical and high alerts each for the same 10 repositories as traffic, newest first, with severity, age, and package name. Past 100, the card gives the count as a floor and leaves out the oldest age. A fine-grained token needs **Dependabot alerts: read**. A classic token needs `security_events`, or `public_repo` for public repositories, and both of those scopes also allow writes. |
+| [Community profiles](https://docs.github.com/en/rest/metrics/community) | Which recommended files, such as a license or contributing guide, each public repository among those 10 has. A fine-grained token needs **Contents: read** for private data, but public profiles need no permission. |
 
 Push counts describe the reported refs, including branches named `main` or `master`, other branches, and tags. A branch name alone cannot establish default-branch status or whether a push bypassed review. Agent signals are estimates based on known app slugs and branch prefixes.
 
@@ -203,7 +213,9 @@ Before saving, Activity Desk asks GitHub who owns the new token and who owns the
 | Recent events, pull requests you opened, pull requests you reviewed, review requests, conversations | Both. The results are joined, and **Data & access** says how many items only one token returned. A fine-grained token sees one account or organization, and a classic token sees what its scopes allow, so the joined list can include organization or private work the fine-grained token cannot reach. |
 | Contribution year and contribution history | Both read the year. Activity Desk keeps the read that hides fewer contributions and uses the same token for the history. |
 | Other pull requests in events, last-commit times | The fine-grained token first. Pull requests it cannot read are asked for again with the classic token. |
-| Profile, repository list, repository traffic, star dates, rate limit | The fine-grained token first. When GitHub denies it, the classic token answers and goes first for that source until you sign out or change tokens. A rate-limited request is not repeated, because both tokens share the account's limit. |
+| Profile, repository list, repository traffic, star dates, Dependabot alerts, community profiles, rate limit | The fine-grained token first. When GitHub denies it, the classic token answers and goes first for that source until you sign out or change tokens. A rate-limited request is not repeated, because both tokens share the account's limit. Dependabot alerts turned off for a repository are a repository setting, so the other token is not tried. |
+
+![Token check for a fictional account: the fine-grained token was denied Dependabot alerts and the classic token answered them](screenshots/two-token-check.png)
 
 Reading with both tokens roughly doubles the requests for the joined sources. **Rate-limit budget** shows what a refresh used.
 
@@ -267,7 +279,7 @@ When nothing applies, it says so.
 
 - **Expires** shows the expiry date when GitHub sends one. Overview warns 14 days before it and names the token.
 - **Scopes** lists a classic token's scopes. Overview warns when a scope such as `repo` allows writes. Activity Desk only sends allowlisted reads, but a narrower token limits what a leaked copy could do: a read-only fine-grained token, or beside one, a classic token with only `notifications`.
-- **Answered this refresh** lists the sources each token returned, so you can see which token a number came from.
+- **Answered this refresh** lists the sources each token returned, so you can see which token a number came from. With two tokens, **What these tokens can see** also says which token answered Dependabot alerts and community profiles.
 - When a REST request is denied, the card names the permission GitHub lists for it in the `X-Accepted-GitHub-Permissions` header, under the token that was denied. GraphQL sources report missing access as partial results under **What this token can see** instead.
 - Overview warns when GitHub rejects a saved token while the other one still works.
 

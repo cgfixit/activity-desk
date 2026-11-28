@@ -1141,6 +1141,15 @@ function githubRequest(operation, args) {
       if (!validRepo(args?.repo)) break;
       return { route: `/repos/${args.repo}/stargazers?per_page=100`, accept: "application/vnd.github.star+json" };
     }
+    case "dependabotAlerts": {
+      if (!validRepo(args?.repo)) break;
+      // Only the severities the suggestion acts on, so the 100 per page caps those and not low alerts.
+      return { route: `/repos/${args.repo}/dependabot/alerts?state=open&severity=critical,high&per_page=100` };
+    }
+    case "communityProfile": {
+      if (!validRepo(args?.repo)) break;
+      return { route: `/repos/${args.repo}/community/profile` };
+    }
     case "profile": return { route: "/user" };
     case "notifications": return { route: "/notifications?all=false&per_page=50" };
     case "year": return { route: "/graphql", body: { query: YEAR_QUERY } };
@@ -1203,6 +1212,11 @@ function tokenOrder(operation, tokens, slot) {
   return SLOTS.filter((s) => tokens[s]).sort((a, b) => (b === first) - (a === first));
 }
 
+// Dependabot answers 403 both when a token lacks the permission and when alerts are off for the
+// repository. Alerts being off is a repository setting, so no other token is tried for it.
+const alertsOff = async (operation, response) => operation === "dependabotAlerts" && response.status === 403 &&
+  /disabled/i.test(await response.clone().text().catch(() => ""));
+
 const rateLimited = (response) => response.headers.get("x-ratelimit-remaining") === "0" || response.headers.has("retry-after");
 const denied = (response) => response.status === 401 || ((response.status === 403 || response.status === 404) && !rateLimited(response));
 
@@ -1214,6 +1228,10 @@ const tokenInfo = (response) => ({
   expires: response.headers.get("github-authentication-token-expiration"),
 });
 
+const SEVERITIES = ["critical", "high", "medium", "low"];
+const COMMUNITY_FILES = ["readme", "license", "contributing", "code_of_conduct", "issue_template", "pull_request_template"];
+const shortText = (v, n) => (typeof v === "string" ? v.slice(0, n) : "");
+
 // Reduces a response to the fields the renderer uses, the same way with or without a token.
 // `search` keeps the search limit too, which only the public view spends.
 function shapeBody(operation, body, { search = false } = {}) {
@@ -1223,6 +1241,25 @@ function shapeBody(operation, body, { search = false } = {}) {
       full_name: r.full_name, private: Boolean(r.private), fork: Boolean(r.fork), archived: Boolean(r.archived),
       stargazers_count: r.stargazers_count, forks_count: r.forks_count, pushed_at: r.pushed_at,
     })));
+  }
+  if (operation === "dependabotAlerts") {
+    const alerts = JSON.parse(body);
+    return JSON.stringify((Array.isArray(alerts) ? alerts : []).filter((a) => a?.state === "open").map((a) => {
+      const severity = [a.security_vulnerability?.severity, a.security_advisory?.severity].find((v) => SEVERITIES.includes(v));
+      return {
+        number: Number.isInteger(a.number) ? a.number : null, severity: severity || "unknown",
+        created_at: typeof a.created_at === "string" ? a.created_at : null,
+        package: shortText(a.dependency?.package?.name, 100), runtime: a.dependency?.scope !== "development",
+      };
+    }));
+  }
+  if (operation === "communityProfile") {
+    const p = JSON.parse(body) || {};
+    const files = p.files && typeof p.files === "object" ? p.files : {};
+    return JSON.stringify({
+      health: Number.isFinite(p.health_percentage) ? p.health_percentage : null, description: Boolean(p.description),
+      files: Object.fromEntries(COMMUNITY_FILES.map((k) => [k, Boolean(files[k])])),
+    });
   }
   if (operation === "stargazers") {
     const stars = JSON.parse(body);
@@ -1268,6 +1305,7 @@ handle("github", async (operation, args, slot) => {
     const skipped = [];
     let response;
     let via;
+    let off = false;
     for (const [i, candidate] of order.entries()) {
       via = candidate;
       response = await fetch(API + request.route, {
@@ -1277,14 +1315,15 @@ handle("github", async (operation, args, slot) => {
         redirect: "error",
         signal: AbortSignal.any([credential.signal, AbortSignal.timeout(30000)]),
       });
-      if (response.ok || i === order.length - 1 || !denied(response)) break;
+      if (response.ok || i === order.length - 1 || !denied(response) || (off = await alertsOff(operation, response))) break;
       skipped.push({ slot: candidate, status: response.status, token: tokenInfo(response) });
       await response.body?.cancel();
     }
     const token = tokenInfo(response);
     if (!response.ok) {
-      await response.body?.cancel();
-      return { ok: false, status: response.status, remaining: response.headers.get("x-ratelimit-remaining"), token, via, skipped };
+      off ||= await alertsOff(operation, response);
+      await response.body?.cancel().catch(() => {});
+      return { ok: false, status: response.status, remaining: response.headers.get("x-ratelimit-remaining"), token, via, skipped, ...(off && { disabled: true }) };
     }
     if (skipped.length) preferred.set(operation, via);
     let body = await response.text();

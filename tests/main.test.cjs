@@ -509,3 +509,53 @@ test("the public view sends no credential, reads only public routes for one user
   assert.equal((await invoke("sign-out")).ok, true);
   assert.deepEqual([(await invoke("status")).publicLogin, fs.existsSync(path.join(profile, "public-user"))], [null, false]);
 });
+
+test("Dependabot alerts and community profiles are read-only, shaped in main, and alerts turned off stop the token fallback", async (t) => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "activity-desk-"));
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
+  const alert = (number, severity, state = "open") => ({
+    number, state, created_at: "2026-11-01T00:00:00Z", html_url: "https://github.com/fixture/app/security/dependabot/1",
+    dependency: { package: { ecosystem: "npm", name: `pkg-${number}` }, scope: number === 2 ? "development" : "runtime" },
+    security_advisory: { severity, summary: "fixture advisory text that stays in main" }, security_vulnerability: { severity },
+  });
+  const { invoke, calls } = await start(t, profile, (url, options) => {
+    const who = bearer(options);
+    if (isUser(url)) return Response.json({ id: 1, login: "fixture" });
+    if (url.endsWith("/repos/fixture/off/dependabot/alerts?state=open&severity=critical,high&per_page=100")) {
+      return Response.json({ message: "Dependabot alerts are disabled for this repository." }, { status: 403, headers: { "x-accepted-github-permissions": "vulnerability_alerts=read" } });
+    }
+    if (url.includes("/dependabot/alerts")) {
+      if (who === fineGrained) return new Response("{}", { status: 403, headers: { "x-accepted-github-permissions": "vulnerability_alerts=read" } });
+      return Response.json([alert(1, "critical"), alert(2, "low"), alert(3, "high", "fixed")]);
+    }
+    if (url.endsWith("/community/profile")) {
+      return Response.json({ health_percentage: 42, description: "A fixture", files: { readme: { html_url: "x" }, license: null, contributing: null, code_of_conduct: null } });
+    }
+    return new Response("[]");
+  });
+  assert.equal((await invoke("sign-in", fineGrained)).ok, true);
+  assert.equal((await invoke("sign-in", token)).ok, true);
+  calls.length = 0;
+  assert.equal((await invoke("github", "dependabotAlerts", { repo: "../x" })).status, 400);
+  assert.equal((await invoke("github", "communityProfile", { repo: "fixture" })).status, 400);
+  assert.equal(calls.length, 0, "invalid repository names never reach GitHub");
+
+  // A repository with alerts off answers 403 to every token, so the classic token is not tried after it.
+  const off = await invoke("github", "dependabotAlerts", { repo: "fixture/off" });
+  assert.deepEqual([off.ok, off.status, off.disabled, off.via, calls.length], [false, 403, true, "fine-grained", 1]);
+  calls.length = 0;
+  const alerts = await invoke("github", "dependabotAlerts", { repo: "fixture/app" });
+  assert.deepEqual([alerts.ok, alerts.via, alerts.skipped.map((s) => s.slot)], [true, "classic", ["fine-grained"]]);
+  assert.deepEqual(JSON.parse(alerts.body), [
+    { number: 1, severity: "critical", created_at: "2026-11-01T00:00:00Z", package: "pkg-1", runtime: true },
+    { number: 2, severity: "low", created_at: "2026-11-01T00:00:00Z", package: "pkg-2", runtime: false },
+  ], "only open alerts, with no advisory text or URLs");
+  assert.ok(calls.every((c) => c.options.method === "GET"));
+
+
+  const community = await invoke("github", "communityProfile", { repo: "fixture/app" });
+  assert.deepEqual(JSON.parse(community.body), {
+    health: 42, description: true,
+    files: { readme: true, license: false, contributing: false, code_of_conduct: false, issue_template: false, pull_request_template: false },
+  });
+});

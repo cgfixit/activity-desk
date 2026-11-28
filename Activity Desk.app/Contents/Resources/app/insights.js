@@ -1608,6 +1608,14 @@ const READING = Object.freeze({
   "chaoss-first-response": { title: "Time to First Response", by: "CHAOSS", kind: "Metric", url: "https://chaoss.community/kb/metric-time-to-first-response/" },
   "dora-wip": { title: "Work in process limits", by: "DORA", kind: "Guide", url: "https://dora.dev/capabilities/wip-limits/" },
   "dora-metrics": { title: "DORA's software delivery performance metrics", by: "DORA", kind: "Guide", url: "https://dora.dev/guides/dora-metrics/" },
+  "gh-dependabot-alerts": { title: "About Dependabot alerts", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/code-security/dependabot/dependabot-alerts/about-dependabot-alerts" },
+  "gh-dependabot-updates": { title: "About Dependabot security updates", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/code-security/dependabot/dependabot-security-updates/about-dependabot-security-updates" },
+  "gh-license": { title: "Licensing a repository", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository" },
+  "gh-contributing": { title: "Setting guidelines for repository contributors", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/communities/setting-up-your-project-for-healthy-contributions/setting-guidelines-for-repository-contributors" },
+  "gh-community-profile": { title: "About community profiles for public repositories", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/communities/setting-up-your-project-for-healthy-contributions/about-community-profiles-for-public-repositories" },
+  "gh-inbox-filters": { title: "Inbox filters", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/subscriptions-and-notifications/reference/inbox-filters" },
+  "gh-subscriptions": { title: "Viewing your subscriptions", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/subscriptions-and-notifications/how-tos/managing-subscriptions-for-activity-on-github/viewing-your-subscriptions" },
+  "gh-unwatch": { title: "Managing your subscriptions", by: "GitHub Docs", kind: "Docs", url: "https://docs.github.com/en/subscriptions-and-notifications/how-tos/managing-subscriptions-for-activity-on-github/managing-your-subscriptions" },
   "bacchelli-2013": { title: "Expectations, Outcomes, and Challenges of Modern Code Review", by: "Bacchelli and Bird, ICSE 2013", kind: "Study", url: "https://doi.org/10.1109/ICSE.2013.6606617" },
   "kudrjavets-2022": { title: "Do Small Code Changes Merge Faster? A Multi-Language Empirical Investigation", by: "Kudrjavets, Nagappan, and Rastogi, MSR 2022", kind: "Study", url: "https://doi.org/10.1145/3524842.3528448" },
   "perry-2023": { title: "Do Users Write More Insecure Code with AI Assistants?", by: "Perry, Srivastava, Kumar, and Boneh, ACM CCS 2023", kind: "Study", url: "https://doi.org/10.1145/3576915.3623157" },
@@ -1627,6 +1635,7 @@ const SUGGEST_LATE_SHARE = 0.15;
 const SUGGEST_CI_SHARE = 0.4;
 const SUGGEST_OUT_MIN = 5;
 const SUGGEST_PENDING_MIN = 2;          // review requests to you by name, each waiting a day, before a card
+const SUGGEST_WATCHED_SHARE = 0.5;      // share of unread notifications that come from watching a repository
 
 const lines = (n) => Math.round(n).toLocaleString();
 const ageDays = (nowTime, at) => (nowTime - Date.parse(at)) / DAY_MS;
@@ -2094,6 +2103,95 @@ const SUGGESTION_RULES = [
     },
   },
   {
+    id: "answer-direct-asks", area: "Notifications", source: "Unread notifications",
+    title: "Clear the notifications that name you",
+    check: ({ notes, notesNote }, { nowTime }) => {
+      if (!notes) return { unavailable: notesNote || "Unread notifications did not load." };
+      // Review requests have their own card, read from GitHub's review-requested search.
+      const waiting = notes.direct.filter((n) => ageDays(nowTime, n.at) > SUGGEST_WAITING_DAYS).sort((a, b) => a.at.localeCompare(b.at));
+      if (waiting.length < SUGGEST_PENDING_MIN) return null;
+      const kinds = Object.entries(DIRECT_REASONS).map(([reason, label]) => [label, waiting.filter((n) => n.reason === reason).length])
+        .filter(([, n]) => n).map(([label, n]) => `${n} ${label}`);
+      return {
+        tone: "warn",
+        basis: `${plural(notes.unread, "unread notification")}${notesNote ? " on the first page" : ""}`,
+        targets: waiting.slice(0, SUGGEST_TARGETS).map((n) => ref(`${n.number ? `${n.repo} #${n.number}` : n.repo} · ${n.title}: ${DIRECT_REASONS[n.reason]}, unread ${durationLabel((nowTime - Date.parse(n.at)) / 36e5)}`, n.repo, n.number)),
+        seen: `${plural(waiting.length, "unread notification")} that name you have waited more than ${SUGGEST_WAITING_DAYS} days: ${kinds.join(", ")}.`,
+        act: [["Filter the inbox with reason:mention, reason:team-mention, and reason:assign, then answer each thread or mark it done.", "gh-inbox-filters"]],
+      };
+    },
+  },
+  {
+    id: "trim-watched-repos", area: "Notifications", source: "Unread notifications",
+    title: "Unwatch the repositories that fill your inbox",
+    check: ({ notes, notesNote }) => {
+      if (!notes) return { unavailable: notesNote || "Unread notifications did not load." };
+      if (notes.unread < 10) return { short: `Needs 10 unread notifications; ${notes.unread} loaded.` };
+      if (notes.watched.total / notes.unread < SUGGEST_WATCHED_SHARE) return null;
+      return {
+        tone: "info",
+        basis: `${plural(notes.unread, "unread notification")}${notesNote ? " on the first page" : ""}`,
+        targets: notes.watched.repos.slice(0, SUGGEST_TARGETS).map(([repo, n]) => ref(`${repo}: ${plural(n, "unread notification")} from watching`, repo)),
+        seen: `${notes.watched.total} of ${plural(notes.unread, "unread notification")} come from repositories you watch, not from threads you took part in.`,
+        why: [["Watching a repository notifies you of all its conversations.", "gh-subscriptions"]],
+        act: [["Under Watched repositories, set each of these to Participating and @mentions, or to Custom for releases or security alerts only. After you unwatch, you are still notified when you take part or are @mentioned.", "gh-unwatch"]],
+      };
+    },
+  },
+  {
+    id: "fix-dependabot-alerts", area: "Security", source: "Dependabot alerts",
+    title: "Fix critical and high Dependabot alerts first",
+    check: ({ health }) => {
+      if (!health) return { unavailable: "Dependabot alerts did not load." };
+      if (health.denied) return { unavailable: health.denied };
+      if (!health.alertsRead) {
+        return { unavailable: health.alertsOff ? `Dependabot alerts are off in the ${plural(health.alertsOff, "repository", "repositories")} checked.` : "Dependabot alerts did not load for any repository." };
+      }
+      const hit = health.rows.filter((r) => r.alerts?.serious).sort((a, b) => b.alerts.serious - a.alerts.serious || (b.alerts.oldestDays ?? 0) - (a.alerts.oldestDays ?? 0));
+      if (!hit.length) return null;
+      const serious = sum(hit.map((r) => r.alerts.serious));
+      const critical = sum(hit.map((r) => r.alerts.critical));
+      // GitHub lists the newest alerts first, so past 100 the count is a floor and the oldest is unseen.
+      const capped = hit.some((r) => r.alerts.more);
+      const ages = hit.map((r) => r.alerts.oldestDays).filter((d) => d != null);
+      const age = !capped && ages.length ? ` The oldest has been open ${durationLabel(Math.max(...ages) * 24)}.` : "";
+      return {
+        tone: "warn",
+        basis: `open alerts in ${plural(health.alertsRead, "repository", "repositories")}`,
+        targets: hit.slice(0, SUGGEST_TARGETS).map((r) => ref(`${r.repo}: ${r.alerts.critical} critical, ${r.alerts.high} high${r.alerts.more ? ", and more past the first 100" : ""}`, r.repo)),
+        seen: `${capped ? "At least " : ""}${plural(serious, "open critical or high alert")} in ${plural(hit.length, "repository", "repositories")}${critical ? `, ${critical} of them critical` : ""}.${age}`,
+        why: [["Dependabot alerts help you find and fix vulnerable dependencies before they become security risks.", "gh-dependabot-alerts"]],
+        act: [["Start in each repository's Security tab with critical alerts. With Dependabot security updates turned on, Dependabot tries to open a pull request for every open alert that has a patch.", "gh-dependabot-updates"]],
+      };
+    },
+  },
+  {
+    id: "add-community-files", area: "Visibility", source: "Community profile",
+    title: "Add a license and a contributing guide",
+    check: ({ health }) => {
+      if (!health) return { unavailable: "Community profiles did not load." };
+      const known = health.rows.filter((r) => r.profile);
+      if (!known.length) return { unavailable: health.publicRepos ? "Community profiles did not load." : "None of the repositories checked are public." };
+      const gaps = known.map((r) => ({ r, missing: [!r.profile.files.license && "license", !r.profile.files.contributing && "contributing guide"].filter(Boolean) }))
+        .filter((g) => g.missing.length).sort((a, b) => b.missing.length - a.missing.length || (a.r.profile.health ?? 0) - (b.r.profile.health ?? 0));
+      if (!gaps.length) return null;
+      const noLicense = gaps.filter((g) => !g.r.profile.files.license).length;
+      const noGuide = gaps.filter((g) => !g.r.profile.files.contributing).length;
+      const of = (n, what) => `${n} of ${plural(known.length, "public repository", "public repositories")} ${n === 1 ? "has" : "have"} no ${what}`;
+      return {
+        tone: "info",
+        basis: `community profiles of ${plural(known.length, "public repository", "public repositories")}`,
+        targets: gaps.slice(0, SUGGEST_TARGETS).map(({ r, missing }) => ref(`${r.repo}: no ${missing.join(" or ")}${r.profile.health != null ? `, community profile ${r.profile.health}%` : ""}`, r.repo)),
+        seen: `${[noLicense && of(noLicense, "license"), noGuide && of(noGuide, "contributing guide")].filter(Boolean).join("; ")}.`,
+        why: [
+          ...(noLicense ? [["Without a license, default copyright law applies: no one may reproduce, distribute, or build on the code.", "gh-license"]] : []),
+          ...(noGuide ? [["A contributing guide is linked for people when they open a pull request or an issue.", "gh-contributing"]] : []),
+        ],
+        act: [["Open the repository's community standards checklist. Each recommended file that is missing has an Add button that drafts it.", "gh-community-profile"]],
+      };
+    },
+  },
+  {
     id: "fine-grained-token", area: "Access", source: "Token check",
     title: "Switch to a read-only fine-grained token",
     check: ({ token }) => {
@@ -2145,6 +2243,12 @@ const SUGGESTION_METRICS = {
     ? { label: "Open pull requests past your usual merge time", value: o.overdue.length, unit: "count" }
     : p && { label: "Open pull requests older than two weeks", value: p.stale, unit: "count" }),
   "branches-without-prs": ({ follow: f }) => f && f.settled >= 4 && { label: "Branches without a pull request", value: f.withoutPr.length, unit: "count" },
+  "answer-direct-asks": ({ notes: n, now }) => n && { label: `Unread notifications naming you, older than ${SUGGEST_WAITING_DAYS} days`,
+    value: n.direct.filter((d) => ageDays(now == null ? Date.now() : new Date(now).getTime(), d.at) > SUGGEST_WAITING_DAYS).length, unit: "count" },
+  "trim-watched-repos": ({ notes: n }) => n && n.unread >= 10 && { label: "Unread notifications from watched repositories", value: n.watched.total / n.unread, unit: "share" },
+  "fix-dependabot-alerts": ({ health: h }) => h?.alertsRead && !h.denied && { label: "Open critical and high Dependabot alerts", value: sum(h.rows.map((r) => r.alerts?.serious || 0)), unit: "count" },
+  "add-community-files": ({ health: h }) => h?.rows.some((r) => r.profile) && { label: "Public repositories missing a license or contributing guide",
+    value: h.rows.filter((r) => r.profile && !(r.profile.files.license && r.profile.files.contributing)).length, unit: "count" },
 };
 // Cards that can never be snoozed or dismissed: write access on a token is never noise.
 const PINNED_SUGGESTIONS = new Set(["fine-grained-token"]);
@@ -2203,7 +2307,8 @@ function trialSeries(id, at, snapshots) {
 // Rules that read the Events feed, the contribution calendar, notifications, conversations, traffic, or
 // the token describe the whole account, so a repository view shows them unchanged and says so.
 const ACCOUNT_RULES = new Set(["branches-without-prs", "answer-waiting-threads", "batch-by-repo",
-  "re-entry-notes", "late-night-review", "ci-notifications", "labels-not-prefixes", "readme-first-screen", "fine-grained-token"]);
+  "re-entry-notes", "late-night-review", "ci-notifications", "labels-not-prefixes", "readme-first-screen", "fine-grained-token",
+  "answer-direct-asks", "trim-watched-repos", "fix-dependabot-alerts", "add-community-files"]);
 const SCOPE_MIN_MERGES = SUGGEST_MIN_MERGES;
 
 // Repositories where you merged enough loaded pull requests to scope Suggestions to, busiest first.
@@ -2325,6 +2430,8 @@ const PUBLIC_NEEDS = {
   "answer-waiting-threads": "Needs a token. Conversations are read only with one.",
   "re-entry-notes": "Needs a token. GitHub's API returns the contribution calendar only to a signed-in request.",
   "readme-first-screen": "Needs a token. Repository traffic is never public.",
+  "fix-dependabot-alerts": "Needs a token. Dependabot alerts are never public.",
+  "add-community-files": "Needs a token. The public view stays inside GitHub's 60 requests an hour, so it does not read community profiles.",
 };
 
 function deriveSuggestions(input) {
@@ -2454,6 +2561,10 @@ function summarizeWaiting({ requests, conversations, prInfo, login, now } = {}) 
   return { reviews, replies, changes, unsure, count };
 }
 
+// Reasons a notification names you rather than a repository you watch. Review requests are left out:
+// the review-requested search covers them.
+const DIRECT_REASONS = { mention: "@mention", team_mention: "team @mention", assign: "assignment" };
+const SUBJECT_NUMBER = /\/(?:issues|pulls)\/(\d{1,10})$/;
 function summarizeNotifications(items) {
   const list = Array.isArray(items) ? items : [];
   const unread = list.filter((item) => item && item.unread);
@@ -2465,12 +2576,51 @@ function summarizeNotifications(items) {
   const important = new Set(["review_requested", "mention", "team_mention", "assign", "author", "comment", "approval_requested", "security_alert"]);
   const ciFailures = unread.filter((item) => item.reason === "ci_activity" && /fail|cancel/i.test((item.subject && item.subject.title) || ""));
   const missed = unread.filter((item) => important.has(item.reason || "")).concat(ciFailures);
+  const watched = unread.filter((item) => item.reason === "subscribed");
+  const watchedBy = new Map();
+  for (const item of watched) {
+    const repo = String(item.repository?.full_name || "");
+    if (repo) watchedBy.set(repo, (watchedBy.get(repo) || 0) + 1);
+  }
   return {
     total: list.length,
     unread: unread.length,
     byReason: Object.entries(byReason).sort((a, b) => b[1] - a[1]),
     missed,
     ciNoise: unread.filter((item) => item.reason === "ci_activity").length - ciFailures.length,
+    direct: unread.filter((item) => Object.hasOwn(DIRECT_REASONS, item.reason) && validTime(item.updated_at)).map((item) => {
+      const number = Number(SUBJECT_NUMBER.exec(String(item.subject?.url || ""))?.[1]);
+      return { reason: item.reason, at: item.updated_at, repo: String(item.repository?.full_name || ""), title: String(item.subject?.title || "Untitled"), number: Number.isInteger(number) && number > 0 ? number : null };
+    }),
+    watched: { total: watched.length, repos: [...watchedBy].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])) },
+  };
+}
+
+// ---------- Repository health ----------
+// Open Dependabot alerts and community profiles for the repositories Footprint reads. `health` is the
+// renderer's load: repository names, alerts by repository, repositories with alerts off, profiles by
+// repository, and why alerts could not be read at all.
+function summarizeRepoHealth(health, now) {
+  if (!health) return null;
+  const nowTime = now == null ? Date.now() : new Date(now).getTime();
+  const rows = health.repos.map(({ repo, isPublic }) => {
+    const a = health.alerts[repo];
+    let alerts = null;
+    if (a) {
+      const serious = a.open.filter((x) => x.severity === "critical" || x.severity === "high");
+      const ages = serious.map((x) => ageDays(nowTime, x.created_at)).filter(Number.isFinite);
+      alerts = {
+        open: a.open.length, more: Boolean(a.more), serious: serious.length,
+        critical: serious.filter((x) => x.severity === "critical").length, high: serious.filter((x) => x.severity === "high").length,
+        oldestDays: ages.length ? Math.max(...ages) : null,
+      };
+    }
+    return { repo, isPublic, alerts, off: health.off.includes(repo), profile: health.profiles[repo] || null };
+  });
+  return {
+    rows, denied: health.denied || "", issues: health.issues || [],
+    alertsRead: rows.filter((r) => r.alerts).length, alertsOff: rows.filter((r) => r.off).length,
+    publicRepos: rows.filter((r) => r.isPublic).length,
   };
 }
 
@@ -2754,7 +2904,7 @@ function clockText(c, asked) {
 // The X-Accepted-GitHub-Permissions value lists the permissions an endpoint needs, comma separated.
 // When several sets work, the sets are separated by semicolons.
 // Header names that differ from the label on GitHub's token settings page.
-const PERMISSION_LABELS = { user_events: "Events (account permission)" };
+const PERMISSION_LABELS = { user_events: "Events (account permission)", vulnerability_alerts: "Dependabot alerts" };
 function parseAcceptedPermissions(header) {
   return String(header || "").split(";").map((set) => set.split(",").map((part) => part.trim()).filter(Boolean).map((part) => {
     const [name, access] = part.split("=").map((x) => x.trim());
@@ -3225,6 +3375,7 @@ const api = {
   summarizePullRequests,
   summarizeContributions,
   summarizeNotifications,
+  summarizeRepoHealth,
   summarizeReviewRequests,
   summarizeWaiting,
   REQUEST_LATE_HOURS,

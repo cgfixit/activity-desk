@@ -33,6 +33,7 @@ const NEEDS_TOKEN = {
   notifications: "Unread notifications need a classic token.",
   footprint: "Repository traffic needs a token. Stars and forks are public.",
   history: "Saved history needs a token.",
+  health: "Dependabot alerts and community profiles need a token.",
 };
 const PUBLIC_NOTES = "Notes need a token. A username alone does not show whose notes to open.";
 const PUBLIC_LIMIT = "GitHub's hourly limit for requests without a token was reached. Try again later, or add a token in Data & access.";
@@ -57,6 +58,7 @@ const initialState = {
   rateLimit: null,
   tokenMeta: null,
   footprint: null,
+  repoHealth: null, // Dependabot alerts and community profiles for the repositories Footprint reads
   savedHistory: null,
   contributionHistory: null,
   contributions: null,
@@ -190,12 +192,12 @@ async function api(account, operation, args, slot) {
   if (!result.ok) {
     const need = accepted.length && (result.status === 403 || result.status === 404)
       ? ` GitHub accepts ${accepted.map((set) => set.join(" with ")).join(", or ")} for this request.` : "";
-    const detail = (result.error || (account.public ? { 403: PUBLIC_LIMIT, 429: PUBLIC_LIMIT } : {
+    const detail = result.disabled ? "Dependabot alerts are off for this repository." : (result.error || (account.public ? { 403: PUBLIC_LIMIT, 429: PUBLIC_LIMIT } : {
       401: "GitHub rejected the saved token.",
       403: "GitHub denied the request. Check token permissions and rate limits.",
       429: "GitHub rate limit reached.",
     })[result.status] || `GitHub returned HTTP ${result.status}.`) + need;
-    throw Object.assign(new Error(detail), { status: result.status });
+    throw Object.assign(new Error(detail), { status: result.status, disabled: Boolean(result.disabled) });
   }
   return { data: JSON.parse(result.body || "null"), more: /rel="next"/.test(result.link || ""), via: result.via };
 }
@@ -216,7 +218,8 @@ function recordToken(account, operation, result) {
   };
   // Tokens GitHub denied before another saved token answered.
   for (const s of result.skipped || []) note(s.slot, s.token, true, s.status);
-  return note(result.via, result.token, !result.ok, result.status);
+  // Alerts being off is a repository setting, not a missing permission.
+  return note(result.via, result.token, !result.ok && !result.disabled, result.status);
 }
 
 async function loadEvents(account, login, slot) {
@@ -377,6 +380,59 @@ async function loadFootprint(account) {
   });
   const saved = account.public ? null : await window.desk.history().catch(() => null);
   return { fp, saved };
+}
+
+// Open Dependabot alerts for the repositories Footprint reads, and the community profile of the public
+// ones. As with traffic, the first repository that answers for alerts decides whether the token can
+// read them at all; a repository with alerts turned off says nothing about the token, so the next is tried.
+async function loadRepoHealth(account, repos) {
+  const names = repos.map((r) => r.full_name);
+  const health = { repos: repos.map((r) => ({ repo: r.full_name, isPublic: !r.private })), alerts: {}, off: [], profiles: {}, denied: "", issues: [] };
+  const readAlerts = async (repo) => {
+    try {
+      const { data, more } = await api(account, "dependabotAlerts", { repo });
+      if (!Array.isArray(data)) throw new Error("GitHub did not return a usable alert list.");
+      health.alerts[repo] = { open: data, more };
+    } catch (error) {
+      if (!error.disabled) throw error;
+      health.off.push(repo);
+    }
+  };
+  const skip = (label) => (error) => {
+    if (error.message === "Session changed.") throw error;
+    health.issues.push(`${label}: ${error.message}`);
+  };
+  const alerts = (async () => {
+    let next = 0;
+    while (next < names.length) {
+      const repo = names[next];
+      next += 1;
+      try {
+        await readAlerts(repo);
+      } catch (error) {
+        if (error.message === "Session changed.") throw error;
+        // Only a refusal says the token cannot read alerts. A timeout or server error is this repository's.
+        if ([401, 403, 404].includes(error.status)) {
+          health.denied = error.message;
+          return;
+        }
+        health.issues.push(`${repo} alerts: ${error.message}`);
+        continue;
+      }
+      if (health.alerts[repo]) break;
+    }
+    await mapLimit(names.slice(next), TRAFFIC_CONCURRENCY, (repo) => readAlerts(repo).catch(skip(`${repo} alerts`)));
+  })();
+  const profiles = mapLimit(repos.filter((r) => !r.private).map((r) => r.full_name), TRAFFIC_CONCURRENCY, async (repo) => {
+    try {
+      const { data } = await api(account, "communityProfile", { repo });
+      if (data && typeof data.files === "object") health.profiles[repo] = data;
+    } catch (error) {
+      skip(`${repo} community profile`)(error);
+    }
+  });
+  await Promise.all([alerts, profiles]);
+  return health;
 }
 
 // Pull requests from a search over the last AUTHORED_DAYS days: those you opened, or those by others you reviewed.
@@ -643,18 +699,21 @@ async function refresh() {
     });
     // Notes load once per account. Later refreshes keep the notes in memory, including unsaved edits.
     const notesTask = account.notes?.userId === user.id && !account.notes.failed ? null : window.desk.notes();
-    const [notes, year, prs, talk, authored, footprint, yearsResult, reviewedResult, notebook, cardStates, asks] = await Promise.allSettled([
+    const footprintTask = loadFootprint(account);
+    const healthTask = footprintTask.then(({ fp }) => loadRepoHealth(account, fp.repos));
+    const [notes, year, prs, talk, authored, footprint, yearsResult, reviewedResult, notebook, cardStates, asks, health] = await Promise.allSettled([
       classic ? api(account, "notifications") : null,
       yearTask,
       lookupTask,
       loadConversations(account, user.login),
       authoredTask,
-      loadFootprint(account),
+      footprintTask,
       historyTask,
       reviewedTask,
       notesTask,
       window.desk.cards(),
       loadReviewRequests(account, user.login),
+      healthTask,
     ]);
     if (account !== state) return;
     if (notesTask) account.notes = notesFrom(notebook.value, user.id);
@@ -742,6 +801,14 @@ async function refresh() {
       else if (fpLoad.saved.note) errors.history = fpLoad.saved.note;
     }
     const footprintData = fpLoad ? fpLoad.fp : null;
+    const repoHealth = health.value || null;
+    if (!repoHealth) errors.health = `Dependabot alerts and community profiles did not load. ${health.reason?.message || ""}`.trim();
+    else {
+      const parts = [];
+      if (repoHealth.denied) parts.push(`Dependabot alerts could not be read. ${repoHealth.denied} They need the fine-grained permission Dependabot alerts: read, or a classic token GitHub allows to read them.`);
+      if (repoHealth.issues.length) parts.push(`Some did not load: ${repoHealth.issues.slice(0, 3).join("; ")}${repoHealth.issues.length > 3 ? "; …" : ""}`);
+      if (parts.length) errors.health = parts.join(" ");
+    }
 
     const yearsData = yearsResult.value?.data;
     let contributionHistory = null;
@@ -780,7 +847,7 @@ async function refresh() {
       ? { events: feed.only, authored: mine?.only, reviewed: theirs?.only, conversations: talkData?.only, requests: requestLoad?.only, year: year.value?.slot || null }
       : null;
 
-    Object.assign(account, { tokenUse, user, viewer, contributions, events, notifications, prLookup, prInfo, reviewed, requests, rateLimit, footprint: footprintData, savedHistory, contributionHistory, conversations, errors, refreshedAt: new Date() });
+    Object.assign(account, { tokenUse, user, viewer, contributions, events, notifications, prLookup, prInfo, reviewed, requests, rateLimit, footprint: footprintData, repoHealth, savedHistory, contributionHistory, conversations, errors, refreshedAt: new Date() });
     await saveWeeklySnapshot(account, mine);
     finishRefresh(account);
   } catch (error) {
@@ -853,6 +920,7 @@ function computed() {
   const h = state.savedHistory;
   const snapshots = h?.enabled ? I.summarizeSnapshots(h.snapshots, state.snapshotSaved ? I.snapshotOf(outcomes) : null, h.week) : null;
   const footprint = state.footprint ? I.summarizeFootprint(state.footprint, state.savedHistory, state.refreshedAt) : null;
+  const health = state.repoHealth ? I.summarizeRepoHealth(state.repoHealth, state.refreshedAt) : null;
   const years = state.contributionHistory
     ? I.summarizeContributionHistory(state.contributionHistory.byYear, localDayKey(new Date()), state.viewer?.createdAt) : null;
   // The classic token is the one whose scopes can allow writes, so it is the one the access check reads.
@@ -868,17 +936,17 @@ function computed() {
     // Public search records carry no branch names, so branches cannot be matched to pull requests there.
     follow: eventsLoaded && prsLoaded && !state.public ? follow : null,
     prPatterns: prsLoaded ? prPatterns : null, review: a ? review : null, prInfo: a ? state.prInfo : null,
-    trajectory, notes, notesNote: state.errors.notifications || "", footprint, conversations: state.conversations, token,
+    trajectory, notes, notesNote: state.errors.notifications || "", footprint, health, conversations: state.conversations, token,
     collab: state.reviewed ? collab : null, requests, outcomes, observations, chance, publicView: state.public,
   }), state.public ? {} : state.cards, state.refreshedAt, null, snapshots);
-  const scoped = scopedSuggestions({ ev, eventsLoaded, sessions, follow, prsLoaded, trajectory, notes, footprint, token, requests });
-  return { years, ev, pr, notes, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, outcomes, observations, footprint, suggestions, chance, snapshots, scoped, requests, waiting };
+  const scoped = scopedSuggestions({ ev, eventsLoaded, sessions, follow, prsLoaded, trajectory, notes, footprint, health, token, requests });
+  return { years, ev, pr, notes, health, year: state.contributions, rhythm, sessions, prPatterns, trajectory, follow, review, collab, outcomes, observations, footprint, suggestions, chance, snapshots, scoped, requests, waiting };
 }
 
 // Suggestions for one repository: the pull request rules run on that repository's pull requests,
 // with their own chance budget, while feed, calendar, traffic, and token rules stay account-wide.
 // Null in the account view, or when the chosen repository no longer has enough loaded merges.
-function scopedSuggestions({ ev, eventsLoaded, sessions, follow, prsLoaded, trajectory, notes, footprint, token, requests }) {
+function scopedSuggestions({ ev, eventsLoaded, sessions, follow, prsLoaded, trajectory, notes, footprint, health, token, requests }) {
   const login = state.user && state.user.login;
   const repos = I.scopeRepos(state.prInfo, login);
   const repo = state.suggestScope;
@@ -898,7 +966,7 @@ function scopedSuggestions({ ev, eventsLoaded, sessions, follow, prsLoaded, traj
     ev: eventsLoaded ? ev : null, sessions: eventsLoaded ? sessions : null,
     follow: eventsLoaded && prsLoaded && !state.public ? follow : null,
     prPatterns: prsLoaded ? prPatterns : null, review: a ? review : null, prInfo: a ? prInfo : null,
-    trajectory, notes, notesNote: state.errors.notifications || "", footprint, conversations: state.conversations, token,
+    trajectory, notes, notesNote: state.errors.notifications || "", footprint, health, conversations: state.conversations, token,
     collab: state.reviewed ? collab : null, outcomes, observations: [], chance, publicView: state.public,
     requests: requests && { ...requests, items: requests.items.filter((r) => r.repo === repo) },
   });
@@ -2043,6 +2111,16 @@ function renderMeta(c) {
   caps.push(!fp ? ["no", "Repository traffic", esc(state.errors.footprint || "Not available.")]
     : fp.denied ? ["no", "Repository traffic", esc(state.errors.footprint)]
     : [state.errors.footprint ? "part" : "ok", "Repository traffic", `${fmt(Object.keys(fp.traffic).length)} of ${fmt(fp.repos.length)} repositories read. ${esc(state.errors.footprint || "")}`]);
+  const rh = state.repoHealth;
+  if (!state.public) {
+    const alertsRead = rh ? Object.keys(rh.alerts).length : 0;
+    caps.push(!rh || rh.denied || (!alertsRead && !rh.off.length) ? ["no", "Dependabot alerts", esc(state.errors.health || "Not available.")]
+      : [state.errors.health ? "part" : "ok", "Dependabot alerts", `${fmt(alertsRead)} of ${fmt(rh.repos.length)} repositories read${rh.off.length ? `, alerts off in ${fmt(rh.off.length)}` : ""}${tokenNote("dependabotAlerts")}. ${esc(state.errors.health || "")}`]);
+    const profiles = rh ? Object.keys(rh.profiles).length : 0;
+    const open = rh ? rh.repos.filter((r) => r.isPublic).length : 0;
+    caps.push(rh && open ? [profiles < open ? "part" : "ok", "Community profiles", `${fmt(profiles)} of ${fmt(open)} public repositories read${tokenNote("communityProfile")}.`]
+      : ["no", "Community profiles", rh ? "None of the repositories read are public." : esc(state.errors.health || "Not available.")]);
+  }
   if (state.errors.account) caps.push(["part", "Account details", esc(state.errors.account)]);
   const kinds = savedSlots(state).map((slot) => `a <strong>${esc(state.tokens[slot])}</strong> token`);
   cards.push(`<article class="card"><h3>${state.public ? "What the public view can see" : both ? "What these tokens can see" : "What this token can see"}</h3>
@@ -2229,7 +2307,15 @@ const OPERATION_LABELS = {
   pullRequests: "Pull request details", pullRequestCommits: "Last-commit times", authoredPullRequests: "Pull requests you opened", reviewedPullRequests: "Pull requests you reviewed",
   conversations: "Conversations", reviewRequests: "Review requests", rateLimit: "Rate-limit budget", contributionHistory: "Contribution history",
   ownedRepos: "Repository list", traffic: "Repository traffic", stargazers: "Star dates",
+  dependabotAlerts: "Dependabot alerts", communityProfile: "Community profiles",
 };
+
+// With two tokens: which one answered a source read with the fine-grained token first.
+function tokenNote(operation) {
+  const slots = state.answered[operation];
+  if (!dual(state) || !slots?.size) return "";
+  return slots.size > 1 ? ", answered by both tokens" : `, answered by the ${esc([...slots][0])} token`;
+}
 
 // With two tokens: how many items of a merged source only one of them returned.
 function onlyNote(only, one, many) {
@@ -2302,13 +2388,13 @@ function tokenCard() {
   const advice = state.public
     ? "No token is saved, so this is the public view. Recommended: a fine-grained token with read-only permissions for everything except the unread inbox, and a classic token with only the notifications scope beside it for the inbox."
     : state.tokens["fine-grained"]
-    ? "Recommended setup for the fine-grained token: resource owner set to your account, access to all repositories you want covered, and read-only permissions only: <strong>Pull requests</strong>, <strong>Issues</strong>, and the account permission <strong>Events</strong>, plus <strong>Administration</strong> if you want repository traffic in Footprint. GitHub adds <strong>Metadata</strong> automatically."
+    ? "Recommended setup for the fine-grained token: resource owner set to your account, access to all repositories you want covered, and read-only permissions only: <strong>Pull requests</strong>, <strong>Issues</strong>, <strong>Contents</strong>, <strong>Dependabot alerts</strong>, and the account permission <strong>Events</strong>, plus <strong>Administration</strong> if you want repository traffic in Footprint. GitHub adds <strong>Metadata</strong> automatically."
     : "Recommended: add a fine-grained token with read-only permissions. A fine-grained token covers one resource owner and cannot read notifications, so keep the classic token beside it for the unread inbox.";
   const warnings = tokenWarnings().filter((w) => !/rate limit/.test(w.title));
   return `${warnings.map((w) => `<div class="callout">${esc(w.title)}. ${esc(w.detail)}</div>`).join("")}
     <div class="token-slots">${SLOTS.map(tokenSlot).join("")}</div>
     <p class="note">${advice}</p>
-    <p class="note">${dual(state) ? "Both tokens belong to this account, which GitHub confirmed before the second was saved. Notifications use the classic token. Activity, pull requests you opened or reviewed, and conversations are read with each token and joined. The contribution year comes from whichever token hides fewer contributions. Every other source uses the fine-grained token and moves to the classic one only when GitHub denies the request. " : ""}${anyDenied ? "Denied requests list the permissions GitHub reported for them." : "No request was denied with a permission hint."} GraphQL sources report missing access as partial results in the list below instead. Activity Desk only sends allowlisted reads, whatever a token allows.</p>`;
+    <p class="note">${dual(state) ? "Both tokens belong to this account, which GitHub confirmed before the second was saved. Notifications use the classic token. Activity, pull requests you opened or reviewed, and conversations are read with each token and joined. The contribution year comes from whichever token hides fewer contributions. Every other source, Dependabot alerts included, uses the fine-grained token and moves to the classic one only when GitHub denies the request, so a classic token with wider access fills what the fine-grained one cannot read. " : ""}${anyDenied ? "Denied requests list the permissions GitHub reported for them." : "No request was denied with a permission hint."} GraphQL sources report missing access as partial results in the list below instead. Activity Desk only sends allowlisted reads, whatever a token allows.</p>`;
 }
 
 function historyCard() {
